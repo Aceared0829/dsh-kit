@@ -1,0 +1,17 @@
+- insert:
+    - id: worktree
+      name: '@deepseek-ai/dsh-experimental-worktree'
+    - id: tool-worktree
+      name: '@deepseek-ai/dsh-experimental-tool-worktree'
+    - id: browser-use
+      name: '@deepseek-ai/dsh-browser-use'
+    - id: browser-use-playwright
+      name: '@deepseek-ai/dsh-experimental-browser-use-playwright-mcp'
+      config:
+        mode: launch
+        headless: false
+        # Chrome 路径不写在这里。要指定本机浏览器，写进自己的 profile 补丁，不要提交回这个库。
+    - id: computer-use
+      name: '@deepseek-ai/dsh-computer-use'
+    - id: computer-use-native
+      name: '@deepseek-ai/dsh-experimental-computer-use-cua-driver-native'

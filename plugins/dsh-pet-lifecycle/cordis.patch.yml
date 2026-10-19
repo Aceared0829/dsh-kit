@@ -1,0 +1,4 @@
+# dsh-pet 生命周期控制：随 DSH 进程起停
+- insert:
+    - id: dsh-pet-lifecycle
+      name: '@dsh-pet/lifecycle'

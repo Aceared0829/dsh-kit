@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Desktop Pet Lifecycle",
+    "description": "Starts the desktop pet when DeepSeek Harness starts and stops it when DeepSeek Harness exits."
+  }
+}

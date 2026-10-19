@@ -1,0 +1,6 @@
+# Example only. Do not commit a real directory.
+# Copy into the profile cordis.patch.yml after the pet app is installed.
+- id: dsh-pet-lifecycle
+  name: "@dsh-pet/lifecycle"
+  config:
+    petDir: "<pet-directory>"

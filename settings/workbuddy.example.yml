@@ -1,0 +1,12 @@
+# Example only. Put your own account id here after install.
+# Do not commit the filled-in file.
+- id: dsh-connect-workbuddy
+  name: dsh-connect-workbuddy
+  config:
+    accounts:
+      cn: "<account-id>"
+    regions:
+      cn:
+        enabled: true
+        showCreditsInMainUi: true
+        creditPosition: stats

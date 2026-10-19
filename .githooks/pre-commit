@@ -1,0 +1,8 @@
+#!/bin/sh
+cd "$(dirname "$0")/.."
+if command -v pwsh >/dev/null 2>&1; then
+  pwsh -File scripts/check-public.ps1
+else
+  echo "pwsh not found; run scripts/check-public.ps1 before pushing" >&2
+  exit 1
+fi

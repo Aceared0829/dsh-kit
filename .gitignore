@@ -1,0 +1,4 @@
+node_modules/
+sync.local.ps1
+*.bak-dsh-kit
+.DS_Store

@@ -1,0 +1,40 @@
+{
+  "name": "dsh-connect-grok",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Grok subscription usage for DeepSeek Harness: sign in with your xAI account and route Grok models through your SuperGrok quota.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-llm-pi-ai": "*",
+    "@deepseek-ai/dsh-authorization": "*",
+    "@deepseek-ai/dsh-credentials": "*"
+  }
+}

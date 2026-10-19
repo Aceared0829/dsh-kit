@@ -1,0 +1,23 @@
+# dsh-kit preferences
+# Applied only when the profile patch is still the empty template.
+# No accounts, tokens, or machine paths. An existing patch is left alone.
+- id: locale
+  name: "@deepseek-ai/dsh-client-locale"
+  config:
+    preference: zh
+- id: ui-chat
+  name: "@deepseek-ai/dsh-client-ui-chat"
+  config:
+    transcriptView: verbose
+    performanceUsage: detailed
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: xai
+    model: grok-4.7
+    reasoningEffort: xhigh
+- id: plugin-market
+  name: "@deepseek-ai/dsh-plugin-market"
+  config:
+    indexes:
+      - https://bruc3van.com/markets/dsh/index.json
