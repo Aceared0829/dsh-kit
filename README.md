@@ -1,8 +1,14 @@
 # dsh-kit
 
+[![DeepSeek Harness](https://img.shields.io/badge/DeepSeek_Harness-dsh--plugin-4f46e5)](https://github.com/deepseek-ai/deepseek-harness)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows_%7C_macOS_%7C_Linux-lightgrey)](#别人怎么装)
+
 把一套 DeepSeek Harness 插件装到另一台已经有 Harness 的机器上，并且可以反复更新。
 
 这个库不是 Harness 本身。官方仓库或你自己的 fork 继续管引擎；这里只放插件、版本清单和安装器。
+
+> 想找更多 Harness 插件？在 GitHub 上搜索 [`dsh-plugin`](https://github.com/topics/dsh-plugin) 话题。
 
 [English](#english)
 
@@ -36,6 +42,16 @@ chmod +x install.sh
 - `-Home <dir>`：指定 Harness home。未传时用环境变量 `DSH_HOME`，再没有就用 `~/.dsh`。
 
 装完重新打开 Harness。
+
+### 安装器会改动 profile 的 pnpm 设置
+
+第一次安装会往 profile 的 `pnpm-workspace.yaml` 补几个必要项，否则 pnpm 会拒绝安装整个依赖树（`ERR_PNPM_IGNORED_BUILDS`）：
+
+- `allowBuilds`：放行 `ssh2`、`cpu-features`（来自 `dsh-ssh`）和 DSH 运行时的原生包（`node-pty`、`koffi`、`protobufjs`、`@deepseek-ai/dsh-subprocess-local`、`@google/genai`）的构建脚本
+- `nodeLinker: hoisted` 与 `autoInstallPeers: false`：与 DSH 自身的 profile 布局一致
+
+只补缺失项。已经在用的 profile 保持原样，改动前备份为 `pnpm-workspace.yaml.bak-dsh-kit`。
+
 
 ## 以后怎么更新
 
