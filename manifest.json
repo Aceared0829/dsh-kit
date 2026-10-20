@@ -1,6 +1,6 @@
 {
   "name": "dsh-kit",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "npm": [
     { "name": "@changfenhuang/dsh-genui", "version": "0.13.0" },
     { "name": "@goodandready/dsh-context-lens", "version": "0.1.33" },
@@ -14,7 +14,7 @@
     { "name": "@linxin666/dsh-usage", "version": "0.4.4" },
     { "name": "@modusensus/dsh-mneme", "version": "0.9.1" },
     { "name": "dsh-better-sidebar", "version": "0.28.0" },
-    { "name": "dsh-connect-workbuddy", "version": "4.8.2" },
+    { "name": "dsh-connect-workbuddy", "version": "4.10.0" },
     { "name": "dsh-context", "version": "0.73.3" },
     { "name": "dsh-diff-approval", "version": "0.35.0" },
     { "name": "dsh-graph", "version": "0.21.0" },
