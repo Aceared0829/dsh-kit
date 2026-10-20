@@ -2,21 +2,40 @@
 
 [![DeepSeek Harness](https://img.shields.io/badge/DeepSeek_Harness-dsh--plugin-4f46e5)](https://github.com/deepseek-ai/deepseek-harness)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows_%7C_macOS_%7C_Linux-lightgrey)](#别人怎么装)
+[![Platform](https://img.shields.io/badge/platform-Windows_%7C_macOS_%7C_Linux-lightgrey)](#装到你的机器上)
 
-把一套 DeepSeek Harness 插件装到另一台已经有 Harness 的机器上，并且可以反复更新。
+这是我的 DeepSeek Harness 插件套装，也是我日常在用的一套。
 
-这个库不是 Harness 本身。官方仓库或你自己的 fork 继续管引擎；这里只放插件、版本清单和安装器。
+我把它们整理成了一个可以直接安装的仓库：你在自己的 Harness 上跑一条命令，就能装上我配置的这些插件和版本。想改什么，fork 我这个仓库自己维护，或者只装其中几个。
 
-> 想找更多 Harness 插件？在 GitHub 上搜索 [`dsh-plugin`](https://github.com/topics/dsh-plugin) 话题。
+> 找更多 Harness 插件？GitHub 上搜 [`dsh-plugin`](https://github.com/topics/dsh-plugin) 话题。
 
 [English](#english)
 
-## 别人怎么装
+## 这里有什么
 
-前提：对方已经装好 DeepSeek Harness，并且 `dsh` 能在终端里运行。安装器不会安装桌面端，也不会克隆 Harness 源码。
+**我自己写的这几个**（源码在这个仓库里）：
 
-Desktop 用户要先在应用里注册「管理 dsh 命令」，然后从托盘**完全退出**。只关窗口不够，Host 还在跑的时候不能改 desktop profile。
+| 插件 | 做什么 |
+|---|---|
+| `dsh-connect-grok` | 用你的 xAI 账号登录，把 Grok 模型走 SuperGrok 额度。设置页里登录一次就能用 |
+| `desktop-extras` | 一次开三个 Desktop 能力：Git worktree、有头 Playwright 浏览器、桌面控制 |
+| `dsh-pet-bridge` | 把 agent 状态事件写到本地 jsonl，给桌宠用。纯本地，不发网络请求 |
+| `dsh-pet-lifecycle` | 让桌宠跟着 Harness 一起起停，退出时自动关掉 |
+
+**别人做的这些**（从 npm 装，清单里锁了版本，我没把源码再拷一份）：
+
+`dsh-graph`（目标看板）、`dsh-context`、`@modusensus/dsh-mneme`（长期记忆）、`dsh-diff-approval`、`dsh-planning-with-files`、`dsh-better-sidebar`、`@changfenhuang/dsh-genui`（界面组件）、`@goodandready/*` 三个、`@linxin666/*` 六个、`dsh-connect-workbuddy`。
+
+完整清单和版本在 [`manifest.json`](manifest.json)。
+
+**Harness 自带、默认关着的实验包**，我这套里也开了：agent team、语音输入、自动评审、inspector、worktree 工具、CoT 翻译、终端、会话搜索、会话标题、badge skill、ralph、插件市场。装的时候会自动检查你那边有没有这些包，没有就跳过，不会为了装上而改你的 Harness。
+
+## 装到你的机器上
+
+前提：你已经装好 DeepSeek Harness，`dsh` 能在终端里跑。这个仓库不装 Harness 本身。
+
+**Desktop 用户注意**：先在应用里注册「管理 dsh 命令」，然后从托盘**完全退出**。只关窗口不够——Host 还在后台跑的时候装不了 desktop profile。
 
 ```powershell
 git clone https://github.com/Aceared0829/dsh-kit.git
@@ -33,38 +52,36 @@ chmod +x install.sh
 ./install.sh --profile web
 ```
 
-常用参数：
-
-- `-Profile desktop` 或 `--profile desktop`：装进 Desktop 的 profile。没有 Desktop 自带的 dsh 时会拒绝，避免用普通 CLI 去改它。
-- `-Profile web`：装进 Web / 终端 profile。
-- `-DryRun`：只打印将要执行的 `dsh plugin` 命令，不改 profile。
-- `-SkipPreferences`：不写入设置模板。
-- `-Home <dir>`：指定 Harness home。未传时用环境变量 `DSH_HOME`，再没有就用 `~/.dsh`。
-
 装完重新打开 Harness。
 
-### 安装器会改动 profile 的 pnpm 设置
+常用参数：
 
-第一次安装会往 profile 的 `pnpm-workspace.yaml` 补几个必要项，否则 pnpm 会拒绝安装整个依赖树（`ERR_PNPM_IGNORED_BUILDS`）：
+- `-Profile desktop` / `--profile desktop`：装进 Desktop 的 profile。没找到 Desktop 自带的 dsh 会拒绝，免得用普通 CLI 把 desktop profile 改坏
+- `-Profile web`：装进 Web / 终端 profile
+- `-DryRun`：只打印要跑的命令，不动 profile。想先看看会改什么就用这个
+- `-SkipPreferences`：不套用我的设置模板
+- `-Home <dir>`：指定 Harness home。默认用 `DSH_HOME`，再没有就是 `~/.dsh`
 
-- `allowBuilds`：放行 `ssh2`、`cpu-features`（来自 `dsh-ssh`）和 DSH 运行时的原生包（`node-pty`、`koffi`、`protobufjs`、`@deepseek-ai/dsh-subprocess-local`、`@google/genai`）的构建脚本
-- `nodeLinker: hoisted` 与 `autoInstallPeers: false`：与 DSH 自身的 profile 布局一致
+### 安装器会往你的 profile 里补几个 pnpm 设置
 
-只补缺失项。已经在用的 profile 保持原样，改动前备份为 `pnpm-workspace.yaml.bak-dsh-kit`。
+第一次装的时候，安装器会往 profile 的 `pnpm-workspace.yaml` 里补几项，不然装不上：
 
+- `allowBuilds`：放行 `ssh2`、`cpu-features`（`dsh-ssh` 要用）和 Harness 运行时的原生包（`node-pty`、`koffi`、`protobufjs`、`@deepseek-ai/dsh-subprocess-local`、`@google/genai`）。pnpm 11 只要见到没批准的构建脚本就整次中止
+- `nodeLinker: hoisted` 和 `autoInstallPeers: false`：跟 Harness 自己的 profile 布局保持一致
 
-## 以后怎么更新
+只补你没有的。已经在用的 profile 不会被重写，改之前会备份成 `pnpm-workspace.yaml.bak-dsh-kit`。
 
-你改这个库并推送。别人：
+## 想自己维护
 
-```powershell
-git pull
-.\install.ps1
-```
+fork 这个仓库，或者直接改你 clone 下来的那份。
 
-同一条命令，第一次是安装，以后是按清单对齐版本。本库里的插件是 `link:` 到克隆下来的目录，所以 `git pull` 之后重启 Harness 就会用到新源码。第三方插件只有 `manifest.json` 里的版本变了才会重装。
+**改插件源码**：`plugins/` 下面就是。装的时候是 `link:` 到 clone 的目录，所以改完 `git pull`（别人）或直接重启（你自己）就生效，不用重新打包。
 
-作者发布更新时：改 `plugins/` 或 `manifest.json`，先跑检查，再提交推送。
+**改装哪些插件**：编辑 `manifest.json`。`npm` 里放包名和版本，`local` 里放 `plugins/` 下的相对路径，`shippedOptional` 里放 Harness 自带的可选包名。
+
+**改我的设置模板**：`settings/preferences.patch.yml`。现在里面是中文界面、详细对话视图、默认 `grok-4.7` + `xhigh` 推理、加了一个插件市场索引。只在你的 `cordis.patch.yml` 还是空模板时才写入，你已经配置过就不动。
+
+发布前跑一下公开检查，它会把本机路径、账号令牌这类不该进仓库的东西拦下来：
 
 ```powershell
 pwsh -File scripts/check-public.ps1
@@ -73,52 +90,28 @@ git commit -m "更新插件清单"
 git push
 ```
 
-检查会拒绝用户主目录、引擎源码目录这类本机路径，以及写死的浏览器路径。账号和令牌不要进这个库。
+## 需要注意的
 
-## 库里有什么
+- **`cordis.patch.yml` 不在这里**。那是你自己的运行时配置，需要的话单独拷
+- **WorkBuddy 要自己登录**。形状看 `settings/workbuddy.example.yml`，填好的别提交
+- **桌宠本体不在这个库**。要装 [dsh-pet](https://github.com/MerZlin/dsh-pet-indesktop)，然后按 `settings/pet.example.yml` 写 `petDir`
+- **版本是按我这台机器锁的**。你那边 Harness 如果缺某个实验包，会跳过；版本不兼容时 dsh 会拒绝安装，安装器不会自动做版本豁免——真要装得自己处理
+- **Desktop 和官方包 appId 一样**。已经在用自建包的机器，别再装官方安装包，会盖掉自建那份
 
-| 内容 | 处理 |
-|---|---|
-| `plugins/dsh-connect-grok` | 自有源码，安装时链接进 profile |
-| `plugins/desktop-extras` | 自有源码。启用 worktree、有头浏览器、桌面控制。不写本机 Chrome 路径 |
-| `plugins/dsh-pet-bridge` | 桌宠桥接，MIT，来自 [dsh-pet](https://github.com/MerZlin/dsh-pet-indesktop) |
-| `plugins/dsh-pet-lifecycle` | 随 Harness 起停桌宠。公开版不写死目录，没配置就跳过 |
-| `manifest.json` | 第三方插件的包名和当时装上的版本 |
-| `settings/preferences.patch.yml` | 语言、详细对话、默认 Grok 模型、插件市场。不含账号 |
+## 不会放进来的
 
-第三方插件从 npm 安装，不把别人的源码再拷一份。随 Harness 自带、默认关闭的实验包，只有当前安装里真的有，才会写进 profile 的 bundle 列表。
+整个 profile、`node_modules`、锁文件、WorkBuddy 账号、本机绝对路径、Harness 源码，都不在这个库。
 
-## 不会放进来的东西
-
-- 整个 profile、`node_modules`、锁文件
-- WorkBuddy 账号、令牌、登录态
-- 本机绝对路径
-- Harness 源码。`dsh-harness-eval` 和 fork 里的 `@deepseek-ai/dsh-subagent-claude-code` 留在引擎仓库，不在这里
-
-WorkBuddy 装上之后要自己登录。形状示例在 `settings/workbuddy.example.yml`，填好的文件不要提交。
-
-桌宠本体不在这个库。需要的话另装 [dsh-pet](https://github.com/MerZlin/dsh-pet-indesktop)，再按 `settings/pet.example.yml` 写 `petDir`。
-
-## 设置模板
-
-只在 profile 的 `cordis.patch.yml` 还是空模板时写入。已经有自己的设置就不会覆盖。
-
-模板把默认模型设为 `grok-4.7`。Grok 插件要在设置页登录之后才能用。不想套用模板就加 `-SkipPreferences`。
-
-## 兼容
-
-清单按作者当时的自建 Desktop 锁定。官方安装包如果缺某个实验包，安装器会跳过那一项，不会为了装上而改你的 Harness。版本不兼容时，dsh 会拒绝安装；安装器不会自动做版本豁免。
-
-Desktop 和官方包的 appId 相同。已经在用自建包的机器，不要再装官方安装包，否则会盖掉自建安装。
+我 fork 的 Harness 是 [Aceared0829/deepseek-harness](https://github.com/Aceared0829/deepseek-harness)，引擎相关的改动在那里；这个库只管插件。
 
 ## English
 
-This repo installs a pinned DeepSeek Harness plugin set onto a machine that already has Harness. It does not install the app.
+This is my DeepSeek Harness plugin set, packaged so you can install it on your own Harness with one command.
 
-```sh
-git clone https://github.com/Aceared0829/dsh-kit.git
-cd dsh-kit
-./install.sh --profile web
-```
+It ships nine plugins I wrote or adapted — a Grok subscription connector, desktop extras (worktrees, headed browser, native control), and a desktop-pet bridge plus lifecycle — alongside a pinned list of third-party plugins I use daily, plus the experimental bundles Harness ships disabled but I keep switched on.
 
-Quit Desktop completely before installing into the `desktop` profile, and use the Desktop-bundled `dsh`. Re-run the installer after `git pull` to update. Accounts, tokens, and machine paths are not in this repo.
+`git clone` it, run `./install.ps1` (Windows) or `./install.sh` (macOS/Linux), then reopen Harness. Quit Desktop completely first if you are installing into its profile.
+
+Fork it and keep your own list: `manifest.json` says which packages and versions, `plugins/` holds the sources I wrote, `settings/preferences.patch.yml` is the configuration template mine uses.
+
+Accounts, tokens, and machine paths are deliberately not in this repo. Run `scripts/check-public.ps1` before you push your fork.
