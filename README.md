@@ -106,12 +106,100 @@ git push
 
 ## English
 
-This is my DeepSeek Harness plugin set, packaged so you can install it on your own Harness with one command.
+This is my DeepSeek Harness plugin set — the one I actually use every day — packaged so you can put it on your own Harness.
 
-It ships nine plugins I wrote or adapted — a Grok subscription connector, desktop extras (worktrees, headed browser, native control), and a desktop-pet bridge plus lifecycle — alongside a pinned list of third-party plugins I use daily, plus the experimental bundles Harness ships disabled but I keep switched on.
+I keep it as a repo you can install from with one command. Take the whole set, take a few of the plugins, or fork it and maintain your own list.
 
-`git clone` it, run `./install.ps1` (Windows) or `./install.sh` (macOS/Linux), then reopen Harness. Quit Desktop completely first if you are installing into its profile.
+> Looking for more Harness plugins? Search the [`dsh-plugin`](https://github.com/topics/dsh-plugin) topic on GitHub.
 
-Fork it and keep your own list: `manifest.json` says which packages and versions, `plugins/` holds the sources I wrote, `settings/preferences.patch.yml` is the configuration template mine uses.
+## What is in here
 
-Accounts, tokens, and machine paths are deliberately not in this repo. Run `scripts/check-public.ps1` before you push your fork.
+**Plugins I wrote** (sources live in this repo):
+
+| Plugin | What it does |
+|---|---|
+| `dsh-connect-grok` | Sign in with your xAI account and route Grok models through your SuperGrok quota. One login in Settings |
+| `desktop-extras` | Three Desktop capabilities at once: Git worktrees, a headed Playwright browser, and native desktop control |
+| `dsh-pet-bridge` | Writes agent state events to a local JSONL file for the desktop pet. Purely local, no network calls |
+| `dsh-pet-lifecycle` | Starts the pet with Harness and shuts it down on exit |
+
+**Plugins by other people**, installed from npm at the versions I pinned — I do not re-host their sources:
+
+`dsh-graph` (goal board), `dsh-context`, `@modusensus/dsh-mneme` (long-term memory), `dsh-diff-approval`, `dsh-planning-with-files`, `dsh-better-sidebar`, `@changfenhuang/dsh-genui` (UI components), three from `@goodandready/*`, six from `@linxin666/*`, and `dsh-connect-workbuddy`.
+
+The full list and versions are in [`manifest.json`](manifest.json).
+
+**Experimental bundles that Harness ships disabled** are switched on in my set: agent team, voice input, auto-review, inspector, the worktree tool, CoT translation, terminal, session search, session titles, the badge skill, ralph, and the plugin market. The installer checks whether your installation actually has each one and skips what is missing — it will not modify your Harness to force them in.
+
+## Installing it
+
+You need DeepSeek Harness already installed and `dsh` available in your terminal. This repo does not install Harness itself.
+
+**Desktop users:** register the `dsh` command in the app first, then **quit completely** from the tray. Closing the window is not enough — the Host keeps running in the background and the desktop profile cannot be written while it does.
+
+```powershell
+git clone https://github.com/Aceared0829/dsh-kit.git
+cd dsh-kit
+.\install.ps1
+```
+
+macOS / Linux:
+
+```sh
+git clone https://github.com/Aceared0829/dsh-kit.git
+cd dsh-kit
+chmod +x install.sh
+./install.sh --profile web
+```
+
+Reopen Harness when it finishes.
+
+Common flags:
+
+- `-Profile desktop` / `--profile desktop` — install into the Desktop profile. It refuses when the Desktop-bundled `dsh` cannot be found, so an ordinary CLI cannot corrupt that profile by accident
+- `-Profile web` — install into the Web / terminal profile
+- `-DryRun` — print the commands without touching the profile. Use this first if you want to see what will change
+- `-SkipPreferences` — do not apply my settings template
+- `-Home <dir>` — target a specific Harness home. Defaults to `DSH_HOME`, then `~/.dsh`
+
+### The installer adds a few pnpm settings to your profile
+
+On first install it writes a few keys into the profile's `pnpm-workspace.yaml`, because otherwise the install cannot complete:
+
+- `allowBuilds` — permits the build scripts of `ssh2` and `cpu-features` (needed by `dsh-ssh`) plus the Harness runtime's native packages (`node-pty`, `koffi`, `protobufjs`, `@deepseek-ai/dsh-subprocess-local`, `@google/genai`). pnpm 11 aborts the whole install when it finds an unapproved build script
+- `nodeLinker: hoisted` and `autoInstallPeers: false` — matches the layout Harness itself uses for a profile
+
+It only adds what you are missing. An existing profile is never rewritten, and the previous file is kept as `pnpm-workspace.yaml.bak-dsh-kit`.
+
+## Maintaining your own copy
+
+Fork the repo, or just edit the clone you already have.
+
+**Change a plugin:** the sources are under `plugins/`. They are installed as `link:` into your clone, so edits take effect on restart — no rebuild needed.
+
+**Change which plugins are installed:** edit `manifest.json`. Put package names and versions under `npm`, repo-relative paths under `local`, and the names of Harness-bundled optional bundles under `shippedOptional`.
+
+**Change my settings template:** `settings/preferences.patch.yml`. Right now it sets a Chinese UI, the verbose transcript view, `grok-4.7` at `xhigh` reasoning effort, and one plugin-market index. It is only applied while your `cordis.patch.yml` is still the empty template; anything you have configured is left alone.
+
+Before publishing, run the public check — it rejects machine paths, accounts, and tokens that should not reach a public repo:
+
+```powershell
+pwsh -File scripts/check-public.ps1
+git add -A
+git commit -m "Update the plugin list"
+git push
+```
+
+## Things worth knowing
+
+- **`cordis.patch.yml` is not included.** That is your own runtime configuration; copy it separately if you want it
+- **WorkBuddy needs its own login.** The shape is in `settings/workbuddy.example.yml`; do not commit a filled-in copy
+- **The desktop pet itself is not in this repo.** Install [dsh-pet](https://github.com/MerZlin/dsh-pet-indesktop) and set `petDir` following `settings/pet.example.yml`
+- **Versions are pinned against my machine.** If your Harness lacks an optional bundle, the installer skips it. When a version is incompatible, `dsh` refuses the install rather than silently exempting it — you would have to handle that yourself
+- **Desktop and the official package share an appId.** If you already run a self-built package, do not install the official build over it
+
+## What is deliberately not here
+
+The whole profile, `node_modules`, lockfiles, WorkBuddy accounts, absolute machine paths, and Harness sources stay out of this repo.
+
+The Harness I run is my fork, [Aceared0829/deepseek-harness](https://github.com/Aceared0829/deepseek-harness). Engine changes go there; this repo is only about plugins.
