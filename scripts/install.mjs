@@ -13,6 +13,33 @@ const kitRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const NPM_SPEC = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*@\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/
 const SHIPPED_NAME = /^@deepseek-ai\/dsh-[a-z0-9-]+$/
 
+/**
+ * Settings a DSH profile needs before `dsh plugin add` can install anything on a fresh machine.
+ *
+ * Two independent failures make a stock profile unusable:
+ *
+ * - pnpm 11 aborts an install whose dependency tree contains an unapproved build script
+ *   (`ERR_PNPM_IGNORED_BUILDS`). `ssh2`/`cpu-features` come from `@linxin666/dsh-ssh`, and linking a local plugin
+ *   pulls the DSH runtime's own native packages (`node-pty`, `koffi`, `@deepseek-ai/dsh-subprocess-local`,
+ *   `@google/genai`, `protobufjs`). All of them have to be allowed or the very first add fails.
+ * - A profile without `nodeLinker: hoisted` installs an isolated store, which changes how the DSH runtime resolves
+ *   its own dependencies and makes every plugin carry its own copy of them.
+ */
+const PROFILE_WORKSPACE_DEFAULTS = {
+  nodeLinker: 'hoisted',
+  autoInstallPeers: 'false',
+}
+
+const REQUIRED_BUILDS = [
+  'cpu-features',
+  'koffi',
+  'node-pty',
+  'protobufjs',
+  'ssh2',
+  '@deepseek-ai/dsh-subprocess-local',
+  '@google/genai',
+]
+
 function fail(message, code = 1) {
   console.error(message)
   process.exit(code)
@@ -147,13 +174,23 @@ function cmdQuote(value) {
   return '"' + value.replace(/"/g, '""') + '"'
 }
 
-function runDsh(dsh, args, dryRun) {
+/**
+ * Run `dsh plugin` against one profile. `dsh` selects its home from `DSH_HOME`, not from a flag, so `--home` must
+ * be exported here: without it the child resolves the default `~/.dsh` and a scripted install silently writes to a
+ * different profile than the one this installer just configured.
+ * @param {string} dsh dsh executable
+ * @param {string[]} args `plugin` arguments
+ * @param {boolean} dryRun report the command without running it
+ * @param {string} home DSH_HOME the child must use
+ */
+function runDsh(dsh, args, dryRun, home) {
   const shown = [dsh, ...args].join(' ')
   console.log(dryRun ? '  [dry-run] ' + shown : '  $ ' + shown)
   if (dryRun) return 0
+  const env = { ...process.env, DSH_HOME: home }
   const result = process.platform === 'win32'
-    ? spawnSync([dsh, ...args].map(cmdQuote).join(' '), { shell: true, stdio: 'inherit', windowsVerbatimArguments: true })
-    : spawnSync(dsh, args, { stdio: 'inherit' })
+    ? spawnSync([dsh, ...args].map(cmdQuote).join(' '), { shell: true, stdio: 'inherit', windowsVerbatimArguments: true, env })
+    : spawnSync(dsh, args, { stdio: 'inherit', env })
   return result.status ?? 1
 }
 
@@ -273,6 +310,80 @@ function selectProfile(requested, home) {
   return 'web'
 }
 
+/** Read the two-space `key: value` pairs under a top-level YAML key, without a YAML dependency. */
+function readYamlSection(text, section) {
+  const lines = text.split(/\r?\n/)
+  const start = lines.findIndex(line => new RegExp('^' + section + ':\\s*$').test(line))
+  if (start < 0) return {}
+  const out = {}
+  for (let i = start + 1; i < lines.length; i++) {
+    const line = lines[i]
+    if (line.trim() === '') continue
+    // A non-indented line ends the section.
+    if (!/^\s/.test(line)) break
+    const matched = line.match(/^\s+([^:#]+?):\s*(.*)$/)
+    if (matched) out[matched[1].trim().replace(/^['"]|['"]$/g, '')] = matched[2].trim()
+  }
+  return out
+}
+
+/**
+ * Quote a YAML scalar when it starts with a character YAML reserves, as scoped package names do.
+ * @param {string} value raw key or value
+ * @returns the value as a safe YAML scalar
+ */
+function yamlScalar(value) {
+  return /^[@*&!|>%#`{}[\],:?'"-]/.test(value) || value === '' ? JSON.stringify(value) : value
+}
+
+/**
+ * Write the profile settings `dsh plugin add` needs, preserving everything already there.
+ *
+ * Only missing top-level keys are added and only missing `allowBuilds` entries are appended, so a profile that
+ * already works (including the `minimumReleaseAgeExclude` list pnpm maintains itself) is left as it was.
+ * @param {string} profileDir profile being installed into
+ * @param {boolean} dryRun report without writing
+ */
+function ensureProfileWorkspaceSettings(profileDir, dryRun) {
+  const path = join(profileDir, 'pnpm-workspace.yaml')
+  const current = existsSync(path) ? readFileSync(path, 'utf8') : ''
+  const approved = readYamlSection(current, 'allowBuilds')
+  const missingBuilds = REQUIRED_BUILDS.filter(name => approved[name] === undefined)
+  const missingDefaults = Object.entries(PROFILE_WORKSPACE_DEFAULTS)
+    .filter(([key]) => !new RegExp('^' + key + ':', 'm').test(current))
+  if (missingBuilds.length === 0 && missingDefaults.length === 0) {
+    console.log('profile 的 pnpm 设置已就绪')
+    return
+  }
+  if (dryRun) {
+    if (missingDefaults.length > 0) console.log('  [dry-run] 将写入 ' + missingDefaults.map(([k, v]) => k + ': ' + v).join(', '))
+    if (missingBuilds.length > 0) console.log('  [dry-run] 将允许构建: ' + missingBuilds.join(', '))
+    return
+  }
+  let next = current === '' ? 'packages:\n  - .\n' : current
+  for (const [key, value] of missingDefaults) next = next.replace(/\s*$/, '\n') + key + ': ' + value + '\n'
+  if (missingBuilds.length > 0) {
+    const block = missingBuilds.map(name => '  ' + yamlScalar(name) + ': true').join('\n')
+    if (Object.keys(approved).length > 0) {
+      // Append under the existing allowBuilds section, before the next top-level key.
+      const lines = next.split(/\r?\n/)
+      const start = lines.findIndex(line => /^allowBuilds:\s*$/.test(line))
+      let last = start
+      for (let i = start + 1; i < lines.length; i++) {
+        if (lines[i].trim() === '') continue
+        if (!/^\s/.test(lines[i])) break
+        last = i
+      }
+      lines.splice(last + 1, 0, block)
+      next = lines.join('\n')
+    } else next = next.replace(/\s*$/, '\n') + 'allowBuilds:\n' + block + '\n'
+  }
+  if (current !== '') copyFileSync(path, path + '.bak-dsh-kit')
+  writeFileSync(path, next)
+  const wrote = [...missingDefaults.map(([k, v]) => k + ': ' + v), ...missingBuilds.length > 0 ? ['allowBuilds（' + missingBuilds.join(', ') + '）'] : []]
+  console.log('已写入 profile 设置: ' + wrote.join(', ') + (current === '' ? '' : '（原文件备份为 pnpm-workspace.yaml.bak-dsh-kit）'))
+}
+
 function main() {
   const args = parseArgs(process.argv.slice(2))
   if (args.help) {
@@ -306,6 +417,9 @@ function main() {
   const profileJsonPath = join(dir, 'package.json')
   if (existsSync(profileJsonPath)) deps = JSON.parse(readFileSync(profileJsonPath, 'utf8')).dependencies ?? {}
 
+  // Before any package operation: pnpm refuses the whole add while an unapproved build script is in the tree.
+  ensureProfileWorkspaceSettings(dir, args.dryRun)
+
   const npmAdd = []
   for (const item of manifest.npm) {
     const spec = item.name + '@' + item.version
@@ -329,17 +443,17 @@ function main() {
 
   if (localRemove.length > 0) {
     console.log('先卸掉旧位置的本地插件，再链到本库')
-    const code = runDsh(dsh, ['plugin', '--profile', profile, 'remove', ...localRemove], args.dryRun)
+    const code = runDsh(dsh, ['plugin', '--profile', profile, 'remove', ...localRemove], args.dryRun, home)
     if (code !== 0) fail('卸载旧链接失败，退出码 ' + code)
   }
   if (npmAdd.length > 0) {
     console.log('安装或更新第三方插件')
-    const code = runDsh(dsh, ['plugin', '--profile', profile, 'add', ...npmAdd], args.dryRun)
+    const code = runDsh(dsh, ['plugin', '--profile', profile, 'add', ...npmAdd], args.dryRun, home)
     if (code !== 0) fail('第三方插件安装失败，退出码 ' + code + '\n如果提示 already-installed，先完全退出应用再重跑。')
   } else console.log('第三方插件版本已对齐')
   if (localAdd.length > 0) {
     console.log('链接本库里的插件')
-    const code = runDsh(dsh, ['plugin', '--profile', profile, 'add', ...localAdd], args.dryRun)
+    const code = runDsh(dsh, ['plugin', '--profile', profile, 'add', ...localAdd], args.dryRun, home)
     if (code !== 0) fail('本地插件链接失败，退出码 ' + code)
   } else console.log('本库插件已链接')
   if (!args.skipShipped && Array.isArray(manifest.shippedOptional)) {
