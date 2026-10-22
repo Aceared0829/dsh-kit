@@ -16,7 +16,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
+import { spawn, execFileSync } from 'node:child_process'
 
 const PLUGIN_ID = 'dsh-pet-lifecycle'
 
@@ -100,7 +100,46 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  /** 桌宠是否已有存活实例（读它自己写的运行标记，pid 活着就算）。 */
+  /**
+   * 该 pid 是否真的是桌宠进程。
+   *
+   * 为什么需要：runtime 标记里只有 pid，而 Windows 的 pid 会被系统复用——
+   * 桌宠退出后残留标记里的 pid 可能已被系统进程（如 RuntimeBroker）占用，
+   * `process.kill(pid, 0)` 成功就让插件误判「桌宠已在运行」并直接 return，
+   * 桌宠从此再也不会被拉起，且一句警告都没有。
+   * 判据：进程存活 + 命令行确实是 `-m pet`（或可执行文件在 petDir 下）。
+   * 拿不到命令行时按「不是桌宠」处理——多起一次会撞桌宠自己的实例门
+   * （静默退出），比永久起不来安全。
+   */
+  const pidLooksLikePet = (pid) => {
+    try {
+      process.kill(pid, 0)
+    } catch {
+      return false
+    }
+    try {
+      const commandLine = process.platform === 'win32'
+        ? execFileSync(
+            'powershell.exe',
+            [
+              '-NoProfile', '-NonInteractive', '-Command',
+              `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" -ErrorAction SilentlyContinue; ` +
+              'if ($p) { "$($p.ExecutablePath)|$($p.CommandLine)" }',
+            ],
+            { encoding: 'utf8', windowsHide: true, timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] },
+          ).trim()
+        : execFileSync('ps', ['-p', String(pid), '-o', 'command='],
+            { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+      if (!commandLine) return false
+      const normalized = commandLine.replace(/\\/g, '/').toLowerCase()
+      return normalized.includes('-m pet') ||
+        normalized.includes(path.resolve(petDir).replace(/\\/g, '/').toLowerCase())
+    } catch {
+      return false
+    }
+  }
+
+  /** 桌宠是否已有存活实例（读它自己写的运行标记，pid 活着且确认是桌宠才算）。 */
   const petAlreadyRunning = () => {
     try {
       const names = fs.readdirSync(petDataDir)
@@ -109,12 +148,7 @@ export function apply(ctx, config = {}) {
         const raw = JSON.parse(fs.readFileSync(path.join(petDataDir, fileName), 'utf8'))
         const pid = Number(raw?.pid || 0)
         if (!Number.isInteger(pid) || pid <= 0) continue
-        try {
-          process.kill(pid, 0)
-          return pid
-        } catch {
-          // 已死：留给桌宠自己的标记回收逻辑处理
-        }
+        if (pidLooksLikePet(pid)) return pid
       }
     } catch {
       // 目录还不存在 / 无权限：当作没有实例
