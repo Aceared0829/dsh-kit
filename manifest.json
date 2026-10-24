@@ -1,6 +1,6 @@
 {
   "name": "dsh-kit",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "npm": [
     {
       "name": "@changfenhuang/dsh-genui",
@@ -8,7 +8,7 @@
     },
     {
       "name": "@deepseek-ai/dsh-subagent-claude-code",
-      "version": "0.2.1-rc.2"
+      "version": "0.2.1-rc.3"
     },
     {
       "name": "@goodandready/dsh-context-lens",
@@ -40,7 +40,7 @@
     },
     {
       "name": "billion-context",
-      "version": "0.1.204"
+      "version": "0.1.206"
     },
     {
       "name": "ds-bot",
@@ -52,11 +52,11 @@
     },
     {
       "name": "dsh-claude-style",
-      "version": "0.18.2"
+      "version": "0.19.0"
     },
     {
       "name": "dsh-context",
-      "version": "0.73.3"
+      "version": "0.75.1"
     },
     {
       "name": "dsh-github-connect",
