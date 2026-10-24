@@ -92,6 +92,10 @@
     {
       "name": "dsh-harness-eval",
       "path": "plugins/harness-eval"
+    },
+    {
+      "name": "@dsh-pet/lifecycle",
+      "path": "plugins/dsh-pet-lifecycle"
     }
   ],
   "shippedOptional": [
@@ -106,6 +110,7 @@
     "@deepseek-ai/dsh-experimental-session-titles-bundle",
     "@deepseek-ai/dsh-experimental-terminal-bundle",
     "@deepseek-ai/dsh-experimental-tool-worktree",
-    "@deepseek-ai/dsh-experimental-voice-input-bundle"
+    "@deepseek-ai/dsh-experimental-voice-input-bundle",
+    "@deepseek-ai/dsh-personalized-recommendations"
   ]
 }

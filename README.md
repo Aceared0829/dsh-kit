@@ -22,6 +22,7 @@
 | `desktop-extras` | 一次开三个 Desktop 能力：Git worktree、有头 Playwright 浏览器、桌面控制 |
 | `dsh-image-viewer` | 点开对话里的图片和工具截图，缩放、拖动查看 |
 | `harness-eval` | 会话证据面板：一轮活干坏在哪儿、花了多少、重试长什么样 |
+| `dsh-pet-lifecycle` | 让桌宠跟着 Harness 一起起停：启动时拉起，退出时关掉。装到别人机器上要自己配 `petDir`（见 `plugins/dsh-pet-lifecycle/LOCAL-CHANGES.md`） |
 
 **我改过的这些**（上游在 npm，我改的地方源码也放进来了，装的是我这份）：
 
@@ -35,7 +36,7 @@
 
 完整清单和版本在 [`manifest.json`](manifest.json)。
 
-**Harness 自带、默认关着的实验包**，我这套里也开了：agent team、语音输入、自动评审、inspector、worktree 工具、CoT 翻译、终端、会话搜索、会话标题、badge skill、ralph、插件市场。装的时候会自动检查你那边有没有这些包，没有就跳过，不会为了装上而改你的 Harness。
+**Harness 自带、默认关着的实验包**，我这套里也开了：agent team、语音输入、自动评审、inspector、worktree 工具、CoT 翻译、终端、会话搜索、会话标题、badge skill、ralph、插件市场、个性化推荐。装的时候会自动检查你那边有没有这些包，没有就跳过，不会为了装上而改你的 Harness。
 
 ## 装到你的机器上
 
@@ -128,6 +129,7 @@ I keep it as a repo you can install from with one command. Take the whole set, t
 | `desktop-extras` | Three Desktop capabilities at once: Git worktrees, a headed Playwright browser, and native desktop control |
 | `dsh-image-viewer` | Open an image or tool screenshot from the transcript and zoom, pan around |
 | `harness-eval` | Session evidence tab: where a run broke down, what it cost, and what the retry looked like |
+| `dsh-pet-lifecycle` | Starts the desktop pet with Harness and shuts it down on exit. Set `petDir` yourself on another machine (see `plugins/dsh-pet-lifecycle/LOCAL-CHANGES.md`) |
 
 **Plugins I modified** (upstream is on npm; my changed sources are here too, and my copy is what gets installed):
 
@@ -141,7 +143,7 @@ I keep it as a repo you can install from with one command. Take the whole set, t
 
 The full list and versions are in [`manifest.json`](manifest.json).
 
-**Experimental bundles that Harness ships disabled** are switched on in my set: agent team, voice input, auto-review, inspector, the worktree tool, CoT translation, terminal, session search, session titles, the badge skill, ralph, and the plugin market. The installer checks whether your installation actually has each one and skips what is missing — it will not modify your Harness to force them in.
+**Experimental bundles that Harness ships disabled** are switched on in my set: agent team, voice input, auto-review, inspector, the worktree tool, CoT translation, terminal, session search, session titles, the badge skill, ralph, the plugin market, and personalized recommendations. The installer checks whether your installation actually has each one and skips what is missing — it will not modify your Harness to force them in.
 
 ## Installing it
 
