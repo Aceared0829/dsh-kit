@@ -1,37 +1,111 @@
 {
   "name": "dsh-kit",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "npm": [
-    { "name": "@changfenhuang/dsh-genui", "version": "0.14.0" },
-    { "name": "@goodandready/dsh-context-lens", "version": "0.1.33" },
-    { "name": "@goodandready/dsh-time-machine", "version": "0.1.29" },
-    { "name": "@linxin666/dsh-client-ui-model-capabilities", "version": "0.4.4" },
-    { "name": "@linxin666/dsh-session-archive", "version": "0.4.4" },
-    { "name": "@linxin666/dsh-usage", "version": "0.4.4" },
-    { "name": "@modusensus/dsh-mneme", "version": "0.9.4" },
-    { "name": "dsh-better-sidebar", "version": "0.28.0" },
-    { "name": "dsh-connect-workbuddy", "version": "5.7.0" },
-    { "name": "dsh-context", "version": "0.73.3" },
-    { "name": "dsh-graph", "version": "0.21.0" }
+    {
+      "name": "@changfenhuang/dsh-genui",
+      "version": "0.14.0"
+    },
+    {
+      "name": "@deepseek-ai/dsh-subagent-claude-code",
+      "version": "0.2.1-rc.2"
+    },
+    {
+      "name": "@goodandready/dsh-context-lens",
+      "version": "0.1.33"
+    },
+    {
+      "name": "@goodandready/dsh-time-machine",
+      "version": "0.1.29"
+    },
+    {
+      "name": "@linxin666/dsh-client-ui-model-capabilities",
+      "version": "0.4.4"
+    },
+    {
+      "name": "@linxin666/dsh-session-archive",
+      "version": "0.4.4"
+    },
+    {
+      "name": "@linxin666/dsh-usage",
+      "version": "0.4.4"
+    },
+    {
+      "name": "@modusensus/dsh-mneme",
+      "version": "0.9.4"
+    },
+    {
+      "name": "@tt-a1i/archify-dsh",
+      "version": "1.0.0"
+    },
+    {
+      "name": "billion-context",
+      "version": "0.1.204"
+    },
+    {
+      "name": "ds-bot",
+      "version": "0.2.1"
+    },
+    {
+      "name": "dsh-better-sidebar",
+      "version": "0.28.0"
+    },
+    {
+      "name": "dsh-claude-style",
+      "version": "0.18.2"
+    },
+    {
+      "name": "dsh-context",
+      "version": "0.73.3"
+    },
+    {
+      "name": "dsh-github-connect",
+      "version": "0.2.0",
+      "spec": "github:Moon-shiyue/dsh-github-connect#89f8258fcca57fdd017bea64e2682f275302f813"
+    },
+    {
+      "name": "dsh-graph",
+      "version": "0.21.0"
+    },
+    {
+      "name": "dsh-super-code",
+      "version": "0.3.6"
+    }
   ],
   "local": [
-    { "name": "dsh-connect-grok", "path": "plugins/dsh-connect-grok" },
-    { "name": "@local/dsh-desktop-extras", "path": "plugins/desktop-extras" },
-    { "name": "@dsh-pet/bridge", "path": "plugins/dsh-pet-bridge" },
-    { "name": "@dsh-pet/lifecycle", "path": "plugins/dsh-pet-lifecycle" }
+    {
+      "name": "@local/dsh-desktop-extras",
+      "path": "plugins/desktop-extras"
+    },
+    {
+      "name": "@local/dsh-image-viewer",
+      "path": "plugins/dsh-image-viewer"
+    },
+    {
+      "name": "dsh-connect-grok",
+      "path": "plugins/dsh-connect-grok"
+    },
+    {
+      "name": "dsh-connect-workbuddy",
+      "path": "plugins/dsh-connect-workbuddy"
+    },
+    {
+      "name": "dsh-harness-eval",
+      "path": "plugins/harness-eval"
+    }
   ],
   "shippedOptional": [
     "@deepseek-ai/dsh-experimental-agent-team-profile",
-    "@deepseek-ai/dsh-experimental-voice-input-bundle",
     "@deepseek-ai/dsh-experimental-auto-review",
-    "@deepseek-ai/dsh-experimental-inspector-profile",
-    "@deepseek-ai/dsh-experimental-tool-worktree",
+    "@deepseek-ai/dsh-experimental-badge-skill-bundle",
     "@deepseek-ai/dsh-experimental-cot-translation-bundle",
-    "@deepseek-ai/dsh-experimental-terminal-bundle",
+    "@deepseek-ai/dsh-experimental-inspector-profile",
+    "@deepseek-ai/dsh-experimental-plugin-market-bundle",
+    "@deepseek-ai/dsh-experimental-ralph-bundle",
     "@deepseek-ai/dsh-experimental-session-search",
     "@deepseek-ai/dsh-experimental-session-titles-bundle",
-    "@deepseek-ai/dsh-experimental-badge-skill-bundle",
-    "@deepseek-ai/dsh-experimental-ralph-bundle",
-    "@deepseek-ai/dsh-experimental-plugin-market-bundle"
+    "@deepseek-ai/dsh-experimental-terminal-bundle",
+    "@deepseek-ai/dsh-experimental-tool-worktree",
+    "@deepseek-ai/dsh-experimental-voice-input-bundle"
   ]
 }

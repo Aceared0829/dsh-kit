@@ -20,12 +20,18 @@
 |---|---|
 | `dsh-connect-grok` | 用你的 xAI 账号登录，把 Grok 模型走 SuperGrok 额度。设置页里登录一次就能用 |
 | `desktop-extras` | 一次开三个 Desktop 能力：Git worktree、有头 Playwright 浏览器、桌面控制 |
-| `dsh-pet-bridge` | 把 agent 状态事件写到本地 jsonl，给桌宠用。纯本地，不发网络请求 |
-| `dsh-pet-lifecycle` | 让桌宠跟着 Harness 一起起停，退出时自动关掉 |
+| `dsh-image-viewer` | 点开对话里的图片和工具截图，缩放、拖动查看 |
+| `harness-eval` | 会话证据面板：一轮活干坏在哪儿、花了多少、重试长什么样 |
+
+**我改过的这些**（上游在 npm，我改的地方源码也放进来了，装的是我这份）：
+
+| 插件 | 相对上游改了什么 |
+|---|---|
+| `dsh-connect-workbuddy` | 中文本地构建（`5.7.0-zh.1`）：固定的中文系统提示、Web GUI 段的中文版、把上游那些会触发网关拒答的英文指纹换成中文。改法与升级流程见 `plugins/dsh-connect-workbuddy/LOCAL-CHANGES.md` |
 
 **别人做的这些**（从 npm 装，清单里锁了版本，我没把源码再拷一份）：
 
-`dsh-graph`（目标看板）、`dsh-context`、`@modusensus/dsh-mneme`（长期记忆）、`dsh-better-sidebar`、`@changfenhuang/dsh-genui`（界面组件）、`@goodandready/*` 两个（`dsh-context-lens`、`dsh-time-machine`）、`@linxin666/*` 三个（`session-archive`、`usage`、`client-ui-model-capabilities`）、`dsh-connect-workbuddy`。
+`dsh-graph`（目标看板）、`dsh-context`、`@modusensus/dsh-mneme`（长期记忆）、`dsh-better-sidebar`、`@changfenhuang/dsh-genui`（界面组件）、`@goodandready/*` 两个（`dsh-context-lens`、`dsh-time-machine`）、`@linxin666/*` 三个（`session-archive`、`usage`、`client-ui-model-capabilities`）、`billion-context`、`dsh-claude-style`、`dsh-super-code`、`ds-bot`、`dsh-github-connect`、`@tt-a1i/archify-dsh`、`@deepseek-ai/dsh-subagent-claude-code`。
 
 完整清单和版本在 [`manifest.json`](manifest.json)。
 
@@ -84,7 +90,7 @@ fork 这个仓库，或者直接改你 clone 下来的那份。
 发布前跑一下公开检查，它会把本机路径、账号令牌这类不该进仓库的东西拦下来：
 
 ```powershell
-pwsh -File scripts/check-public.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-public.ps1
 git add -A
 git commit -m "更新插件清单"
 git push
@@ -94,14 +100,13 @@ git push
 
 - **`cordis.patch.yml` 不在这里**。那是你自己的运行时配置，需要的话单独拷
 - **WorkBuddy 要自己登录**。形状看 `settings/workbuddy.example.yml`，填好的别提交
-- **WorkBuddy 的版本是 npm 上的 5.7.0，我本机跑的是自己的中文本地构建**（`5.7.0-zh.1`，`link:` 进 profile）。那份构建不在这个库，别人装到的是 npm 版
-- **桌宠本体不在这个库**。要装 [dsh-pet](https://github.com/MerZlin/dsh-pet-indesktop)，然后按 `settings/pet.example.yml` 写 `petDir`
+- **版本是照我这台机器锁的**。装到别人机器上，npm 那些是同样的版本，我改过的和自建的（`dsh-connect-workbuddy`、`dsh-image-viewer`、`harness-eval` 等）是同一个仓库里的同一份源码，装出来跟我这边一致。升级 WorkBuddy 上游时按 `plugins/dsh-connect-workbuddy/LOCAL-CHANGES.md` 的流程走，别直接 `dsh plugin add` 覆盖
 - **版本是按我这台机器锁的**。你那边 Harness 如果缺某个实验包，会跳过；版本不兼容时 dsh 会拒绝安装，安装器不会自动做版本豁免——真要装得自己处理
 - **Desktop 和官方包 appId 一样**。已经在用自建包的机器，别再装官方安装包，会盖掉自建那份
 
 ## 不会放进来的
 
-整个 profile、`node_modules`、锁文件、WorkBuddy 账号、本机绝对路径、Harness 源码，都不在这个库。
+整个 profile、`node_modules`（唯一的例外是 `plugins/dsh-connect-workbuddy/node_modules/@deepseek-ai/schemastery`——这个包不在 profile 根上，不带就得自己装）、锁文件、WorkBuddy 账号、本机绝对路径、Harness 源码，都不在这个库。
 
 我 fork 的 Harness 是 [Aceared0829/deepseek-harness](https://github.com/Aceared0829/deepseek-harness)，引擎相关的改动在那里；这个库只管插件。
 
@@ -121,12 +126,18 @@ I keep it as a repo you can install from with one command. Take the whole set, t
 |---|---|
 | `dsh-connect-grok` | Sign in with your xAI account and route Grok models through your SuperGrok quota. One login in Settings |
 | `desktop-extras` | Three Desktop capabilities at once: Git worktrees, a headed Playwright browser, and native desktop control |
-| `dsh-pet-bridge` | Writes agent state events to a local JSONL file for the desktop pet. Purely local, no network calls |
-| `dsh-pet-lifecycle` | Starts the pet with Harness and shuts it down on exit |
+| `dsh-image-viewer` | Open an image or tool screenshot from the transcript and zoom, pan around |
+| `harness-eval` | Session evidence tab: where a run broke down, what it cost, and what the retry looked like |
+
+**Plugins I modified** (upstream is on npm; my changed sources are here too, and my copy is what gets installed):
+
+| Plugin | What differs from upstream |
+|---|---|
+| `dsh-connect-workbuddy` | A Chinese local build (`5.7.0-zh.1`): fixed Chinese system prompt, a Chinese rendering of the Web GUI paragraph, and the upstream English fingerprints that the gateway rejects replaced with Chinese. The changes and the upgrade procedure are in `plugins/dsh-connect-workbuddy/LOCAL-CHANGES.md` |
 
 **Plugins by other people**, installed from npm at the versions I pinned — I do not re-host their sources:
 
-`dsh-graph` (goal board), `dsh-context`, `@modusensus/dsh-mneme` (long-term memory), `dsh-better-sidebar`, `@changfenhuang/dsh-genui` (UI components), two from `@goodandready/*` (`dsh-context-lens`, `dsh-time-machine`), three from `@linxin666/*` (`session-archive`, `usage`, `client-ui-model-capabilities`), and `dsh-connect-workbuddy`.
+`dsh-graph` (goal board), `dsh-context`, `@modusensus/dsh-mneme` (long-term memory), `dsh-better-sidebar`, `@changfenhuang/dsh-genui` (UI components), two from `@goodandready/*` (`dsh-context-lens`, `dsh-time-machine`), three from `@linxin666/*` (`session-archive`, `usage`, `client-ui-model-capabilities`), plus `billion-context`, `dsh-claude-style`, `dsh-super-code`, `ds-bot`, `dsh-github-connect`, `@tt-a1i/archify-dsh`, and `@deepseek-ai/dsh-subagent-claude-code`.
 
 The full list and versions are in [`manifest.json`](manifest.json).
 
@@ -185,7 +196,7 @@ Fork the repo, or just edit the clone you already have.
 Before publishing, run the public check — it rejects machine paths, accounts, and tokens that should not reach a public repo:
 
 ```powershell
-pwsh -File scripts/check-public.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-public.ps1
 git add -A
 git commit -m "Update the plugin list"
 git push
@@ -195,13 +206,11 @@ git push
 
 - **`cordis.patch.yml` is not included.** That is your own runtime configuration; copy it separately if you want it
 - **WorkBuddy needs its own login.** The shape is in `settings/workbuddy.example.yml`; do not commit a filled-in copy
-- **WorkBuddy is pinned to npm 5.7.0; my machine runs my own Chinese local build** (`5.7.0-zh.1`, linked into the profile). That build is not in this repo — installing from here gets the npm one
-- **The desktop pet itself is not in this repo.** Install [dsh-pet](https://github.com/MerZlin/dsh-pet-indesktop) and set `petDir` following `settings/pet.example.yml`
-- **Versions are pinned against my machine.** If your Harness lacks an optional bundle, the installer skips it. When a version is incompatible, `dsh` refuses the install rather than silently exempting it — you would have to handle that yourself
+- **Versions are pinned against my machine.** On someone else's box the npm entries resolve to the same versions, and the ones I modified or wrote myself (`dsh-connect-workbuddy`, `dsh-image-viewer`, `harness-eval`, …) come from the same sources in this repo, so an install lands on what I run. When upgrading WorkBuddy's upstream, follow `plugins/dsh-connect-workbuddy/LOCAL-CHANGES.md` — do not overwrite it with `dsh plugin add`
 - **Desktop and the official package share an appId.** If you already run a self-built package, do not install the official build over it
 
 ## What is deliberately not here
 
-The whole profile, `node_modules`, lockfiles, WorkBuddy accounts, absolute machine paths, and Harness sources stay out of this repo.
+The whole profile, `node_modules` (one exception: `plugins/dsh-connect-workbuddy/node_modules/@deepseek-ai/schemastery`, which is not present at the profile root and would otherwise have to be installed separately), lockfiles, WorkBuddy accounts, absolute machine paths, and Harness sources stay out of this repo.
 
 The Harness I run is my fork, [Aceared0829/deepseek-harness](https://github.com/Aceared0829/deepseek-harness). Engine changes go there; this repo is only about plugins.

@@ -1,0 +1,931 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>账号池 · 演示设置界面 — dsh-connect-workbuddy</title>
+<style>
+/* ============================================================================
+   沿用插件真实设计令牌（--dsw-alias-*）与类名前缀 dsm-workbuddy-*。
+   这份演示稿是「国内版 tab 内新增账号池区块」的形态预览，不是最终实现。
+   ========================================================================== */
+:root{
+  --dsw-alias-border-l2:#36373b; --dsw-alias-border-l1:#2c2d31;
+  --dsw-alias-bg-layer-1:#1b1c20; --dsw-alias-bg-layer-2:#25262b; --dsw-alias-bg-layer-3:#202126;
+  --dsw-alias-label-primary:#e6e6e6; --dsw-alias-label-secondary:#b8b8b8;
+  --dsw-alias-label-tertiary:#999; --dsw-alias-label-dimmed:#777;
+  --dsw-alias-brand-primary:#5686fe;
+  --dsw-alias-state-success-primary:#22c55e; --dsw-alias-state-warn-primary:#f59e0b;
+  --dsw-alias-state-error-primary:#ef4444;
+}
+@media (prefers-color-scheme: light){
+  :root{
+    --dsw-alias-border-l2:#e2e4e9; --dsw-alias-border-l1:#eceef2;
+    --dsw-alias-bg-layer-1:#f6f7f9; --dsw-alias-bg-layer-2:#fff; --dsw-alias-bg-layer-3:#fbfbfc;
+    --dsw-alias-label-primary:#1f2023; --dsw-alias-label-secondary:#4b4f56;
+    --dsw-alias-label-tertiary:#767a82; --dsw-alias-label-dimmed:#a5a9b0;
+    --dsw-alias-brand-primary:#3f6fe0;
+    --dsw-alias-state-success-primary:#16a34a; --dsw-alias-state-warn-primary:#d97706;
+    --dsw-alias-state-error-primary:#dc2626;
+  }
+}
+*{box-sizing:border-box}
+body{
+  margin:0; padding:28px 20px 64px;
+  font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+  color:var(--dsw-alias-label-primary); background:var(--dsw-alias-bg-layer-1);
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:18px}
+.demo-note{
+  padding:12px 14px;border:1px dashed var(--dsw-alias-border-l2);border-radius:10px;
+  background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:1.7;
+}
+.demo-note b{color:var(--dsw-alias-label-secondary);font-weight:600}
+.demo-note code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;
+  background:var(--dsw-alias-bg-layer-2);padding:1px 5px;border-radius:4px;border:1px solid var(--dsw-alias-border-l1)}
+
+/* ---- 卡片外壳（与 dsm-plugin-card 一致） ---- */
+.dsm-plugin-card{border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-3);
+  border-radius:12px;list-style:none;transition:border-color .16s,background .16s}
+.dsm-plugin-card-open{background:var(--dsw-alias-bg-layer-2);border-color:var(--dsw-alias-label-dimmed)}
+.dsm-plugin-card-header{appearance:none;width:100%;font:inherit;color:inherit;text-align:left;cursor:pointer;
+  background:transparent;border:0;border-radius:12px;align-items:center;gap:12px;padding:14px 16px;display:flex}
+.dsm-plugin-card-head{flex-direction:column;flex:1;gap:4px;min-width:0;display:flex}
+.dsm-plugin-card-title{color:var(--dsw-alias-label-primary);font-size:15px;font-weight:600;line-height:1.4}
+.dsm-plugin-card-description{color:var(--dsw-alias-label-tertiary);font-size:13px;line-height:1.5}
+.dsm-plugin-card-chevron{color:var(--dsw-alias-label-tertiary);flex:none;width:16px;height:16px;position:relative;transition:transform .16s}
+.dsm-plugin-card-chevron::before{content:"";display:block;position:absolute;left:4px;top:5px;width:7px;height:7px;
+  border-right:1.6px solid currentColor;border-bottom:1.6px solid currentColor;transform:rotate(45deg)}
+.dsm-plugin-card-chevron-open{transform:rotate(180deg)}
+.dsm-plugin-card-body{border-top:1px solid var(--dsw-alias-border-l2);margin:0 16px;padding:0 0 12px}
+.dsm-plugin-card-icon{width:32px;height:32px;flex:none;border-radius:7px;display:grid;place-items:center;
+  background:linear-gradient(140deg,#5686fe,#7b5cff);color:#fff;font-size:15px;font-weight:700}
+
+/* ---- tab 栏 ---- */
+.dsm-workbuddy-tabs{display:flex;gap:6px;padding:4px;border:1px solid var(--dsw-alias-border-l2);
+  border-radius:10px;background:var(--dsw-alias-bg-layer-3);margin:16px 0 4px}
+.dsm-workbuddy-tab{appearance:none;font:inherit;cursor:pointer;flex:1;border:0;border-radius:7px;
+  padding:7px 10px;color:var(--dsw-alias-label-tertiary);font-size:13px;font-weight:500;line-height:18px;
+  background:transparent;transition:color .15s,background .15s;white-space:nowrap}
+.dsm-workbuddy-tab:hover:not(.dsm-workbuddy-tab-active){color:var(--dsw-alias-label-primary)}
+.dsm-workbuddy-tab-active{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-2);
+  box-shadow:inset 0 0 0 1px var(--dsw-alias-border-l2)}
+.dsm-workbuddy-tab-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:baseline}
+.dsm-workbuddy-usage{display:flex;flex-direction:column;gap:16px;margin:0;padding:16px 0 4px}
+
+/* ---- 【原有区块】账号状态行 / 选择 / 积分 / 模型管理 ---- */
+.dsm-workbuddy-usage-account{display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:12px 14px;border:1px solid var(--dsw-alias-border-l2);border-radius:14px;background:var(--dsw-alias-bg-layer-2)}
+.dsm-workbuddy-usage-account-copy{display:flex;flex-direction:column;gap:3px;min-width:0}
+.dsm-workbuddy-usage-status{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:500;color:var(--dsw-alias-label-primary)}
+.dsm-workbuddy-usage-dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
+.dsm-workbuddy-usage-text{margin:0;font-size:14px;line-height:22px;color:var(--dsw-alias-label-secondary)}
+/* 账号选择器已整块删除：账号一律在账号池里管（成员勾选就是选择面），
+   而池开启时由排序决定谁服务，一个「改了也不生效」的下拉比没有更糟。 */
+.dsm-workbuddy-account-state{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.wb-models-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.wb-models-title{margin:0;font-size:15px;font-weight:600;color:var(--dsw-alias-label-primary)}
+.wb-models-summary{margin:2px 0 0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
+.wb-model-list{margin-top:10px;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;overflow:hidden;
+  background:var(--dsw-alias-bg-layer-2)}
+.wb-model-row{display:grid;grid-template-columns:auto 1fr auto auto;gap:12px;align-items:center;
+  padding:10px 14px;border-top:1px solid var(--dsw-alias-border-l1)}
+.wb-model-row:first-child{border-top:0}
+.wb-model-check,.wb-model-img{display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;
+  color:var(--dsw-alias-label-tertiary)}
+.wb-model-check input,.wb-model-img input{margin:0;cursor:pointer;accent-color:var(--dsw-alias-brand-primary)}
+.wb-model-name{display:inline-flex;align-items:baseline;gap:7px;color:var(--dsw-alias-label-primary);
+  font-size:13px;font-weight:500;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wb-rate{color:var(--dsw-alias-label-tertiary);font-size:11px;font-weight:400;flex:none}
+.wb-probe{padding:3px 10px;font-size:12px}
+.wb-models-foot{margin:10px 0 0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
+
+/* 注意：这里原本有一条「手动 / 自动冲突提示」样式块（含只读下拉的置灰样式）。
+   新版删掉了「按积分自动轮换」这个设置，于是「手动还是自动」不再是二选一，那一整套冲突状态
+   （置灰下拉 + 告警块 + 解锁按钮）不复存在，故整块删除 —— 留着一套没人使用的警告样式，
+   只会让人以为还有这个状态。
+   目前的关系是：开启账号池时由池子的排序决定谁服务，你保存的选择不被改写；关闭后它立刻完全生效。 */
+
+/* ---- 【新增】草稿 / 保存 ---- */
+.pool-save-bar{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.pool-dirty{font-size:12px;line-height:18px;color:var(--dsw-alias-state-warn-primary);font-weight:500}
+.pool-dirty[hidden]{display:none}
+.pool-set.is-dirty{background:rgba(245,158,11,.055)}
+.pool-set.is-dirty .pool-set-copy b::after{content:" *";color:var(--dsw-alias-state-warn-primary)}
+
+/* ---- 【新增】区域独立标识 ---- */
+.region-badge{display:inline-flex;align-items:center;gap:5px;padding:1px 8px;border-radius:6px;
+  font-size:11px;font-weight:600;border:1px solid var(--dsw-alias-border-l2);
+  background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-tertiary)}
+.region-independent{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
+
+/* ---- 【新增区块】分隔标识 ---- */
+.pool-new-marker{display:flex;align-items:center;gap:10px;margin:4px 0}
+.pool-new-line{flex:1;height:1px;background:var(--dsw-alias-brand-primary);opacity:.34}
+.pool-new-tag{flex:none;font-size:11px;font-weight:600;letter-spacing:.02em;color:var(--dsw-alias-brand-primary);
+  padding:3px 10px;border:1px dashed var(--dsw-alias-brand-primary);border-radius:999px;opacity:.9}
+
+/* ---- 通用按钮 ---- */
+.dsm-btn{appearance:none;font:inherit;cursor:pointer;border:1px solid transparent;border-radius:8px;
+  padding:5px 14px;font-size:13px;line-height:1.5;transition:opacity .15s,background .15s,border-color .15s}
+.dsm-btn:disabled{opacity:.42;cursor:default}
+.dsm-btn-outline{border-color:var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);background:transparent;font-weight:500}
+.dsm-btn-outline:hover:not(:disabled){color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-label-dimmed);background:rgba(127,127,127,.08)}
+.dsm-btn-primary{background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-layer-3);font-weight:500}
+.dsm-btn-primary:hover:not(:disabled){opacity:.9}
+
+/* ---- 区块标题 ---- */
+.pool-section{display:flex;flex-direction:column;gap:10px}
+.pool-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.pool-title{font-size:14px;font-weight:600;color:var(--dsw-alias-label-primary);margin:0}
+.pool-sub{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary);margin:0}
+.pool-actions{display:flex;gap:8px;flex-wrap:wrap}
+
+/* ---- 状态条 ---- */
+.pool-bar{display:flex;align-items:center;gap:10px;padding:11px 14px;border-radius:12px;
+  border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);font-size:13px}
+.pool-bar-dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
+.pool-bar-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.pool-bar-name{color:var(--dsw-alias-label-primary);font-weight:500}
+.pool-bar-meta{color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:18px}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+
+/* ---- 账号表 ---- */
+.pool-table{width:100%;border:1px solid var(--dsw-alias-border-l2);border-radius:12px;overflow:hidden;background:var(--dsw-alias-bg-layer-2)}
+.pool-row{display:grid;grid-template-columns:1.5fr .85fr 1fr 1.15fr;gap:10px;align-items:center;
+  padding:10px 14px;border-top:1px solid var(--dsw-alias-border-l1);font-size:13px}
+.pool-row:first-child{border-top:0}
+.pool-row-head{padding:8px 14px;background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-tertiary);
+  font-size:11px;font-weight:600;letter-spacing:.02em;text-transform:uppercase}
+.pool-acc{display:flex;align-items:center;gap:8px;min-width:0}
+.pool-acc-name{display:flex;flex-direction:column;gap:1px;min-width:0}
+.pool-acc-name b{font-weight:500;color:var(--dsw-alias-label-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pool-acc-name span{font-size:11px;color:var(--dsw-alias-label-tertiary)}
+.pool-credits{font-variant-numeric:tabular-nums;color:var(--dsw-alias-label-secondary)}
+.pool-credits b{color:var(--dsw-alias-label-primary);font-weight:600}
+.pool-expiry{font-size:12px;color:var(--dsw-alias-label-tertiary);line-height:17px}
+.pool-expiry-warn{color:var(--dsw-alias-state-warn-primary)}
+
+/* ---- 徽章 ---- */
+.badge{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:999px;
+  font-size:12px;line-height:18px;font-weight:500;white-space:nowrap;border:1px solid transparent}
+.badge-dot{width:6px;height:6px;border-radius:50%;flex:none}
+.badge-ok{color:var(--dsw-alias-state-success-primary);background:rgba(34,197,94,.12);border-color:rgba(34,197,94,.32)}
+.badge-ok .badge-dot{background:var(--dsw-alias-state-success-primary)}
+.badge-warn{color:var(--dsw-alias-state-warn-primary);background:rgba(245,158,11,.12);border-color:rgba(245,158,11,.32)}
+.badge-warn .badge-dot{background:var(--dsw-alias-state-warn-primary)}
+.badge-err{color:var(--dsw-alias-state-error-primary);background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.32)}
+.badge-err .badge-dot{background:var(--dsw-alias-state-error-primary)}
+.badge-idle{color:var(--dsw-alias-label-tertiary);background:rgba(127,127,127,.1);border-color:var(--dsw-alias-border-l2)}
+.badge-idle .badge-dot{background:var(--dsw-alias-label-dimmed)}
+.badge-info{color:var(--dsw-alias-brand-primary);background:rgba(86,134,254,.12);border-color:rgba(86,134,254,.32)}
+.badge-info .badge-dot{background:var(--dsw-alias-brand-primary)}
+
+/* ---- 行内 spinner ---- */
+.spin{width:12px;height:12px;flex:none;border-radius:50%;border:2px solid var(--dsw-alias-border-l2);
+  border-top-color:var(--dsw-alias-brand-primary);animation:spin .7s linear infinite;display:inline-block;vertical-align:-2px}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ---- 设置项 ---- */
+.pool-settings{display:flex;flex-direction:column;gap:1px;border:1px solid var(--dsw-alias-border-l2);
+  border-radius:12px;overflow:hidden;background:var(--dsw-alias-bg-layer-2)}
+.pool-set{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:12px 14px;
+  border-top:1px solid var(--dsw-alias-border-l1)}
+.pool-set:first-child{border-top:0}
+.pool-set-copy{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1}
+.pool-set-copy b{font-weight:500;color:var(--dsw-alias-label-primary);font-size:13px}
+.pool-set-copy span{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
+.pool-set-ctl{flex:none;display:flex;align-items:center;gap:8px}
+
+/* switch */
+.sw{position:relative;display:inline-block;width:38px;height:22px;flex:none;cursor:pointer}
+.sw input{opacity:0;width:0;height:0;position:absolute}
+.sw-track{position:absolute;inset:0;border-radius:999px;background:var(--dsw-alias-border-l2);transition:background .18s}
+.sw-track::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;
+  background:#fff;transition:transform .18s;box-shadow:0 1px 3px rgba(0,0,0,.3)}
+.sw input:checked + .sw-track{background:var(--dsw-alias-brand-primary)}
+.sw input:checked + .sw-track::after{transform:translateX(16px)}
+.sw input:disabled + .sw-track{opacity:.4;cursor:default}
+
+/* select（原「自动测试间隔」的 number 输入随该设置一起删除，故不再有 .pool-num 规则） */
+.pool-select{appearance:none;font:inherit;font-size:13px;padding:6px 10px 6px 10px;border-radius:8px;
+  border:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-primary);
+  background:var(--dsw-alias-bg-layer-3);cursor:pointer;
+  padding-right:28px;background-image:linear-gradient(45deg,transparent 50%,var(--dsw-alias-label-tertiary) 50%),
+  linear-gradient(135deg,var(--dsw-alias-label-tertiary) 50%,transparent 50%);
+  background-position:calc(100% - 15px) 51%,calc(100% - 10px) 51%;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+.pool-unit{font-size:12px;color:var(--dsw-alias-label-tertiary)}
+
+/* ---- 换号顺序说明（原「轮换规则」） ---- */
+.pool-rule{border:1px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-2);
+  padding:12px 14px;display:flex;flex-direction:column;gap:9px}
+.pool-rule-line{display:flex;gap:9px;align-items:flex-start;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}
+.pool-rule-idx{flex:none;width:17px;height:17px;border-radius:50%;display:grid;place-items:center;font-size:10px;
+  font-weight:700;background:var(--dsw-alias-bg-layer-3);border:1px solid var(--dsw-alias-border-l2);
+  color:var(--dsw-alias-label-tertiary);margin-top:1px}
+.pool-rule-line b{color:var(--dsw-alias-label-primary);font-weight:600}
+
+/* ---- 活动日志 ---- */
+.pool-log{border:1px solid var(--dsw-alias-border-l2);border-radius:12px;overflow:hidden;background:var(--dsw-alias-bg-layer-2)}
+.pool-log-head{display:flex;align-items:center;justify-content:space-between;padding:9px 14px;
+  background:var(--dsw-alias-bg-layer-3);border-bottom:1px solid var(--dsw-alias-border-l1);
+  font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary)}
+.pool-log-body{max-height:186px;overflow-y:auto}
+.pool-log-row{display:flex;gap:10px;padding:7px 14px;border-top:1px solid var(--dsw-alias-border-l1);
+  font-size:12px;line-height:18px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.pool-log-row:first-child{border-top:0}
+.pool-log-time{color:var(--dsw-alias-label-tertiary);flex:none}
+.pool-log-text{color:var(--dsw-alias-label-secondary);min-width:0;word-break:break-word}
+.pool-log-empty{padding:14px;font-size:12px;color:var(--dsw-alias-label-tertiary)}
+.log-ok{color:var(--dsw-alias-state-success-primary)}
+.log-warn{color:var(--dsw-alias-state-warn-primary)}
+.log-err{color:var(--dsw-alias-state-error-primary)}
+/* 品牌蓝：既用于「换号重试」这条运行时事实，也用于插件的自动落盘行 */
+.log-swap{color:var(--dsw-alias-brand-primary)}
+
+/* ---- 结算/确认条 ---- */
+.pool-confirm{border:1px solid var(--dsw-alias-state-warn-primary);border-radius:12px;
+  background:rgba(245,158,11,.07);padding:12px 14px;display:flex;flex-direction:column;gap:9px}
+.pool-confirm-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}
+.pool-confirm-text{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}
+.pool-confirm-actions{display:flex;gap:8px;flex-wrap:wrap}
+.btn-warn{background:var(--dsw-alias-state-warn-primary);color:#fff;font-weight:500;border-color:transparent}
+.btn-warn:hover:not(:disabled){opacity:.9}
+.pool-foot{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="demo-note">
+    <b>演示稿（Demo）</b> — 这是<b>国内版 tab 的完整卡片</b>，非最终实现。
+    上半部分是插件<b>原有的设置</b>（区域状态 / 积分与签到），
+    下半部分蓝色虚线以下是<b>本次新增的账号池</b>。数据均为示例值，按钮只驱动本地假状态，
+    不发任何真实请求。视觉沿用插件真实的 <code>--dsw-alias-*</code> 令牌与 <code>dsm-*</code> 类名，
+    配色随系统深浅色切换。<br />
+    规划文档：<code>docs/ACCOUNT_POOL_PLAN.md</code>
+  </div>
+
+  <!-- ============ 插件卡片 ============ -->
+  <div class="dsm-plugin-card dsm-plugin-card-open">
+    <div class="dsm-plugin-card-header">
+      <span class="dsm-plugin-card-icon">W</span>
+      <span class="dsm-plugin-card-head">
+        <span class="dsm-plugin-card-title">DSH Connect WorkBuddy</span>
+        <span class="dsm-plugin-card-description">把本机登录的 WorkBuddy 模型接入 DeepSeek Harness</span>
+      </span>
+      <span class="dsm-plugin-card-chevron dsm-plugin-card-chevron-open"></span>
+    </div>
+
+    <div class="dsm-plugin-card-body">
+      <!-- tab 栏：国内版 / 国际版 -->
+      <div class="dsm-workbuddy-tabs">
+        <button class="dsm-workbuddy-tab dsm-workbuddy-tab-active" type="button">
+          <span class="dsm-workbuddy-tab-dot" style="background:var(--dsw-alias-state-success-primary)"></span>国内版
+        </button>
+        <button class="dsm-workbuddy-tab" type="button">
+          <span class="dsm-workbuddy-tab-dot" style="background:var(--dsw-alias-state-success-primary)"></span>国际版
+        </button>
+      </div>
+
+      <div class="dsm-workbuddy-usage">
+
+        <!-- ==================== [原有] 账号状态行 ==================== -->
+        <div class="dsm-workbuddy-usage-account">
+          <div class="dsm-workbuddy-usage-account-copy">
+            <span class="dsm-workbuddy-usage-status">
+              <span class="dsm-workbuddy-usage-dot" style="background:var(--dsw-alias-state-success-primary)"></span>
+              已登录
+            </span>
+            <span class="dsm-workbuddy-usage-text" style="font-size:13px">账号A · 138****6621</span>
+          </div>
+          <!-- 「重新检测账号」已移到下面的账号池区块：那里才是管理账号的地方，
+               新登录的账号会以「一行待勾选」的形式出现。（真机同样如此；未登录状态
+               下卡片仍保留一个副本，因为那时账号池整块不渲染。） -->
+        </div>
+
+        <!-- ==================== 【新增】账号池区块 ==================== -->
+        <div class="pool-new-marker">
+          <span class="pool-new-line"></span>
+          <span class="pool-new-tag">以下为新增功能（演示重点）</span>
+          <span class="pool-new-line"></span>
+        </div>
+
+        <div class="pool-section">
+          <div class="pool-head">
+            <div>
+              <p class="pool-title">账号池 <span class="region-badge">国内版</span></p>
+              <p class="pool-sub">池内 3 个国内版账号 · 目标模型 <b class="mono">deepseek-v4.1-flash</b>（免费，x0.00 倍率）</p>
+            </div>
+            <button class="dsm-btn dsm-btn-outline" type="button">重新检测账号</button>
+          </div>
+          <p class="region-independent">
+            国内版与国际版是<b>各自独立</b>的两个账号池：账号与目标模型互不影响。
+            切到「国际版」tab 可以看到另一套同样的控件。
+          </p>
+
+          <!-- 当前使用的账号：这是个显式标注，不是靠行底色的深浅去猜 -->
+          <div class="pool-bar" id="currentBar">
+            <span class="pool-bar-dot" style="background:var(--dsw-alias-state-success-primary)"></span>
+            <span class="pool-bar-main">
+              <span class="pool-bar-name">当前使用：账号A · 138****6621</span>
+              <span class="pool-bar-meta" id="currentMeta">
+                积分 1,240 · deepseek-v4.1-flash 可用 · 上次测试 14:02
+              </span>
+              <span class="pool-bar-meta">
+                下一个请求从它开始。开启账号池后，请求在上游失败时可能改用池里另一个可用账号重试 ——
+                那只是为这一次请求借用额度，不会改变这里的选定。
+              </span>
+            </span>
+            <span class="badge badge-info" id="failoverBadge"><span class="badge-dot"></span>自动换号已启用</span>
+          </div>
+
+          <!-- 两个功能按钮 -->
+          <div class="pool-actions">
+            <button class="dsm-btn dsm-btn-primary" type="button" id="btnCheckin">
+              一键签到所有账号
+            </button>
+            <button class="dsm-btn dsm-btn-outline" type="button" id="btnTest">
+              一键测试所有账号
+            </button>
+            <button class="dsm-btn dsm-btn-outline" type="button" id="btnSimulate">
+              模拟一次失败请求
+            </button>
+            <span class="pool-unit" id="actionHint" style="align-self:center"></span>
+          </div>
+
+          <!-- 账号表 -->
+          <div class="pool-table">
+            <div class="pool-row pool-row-head">
+              <span>账号</span><span>积分</span><span>v4.1-flash</span><span>签到 / 备注</span>
+            </div>
+            <div id="accountRows"><!-- 由脚本渲染 --></div>
+          </div>
+
+          <p class="pool-foot" id="poolFoot">
+            每次测试会向 <b class="mono">deepseek-v4.1-flash</b> 发一次真实体积请求（实测约 25k input tokens）。
+            该模型倍率为 0，但仍会消耗少量额度；测试严格串行，避免把账号打成限流。
+          </p>
+        </div>
+
+        <!-- ==================== [原有] 模型管理 ==================== -->
+        <section class="dsm-workbuddy-models">
+          <div class="wb-models-head">
+            <div>
+              <h3 class="wb-models-title">模型</h3>
+              <p class="wb-models-summary">已启用 3 / 共 4 个（国内版目录）</p>
+            </div>
+            <button class="dsm-btn dsm-btn-outline" type="button">重新读取模型</button>
+          </div>
+          <div class="wb-model-list">
+            <div class="wb-model-row">
+              <label class="wb-model-check"><input type="checkbox" checked /><span></span></label>
+              <span class="wb-model-name">Deepseek-V4.1-Flash <span class="wb-rate">x0.00</span></span>
+              <label class="wb-model-img"><input type="checkbox" checked /><span>图片</span></label>
+              <button class="dsm-btn dsm-btn-outline wb-probe" type="button">测试</button>
+            </div>
+            <div class="wb-model-row">
+              <label class="wb-model-check"><input type="checkbox" checked /><span></span></label>
+              <span class="wb-model-name">GLM-5.3 <span class="wb-rate">x0.79</span></span>
+              <label class="wb-model-img"><input type="checkbox" /><span>图片</span></label>
+              <button class="dsm-btn dsm-btn-outline wb-probe" type="button">测试</button>
+            </div>
+            <div class="wb-model-row">
+              <label class="wb-model-check"><input type="checkbox" checked /><span></span></label>
+              <span class="wb-model-name">Kimi-K3 <span class="wb-rate">x1.20</span></span>
+              <label class="wb-model-img"><input type="checkbox" /><span>图片</span></label>
+              <button class="dsm-btn dsm-btn-outline wb-probe" type="button">测试</button>
+            </div>
+            <div class="wb-model-row">
+              <label class="wb-model-check"><input type="checkbox" /><span></span></label>
+              <span class="wb-model-name">Hy3 <span class="wb-rate">x0.50</span></span>
+              <label class="wb-model-img"><input type="checkbox" /><span>图片</span></label>
+              <button class="dsm-btn dsm-btn-outline wb-probe" type="button">测试</button>
+            </div>
+          </div>
+          <p class="wb-models-foot">每次测试会发一次真实体积请求（实测约 25k input tokens，credit ≈ 0.72），因此只支持逐个测试。</p>
+        </section>
+
+        <!-- ==================== 换号规则 ==================== -->
+        <div class="pool-section">
+          <div class="pool-head">
+            <p class="pool-title">自动换号规则</p>
+            <p class="pool-sub">开启「启用账号池」即生效：失败时依次用池内其他可用账号重试</p>
+          </div>
+          <div class="pool-rule">
+            <div class="pool-rule-line">
+              <span class="pool-rule-idx">1</span>
+              <span><b>每一次请求都由池子的排序选出服务账号</b>（可用优先，其次积分高、快过期的积分包、凭据更新的），
+                所以上面那行「当前使用」是排序的结果，不一定是你手动选的那个。该账号失败时，
+                再按同一个排序取下一个<b>可用</b>成员重试，直到有人接手或全部不可用；全部失败才把错误报出来（并注明尝试过几个账号）。</span>
+            </div>
+            <div class="pool-rule-line">
+              <span class="pool-rule-idx">2</span>
+              <span><b>只跳过「已知不可用」的成员</b>：仍在冷却期内的限流账号、凭据被上游拒绝的账号。
+                <b>从没测试过的账号默认视为可用</b>——刚发现的登录不该因为「还没测」就被排除在外。
+                积分也参与排序，但只在有新鲜读数时（卡片轮询 / 批量测试 / 保存时读到的），请求路径不会为了排序去打上游。</span>
+            </div>
+            <div class="pool-rule-line">
+              <span class="pool-rule-idx">3</span>
+              <span><b>限流、无积分、凭据失效、网关/网络错误都会换号</b>——这些都是某个账号的状态，换一个很可能就过了。
+                <b>请求本身不合法（HTTP 400）不换</b>：同一个请求体换谁都一样是 400，重试只是白等。</span>
+            </div>
+            <div class="pool-rule-line">
+              <span class="pool-rule-idx">4</span>
+              <span><b>不写回你保存的选择</b>。排序只通过运行时覆盖决定「谁服务」，从不改写你选定的账号；
+                关掉账号池，你选定的那个立刻完全恢复生效。上面那行「当前使用」就是当下真正在服务的账号。</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- ==================== 设置项 ==================== -->
+        <div class="pool-section">
+          <div class="pool-head">
+            <p class="pool-title">账号池设置</p>
+            <span class="pool-dirty" id="dirtyBadge" hidden>● 有未保存的修改</span>
+          </div>
+          <p class="region-independent">
+            下面是<b>偏好设置</b>：改动后需要点「保存」才落盘（与「模型管理」一致）。
+            池里的<b>探测结果</b>由插件自动写入，不经过这个保存按钮，
+            因此保存不会把你刚测出来的结果回退掉。
+          </p>
+          <div class="pool-settings">
+            <div class="pool-set">
+              <span class="pool-set-copy">
+                <b>启用账号池</b>
+                <span>开启后，请求在上游失败时会依次用池里其他可用账号重试，直到有人接住或全部不可用为止。
+                  你自己的账号永远排第一，下一个请求仍从它开始。关闭时跟随你选择的账号，失败就如实报错。</span>
+              </span>
+              <span class="pool-set-ctl">
+                <label class="sw"><input type="checkbox" id="swEnabled" checked /><span class="sw-track"></span></label>
+              </span>
+            </div>
+
+            <div class="pool-set">
+              <span class="pool-set-copy">
+                <b>目标测试模型</b>
+                <span><b>自动</b>（默认）：从本区域模型目录里挑一个<b>倍率为 0 的免费模型</b>，
+                  多个候选取上下文窗口最大的。<b>国内版与国际版挑出的模型可能不同</b>——
+                  国际版目前有 3 个免费模型，国内版要等模型目录刷新后才出现。
+                  也可以手动指定，手动指定的值优先于自动挑选。</span>
+              </span>
+              <span class="pool-set-ctl">
+                <select class="pool-select" id="selModel">
+                  <option value="auto" selected>自动挑免费模型（推荐）</option>
+                  <option value="deepseek-v4.1-flash">deepseek-v4.1-flash（x0.00）</option>
+                  <option value="glm-5.3">GLM-5.3（x0.79，收费）</option>
+                  <option value="kimi-k3">Kimi-K3（x1.20，收费）</option>
+                </select>
+              </span>
+            </div>
+            <div class="pool-set" id="autoPickRow">
+              <span class="pool-set-copy">
+                <span id="autoPickNote"></span>
+              </span>
+            </div>
+          </div>
+
+          <!-- 【新增】保存 / 放弃（与「模型管理」同一套草稿语义） -->
+          <div class="pool-save-bar">
+            <button class="dsm-btn dsm-btn-primary" type="button" id="btnSavePool" disabled>保存</button>
+            <button class="dsm-btn dsm-btn-outline" type="button" id="btnDiscardPool" disabled>放弃修改</button>
+            <span class="pool-unit" id="saveHint">修改任一设置后即可保存。</span>
+          </div>
+          <p class="region-independent" id="runtimeNote">
+            提示：下方活动记录里的<b>测试结果与换号</b>是运行时事实，由插件自动落盘 ——
+            上面这个「保存」只写你的偏好，两者互不覆盖。
+          </p>
+        </div>
+
+        <!-- ==================== 活动记录 ==================== -->
+        <div class="pool-section">
+          <div class="pool-log">
+            <div class="pool-log-head">
+              <span>活动记录</span>
+              <button class="dsm-btn dsm-btn-outline" type="button" id="btnClearLog" style="padding:2px 10px;font-size:12px">清空</button>
+            </div>
+            <div class="pool-log-body" id="logBody">
+              <div class="pool-log-empty">尚无活动。点击上方按钮后，每次签到、测试与自动换号都会记录在这里。</div>
+            </div>
+          </div>
+        </div>
+
+      </div><!-- /usage -->
+    </div><!-- /card-body -->
+  </div><!-- /card -->
+
+</div>
+
+<script>
+/* ============================================================================
+   演示逻辑：纯本地假状态，不发起任何网络请求。
+   ========================================================================== */
+const HOUR = 3600 * 1000;
+const now = Date.now();
+
+/* 示例账号池。credits/expiry 对应真实的 WorkBuddyWebCredits 字段。 */
+let accounts = [
+  { id:'a1', name:'账号A', masked:'138****6621', credits:1240, expiringSoon:0,
+    nearestExpiryMs: now + 21*24*HOUR, checkedIn:false, probe:'ok', probeAgo:38*60*1000, note:'' },
+  { id:'a2', name:'账号B', masked:'189****3302', credits:980, expiringSoon:320,
+    nearestExpiryMs: now + 2*24*HOUR + 5*HOUR, checkedIn:false, probe:'rate-limited', probeAgo:9*60*1000, note:'上游：02:30:30 重置' },
+  { id:'a3', name:'账号C（未命名）', masked:'152****7788', credits:0, expiringSoon:0,
+    nearestExpiryMs: null, checkedIn:false, probe:'out-of-credit', probeAgo:41*60*1000, note:'积分耗尽' },
+];
+
+let currentId = 'a1';
+let running = false;
+let log = [];
+
+const $ = id => document.getElementById(id);
+const fmt = n => n.toLocaleString('zh-CN');
+const clock = () => new Date().toLocaleTimeString('zh-CN', { hour12:false });
+const agoText = ms => ms < 60000 ? '刚刚' : (ms < HOUR ? Math.round(ms/60000)+' 分钟前' : Math.round(ms/HOUR)+' 小时前');
+
+function expiryText(a){
+  if (a.nearestExpiryMs === null) return { text:'无可用积分包', warn:false };
+  const days = (a.nearestExpiryMs - Date.now()) / (24*HOUR);
+  const d = Math.max(0, Math.round(days));
+  return { text:`最近积分包 ${d} 天后过期`, warn: d <= 3 };
+}
+
+/* ---- 换号候选：从未测试过的账号视为可用；限流/耗尽的先排除 ---- */
+/*
+ * 这是真机里的判定规则，演示里照它实现，好让「点了测试之后会发生什么」看得见：
+ *   - 最近一次测试为「可用」→ 候选；
+ *   - **从未测试过** → 也是候选（刚发现的账号不该因为「还没测」就被排除）；
+ *   - 「被限流」/「积分耗尽」且未到恢复时间 → 不参与换号；
+ *   - 「测试中」→ 结果还不知道，此刻不参与。
+ */
+function availableForFailover(){
+  return accounts.filter(a =>
+    a.probe === 'ok' || a.probe === 'untested' || a.probe === undefined
+    || (a.probe === 'rate-limited' && a.probeRetryDue === true)
+    || (a.probe === 'out-of-credit' && a.probeRetryDue === true),
+  );
+}
+
+function badge(a){
+  switch (a.probe){
+    case 'ok':            return '<span class="badge badge-ok"><span class="badge-dot"></span>可用</span>';
+    case 'rate-limited':  return '<span class="badge badge-warn"><span class="badge-dot"></span>被限流</span>';
+    case 'out-of-credit': return '<span class="badge badge-err"><span class="badge-dot"></span>积分耗尽</span>';
+    case 'testing':       return '<span class="badge badge-idle"><span class="spin"></span>测试中</span>';
+    default:              return '<span class="badge badge-idle"><span class="badge-dot"></span>未测试</span>';
+  }
+}
+
+function render(){
+  const rows = $('accountRows');
+  rows.innerHTML = '';
+  for (const a of accounts){
+    const isCurrent = a.id === currentId;
+    const e = expiryText(a);
+    const checkinCell = a.checkedIn
+      ? '<span class="badge badge-ok"><span class="badge-dot"></span>已签到</span>'
+        + (a.note ? `<div class="pool-expiry">${a.note}</div>` : '')
+      : (a.note
+          ? `<div class="pool-expiry${a.probe==='rate-limited'?' pool-expiry-warn':''}">${a.note}</div>`
+          : '<span class="badge badge-idle"><span class="badge-dot"></span>未签到</span>');
+
+    const row = document.createElement('div');
+    row.className = 'pool-row' + (isCurrent ? ' pool-row-current' : '');
+    row.innerHTML = `
+      <span class="pool-acc">
+        <span class="badge-dot" style="background:${isCurrent?'var(--dsw-alias-brand-primary)':'var(--dsw-alias-border-l2)'};width:8px;height:8px"></span>
+        <span class="pool-acc-name">
+          <b>${a.name}</b>
+          ${isCurrent ? '<span class="pool-current-tag">当前使用</span>' : ''}
+          <span class="mono">${a.masked}</span>
+        </span>
+      </span>
+      <span class="pool-credits">
+        <b>${fmt(a.credits)}</b>
+        <div class="pool-expiry${e.warn?' pool-expiry-warn':''}">${e.text}</div>
+      </span>
+      <span>${badge(a)}
+        <div class="pool-expiry" style="margin-top:3px">${a.probe==='testing'?'正在发送真实请求…':agoText(a.probeAgo)+'测试'}</div>
+      </span>
+      <span>${checkinCell}</span>`;
+    rows.appendChild(row);
+  }
+  renderCurrent();
+  renderLog();
+}
+
+function renderCurrent(){
+  const el = $('currentBar'), meta = $('currentMeta');
+  const cur = accounts.find(a => a.id === currentId);
+  const badgeEl = $('failoverBadge');
+  if (!cur){
+    el.querySelector('.pool-bar-dot').style.background = 'var(--dsw-alias-state-error-primary)';
+    el.querySelector('.pool-bar-name').textContent = '当前没有可用的账号';
+    meta.textContent = '本机没有可结算的登录，请先在 WorkBuddy 桌面端登录。';
+    badgeEl.className = 'badge badge-err';
+    badgeEl.innerHTML = '<span class="badge-dot"></span>无账号';
+    return;
+  }
+  el.querySelector('.pool-bar-dot').style.background = 'var(--dsw-alias-state-success-primary)';
+  el.querySelector('.pool-bar-name').textContent = `当前使用：${cur.name} · ${cur.masked}`;
+  // 这里说的是「下一个请求从谁开始」，而不是「上一次请求谁服务了」——
+  // 换号只为一次请求借用额度，不写回选择，所以这两者在换号发生后会不同。
+  // 演示里如实区分，免得把「当前使用」误解成「上一条请求的计费方」。
+  const bits = [`积分 ${fmt(cur.credits)}`, `${$('selModel').value === 'auto' ? '免费目标模型' : $('selModel').value} 可用性：${probeText(cur.probe)}`];
+  if (cur.expiringSoon > 0) bits.push(`${cur.expiringSoon} 积分 3 天内过期`);
+  meta.textContent = bits.join(' · ');
+  const on = $('swEnabled').checked;
+  badgeEl.className = on ? 'badge badge-info' : 'badge badge-idle';
+  badgeEl.innerHTML = on
+    ? '<span class="badge-dot"></span>自动换号已启用'
+    : '<span class="badge-dot"></span>账号池已关闭';
+}
+
+const probeText = p => p === 'ok' ? '可用' : p === 'rate-limited' ? '被限流'
+  : p === 'out-of-credit' ? '积分耗尽' : p === 'testing' ? '测试中' : '未测试';
+
+function addLog(text, cls){
+  log.unshift({ t: clock(), text, cls: cls || '' });
+  renderLog();
+}
+
+function renderLog(){
+  const body = $('logBody');
+  if (log.length === 0){
+    body.innerHTML = '<div class="pool-log-empty">尚无活动。点击上方按钮后，每次签到、测试与自动换号都会记录在这里。</div>';
+    return;
+  }
+  body.innerHTML = log.map(e =>
+    `<div class="pool-log-row"><span class="pool-log-time">${e.t}</span><span class="pool-log-text ${e.cls}">${e.text}</span></div>`
+  ).join('');
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+/* ---- 功能一：一键签到所有账号（串行） ---- */
+async function runCheckin(){
+  if (running) return;
+  running = true; setBusy(true);
+  addLog(`开始一键签到，共 ${accounts.length} 个账号（串行）`, 'log-swap');
+  for (const a of accounts){
+    await sleep(520);
+    if (a.checkedIn){ addLog(`${a.name}：今日已签到，跳过（幂等，不重复领取）`); continue; }
+    if (a.probe === 'out-of-credit' && a.credits === 0){
+      a.checkedIn = true; a.note = '签到成功 +60（仍在耗尽状态）';
+      addLog(`${a.name}：签到成功 +60 积分`, 'log-ok');
+    } else {
+      a.checkedIn = true; a.note = '签到成功 +60 · 连续 7 天';
+      a.credits += 60;
+      addLog(`${a.name}：签到成功 +60 积分，当前 ${fmt(a.credits)}`, 'log-ok');
+    }
+    render();
+  }
+  addLog('一键签到完成', 'log-ok');
+  running = false; setBusy(false); render();
+}
+
+/* ---- 功能二：一键测试所有账号 × deepseek-v4.1-flash（串行） ---- */
+async function runTest(){
+  if (running) return;
+  running = true; setBusy(true);
+  const model = $('selModel').value;
+  addLog(`开始测试 ${accounts.length} 个账号 × ${model}（串行，每次一个真实请求）`, 'log-swap');
+  for (const a of accounts){
+    a.probe = 'testing'; render();
+    await sleep(900);
+    if (a.credits === 0){
+      a.probe = 'out-of-credit'; a.note = '积分耗尽'; a.probeAgo = 0;
+      addLog(`${a.name}：out-of-credit —— 积分耗尽，按配额刷新时间回池`, 'log-err');
+    } else if (a.id === 'a2'){
+      a.probe = 'rate-limited'; a.note = '上游：将在 02:30:30 重置'; a.probeAgo = 0;
+      addLog(`${a.name}：rate-limited —— 模型本身可用，仅在限流，按上游重置时间回池`, 'log-warn');
+    } else {
+      a.probe = 'ok'; a.note = ''; a.probeAgo = 0;
+      addLog(`${a.name}：ok —— 可用（credit 0.00，耗时 1.8s）`, 'log-ok');
+    }
+    render();
+  }
+  addLog('测试完成，已按规则重算候选账号', 'log-ok');
+  persistRuntime('测试结果与每个账号的可用状态已写入运行时记录（不占草稿）');
+  renderCurrent();
+  running = false; setBusy(false); render();
+}
+
+function setBusy(on){
+  $('btnCheckin').disabled = on;
+  $('btnTest').disabled = on;
+  $('btnSimulate').disabled = on;
+  $('actionHint').innerHTML = on ? '<span class="spin"></span> 串行执行中…' : '';
+}
+
+/* ============================================================================
+   两种状态，两套写入语义（与真实插件一致）：
+   - savedPrefs：偏好设置，改动进草稿，点「保存」才落盘
+   - runtime    ：探测结果，插件自动落盘，不经过保存按钮
+   ========================================================================== */
+const savedPrefs = { enabled:true, targetModel:'auto' };
+let draftPrefs = null;          // null = 无未保存修改
+let runtimeSnap = {};           // 模拟 Host 侧自动落盘的运行时事实
+
+const prefsOf = () => draftPrefs ?? savedPrefs;
+const isDirty = () => draftPrefs !== null;
+
+function editPref(key, value){
+  const base = draftPrefs ?? { ...savedPrefs };
+  draftPrefs = { ...base, [key]: value };
+  renderPrefs();
+}
+
+/* 把偏好渲染进控件（保存后 / 放弃后 / 首次加载） */
+function renderPrefs(){
+  const p = prefsOf();
+  $('swEnabled').checked = p.enabled;
+  $('selModel').value = p.targetModel;
+  $('selModel').disabled = !p.enabled;
+
+  const dirty = isDirty();
+  $('dirtyBadge').hidden = !dirty;
+  $('btnSavePool').disabled = !dirty;
+  $('btnDiscardPool').disabled = !dirty;
+  $('saveHint').textContent = dirty
+    ? '有未保存的修改 —— 保存后写入本区域配置。'
+    : '修改任一设置后即可保存。';
+  document.querySelectorAll('.pool-set').forEach(n => n.classList.remove('is-dirty'));
+  if (dirty){
+    // 标出被改过的行（演示用：整块提示）
+    $('autoPickRow').classList.add('is-dirty');
+  }
+  renderAutoPick();
+  renderCurrent();
+}
+
+function savePrefs(){
+  if (!isDirty()) return;
+  const before = { ...savedPrefs }, after = { ...draftPrefs };
+  Object.assign(savedPrefs, after);
+  draftPrefs = null;
+  const changed = Object.keys(after).filter(k => before[k] !== after[k]);
+  addLog(`已保存账号池设置（${changed.join('、') || '无变化'}）—— 写入本区域偏好，未触碰运行时结果`, 'log-ok');
+  renderPrefs(); render();
+}
+
+function discardPrefs(){
+  if (!isDirty()) return;
+  draftPrefs = null;
+  addLog('已放弃修改，回到上次保存的设置', 'log-warn');
+  renderPrefs(); render();
+}
+
+/* 运行时事实的"自动落盘"：只记录，不参与草稿 */
+function persistRuntime(note){
+  runtimeSnap.updatedAt = clock();
+  addLog(`（自动落盘）${note}`, 'log-swap');
+}
+
+/* ---- 目标测试模型：按区域 catalog 自动挑倍率为 0 的 ---- */
+/* 演示用的两套区域目录（真实值取自 src/catalog.ts 的静态 fallback 与 live 形态）。
+   注意国内版静态 fallback 不带 creditMultiplier —— 免费模型要刷新后才知道。 */
+const REGION_CATALOG = {
+  cn: [
+    { id:'auto',                 name:'Auto',                 contextWindow:168000, creditMultiplier:undefined },
+    { id:'hy3',                  name:'Hy3',                  contextWindow:192000, creditMultiplier:undefined },
+    { id:'glm-5.3',              name:'GLM-5.3',              contextWindow:1000000, creditMultiplier:0.79 },
+    { id:'kimi-k3-1',            name:'Kimi-K3',              contextWindow:1000000, creditMultiplier:1.20 },
+  ],
+  global: [
+    { id:'deepseek-v4.1-flash',  name:'deepseek-v4.1-flash',  contextWindow:1000000, creditMultiplier:0 },
+    { id:'hy4-preview',          name:'Hy4 preview',          contextWindow:1000000, creditMultiplier:0 },
+    { id:'hy3',                  name:'Hy3',                  contextWindow:192000,  creditMultiplier:0 },
+    { id:'glm-5.3',              name:'GLM-5.3',              contextWindow:1000000, creditMultiplier:0.79 },
+  ],
+};
+
+/** 严格判 === 0（缺失倍率不等于免费），多个候选取窗口最大的。 */
+function pickFreeModel(region){
+  const candidates = REGION_CATALOG[region].filter(m => m.creditMultiplier === 0);
+  if (candidates.length === 0) return undefined;
+  return candidates.reduce((best, m) => m.contextWindow > best.contextWindow ? m : best);
+}
+
+function resolveTargetModel(){
+  const choice = prefsOf().targetModel;
+  if (choice !== 'auto') return { id: choice, manual: true };
+  const picked = pickFreeModel('cn');
+  return picked === undefined ? { id: undefined, manual: false } : { id: picked.id, manual: false, model: picked };
+}
+
+function renderAutoPick(){
+  const target = resolveTargetModel();
+  const note = $('autoPickNote');
+  const row = $('autoPickRow');
+  if (target.manual){
+    note.innerHTML = `已手动指定 <b class="mono">${target.id}</b> —— 自动挑选不再生效，注意该模型可能收费。`;
+    return;
+  }
+  if (target.id === undefined){
+    // 国内版静态目录里没有倍率为 0 的模型：不静默回退到收费模型
+    note.innerHTML = `<b style="color:var(--dsw-alias-state-warn-primary)">本区域暂无免费模型</b>
+      —— 国内版要等模型目录刷新后才会出现倍率为 0 的条目。
+      为避免产生你没预期的开销，<b>不会</b>自动回退到收费模型；请先刷新模型目录，或手动指定一个目标模型。`;
+    return;
+  }
+  note.innerHTML = `自动选中 <b class="mono">${target.id}</b>
+    （x0.00 免费，上下文 ${(target.model.contextWindow/1000).toFixed(0)}k）
+    —— 从本区域 catalog 内倍率为 0 的候选中取窗口最大的。`;
+}
+
+/* ---- 模拟一次失败请求：把「自动换号」跑给人看 ---- */
+/*
+ * 真机里这条路径是：请求先发给「当前使用」的账号 → 上游报 429/402/401/502 →
+ * 插件依次取池内其他**可用**账号重发同一个请求 → 有人接住就正常返回 →
+ * 全部不可用才把错误报出来。这里按同一顺序演一遍，好让规则可验证，而不只是可读。
+ *
+ * 两个刻意的设计在这段演示里也能看出来：
+ *   - **「当前使用」始终不变**：换号只是为这一次请求借用额度；
+ *   - **从没测试过的账号算可用**：所以「当前账号被限流」时，只要池里还有没测过的
+ *     账号，请求依然能跑完 —— 这正是「不点测试也能用」的意思。
+ */
+async function runSimulatedRequest(){
+  if (running) return;
+  running = true; setBusy(true);
+
+  const primary = accounts.find(a => a.id === currentId);
+  addLog(`发起请求 → 当前使用：${primary ? primary.name : '（无）'}`, 'log-swap');
+  await sleep(450);
+
+  if (!$('swEnabled').checked){
+    // 池关闭：不换号，如实报错 —— 这正是开关关闭时的承诺。
+    addLog(`账号池已关闭：${primary ? primary.name : '当前账号'} 失败即报错，不尝试池内其他账号`, 'log-err');
+    if (primary) primary.note = '上游：429（未换号 —— 账号池已关闭）';
+    render();
+    running = false; setBusy(false);
+    return;
+  }
+
+  // 让「当前使用」的账号这一次失败，制造需要换号的局面。
+  if (primary){
+    primary.probe = 'rate-limited';
+    primary.probeRetryDue = false;   // 冷却未过：真实场景里它会被排除
+    primary.note = '上游：将在 02:30:30 重置';
+    primary.probeAgo = 0;
+    addLog(`${primary.name}：soft_rate（429）—— 使用量超出频率限制`, 'log-warn');
+    render();
+  }
+  await sleep(550);
+
+  // 依次找下一个可用账号：跳过的会说明原因，而不是默默略过。
+  const tried = [currentId];
+  for (const cand of accounts){
+    if (cand.probe === 'testing'){
+      addLog(`${cand.name}：跳过 —— 上一次测试还在进行，结果未知`, 'log-warn');
+      continue;
+    }
+    if (cand.probe === 'rate-limited' || cand.probe === 'out-of-credit'){
+      addLog(`${cand.name}：跳过 —— 已知不可用（${probeText(cand.probe)}，未到恢复时间）`, 'log-warn');
+      continue;
+    }
+    tried.push(cand.id);
+    if (cand.probe === undefined || cand.probe === 'untested'){
+      addLog(`${cand.name}：从未测试过，按「默认可用」参与换号`, 'log-swap');
+    }
+    await sleep(450);
+    addLog(`改用 ${cand.name} 重发同一个请求 → 成功返回`, 'log-ok');
+    persistRuntime(`本次请求由 ${cand.name} 承接；当前使用仍是 ${primary ? primary.name : '（无）'}`);
+    addLog('排序不写回你保存的选择：关闭账号池后仍然是你选定的那个账号生效', 'log-swap');
+    render();
+    running = false; setBusy(false);
+    return;
+  }
+
+  // 全部不可用：把原始错误报出来，并注明尝试过几个账号。
+  addLog(`池内没有其他可用账号（尝试过 ${tried.length} 个）：原样报出上游错误 429 soft_rate`, 'log-err');
+  addLog('错误里会带上上游给的重置时间，用户据此知道何时再试', 'log-warn');
+  render();
+  running = false; setBusy(false);
+}
+
+/* ---- 绑定 ---- */
+$('btnCheckin').addEventListener('click', runCheckin);
+$('btnTest').addEventListener('click', runTest);
+$('btnSimulate').addEventListener('click', runSimulatedRequest);
+$('btnClearLog').addEventListener('click', () => { log = []; renderLog(); });
+$('swEnabled').addEventListener('change', e => {
+  editPref('enabled', e.target.checked);
+  addLog(e.target.checked
+    ? '（草稿）账号池：启用 —— 失败时依次用池内其他可用账号重试'
+    : '（草稿）账号池：关闭 —— 跟随你选的账号，失败如实报错', e.target.checked ? 'log-ok' : 'log-warn');
+});
+$('btnSavePool').addEventListener('click', savePrefs);
+$('btnDiscardPool').addEventListener('click', discardPrefs);
+$('selModel').addEventListener('change', e => {
+  editPref('targetModel', e.target.value);
+});
+
+renderPrefs();
+render();
+addLog('账号池就绪：池内 3 个账号，目标模型由本区域 catalog 自动挑选');
+addLog('点「模拟一次失败请求」可以看到自动换号：当前账号被限流后，请求改由池内下一个可用账号跑完');
+if (!$('swEnabled').checked) addLog('账号池当前关闭：失败不会换号，会如实报错');
+</script>
+</body>
+</html>

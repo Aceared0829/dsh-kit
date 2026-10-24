@@ -1,0 +1,78 @@
+{
+  "name": "dsh-harness-eval",
+  "version": "0.0.2",
+  "private": true,
+  "description": "Session harness evidence tab: where work broke down, what it cost, and what the retry looked like.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "test": "node --test test.mjs client.test.mjs deploy.test.mjs marks.test.mjs remote-spec.test.mjs export.test.mjs siblings.test.mjs gui-guard.test.mjs verdict.test.mjs loop.test.mjs",
+    "verify": "node verify.mjs",
+    "gate": "node gate.mjs",
+    "loop": "node loop.mjs",
+    "export": "node export.mjs",
+    "build": "node ../../node_modules/typescript/bin/tsc -p tsconfig.service.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/evidence.js",
+    "lib/reader.js",
+    "lib/siblings.js",
+    "lib/ledger.js",
+    "lib/gui-guard.js",
+    "lib/verdict.js",
+    "lib/loop.js",
+    "lib/candidates.js",
+    "lib/http.js",
+    "lib/fork-tool.js",
+    "lib/marks.js",
+    "lib/marks-service.js",
+    "lib/typert.remote-client.js",
+    "lib/client.js",
+    "export.mjs",
+    "gate.mjs",
+    "loop.mjs",
+    "vendor/session-usage.js",
+    "vendor/capabilities.js",
+    "vendor/NOTICE.md",
+    "cordis.patch.yml",
+    "README.md",
+    "GUIDE.md",
+    "QUICKSTART.md",
+    "HANDOFF.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-storage-domain": "*",
+    "@deepseek-ai/dsh-typert-protocol": "*",
+    "zod": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-storage-domain": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-typert-protocol": {
+      "optional": true
+    },
+    "zod": {
+      "optional": true
+    }
+  },
+  "license": "Apache-2.0"
+}

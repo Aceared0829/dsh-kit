@@ -1,0 +1,32 @@
+{
+  "compilerOptions": {
+    "target": "es2024",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["es2024"],
+    "types": [],
+    "strict": true,
+    "skipLibCheck": true,
+    "declaration": false,
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "lib",
+    "verbatimModuleSyntax": false,
+    "esModuleInterop": true,
+    "allowJs": true,
+    "checkJs": false,
+    "allowImportingTsExtensions": false,
+    "rewriteRelativeImportExtensions": false,
+    "paths": {
+      "@deepseek-ai/dsh-typert-protocol": ["../../packages/typert/protocol/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-storage-domain": ["../../packages/storage/storage-domain/lib/types/index.d.ts"],
+      "@deepseek-ai/dsh-storage": ["../../packages/storage/storage/lib/types/index.d.ts"],
+      "@deepseek-ai/cordis": ["../../vendor/cordis/lib/types/index.d.ts"],
+      "zod": ["../../node_modules/zod/index.d.ts"]
+    }
+  },
+  // Only the service is compiled. `marks.js` is hand-written and copied into
+  // `lib/`, so it is read for types (via `allowJs`) but must not be emitted
+  // over its own copy.
+  "include": ["src/marks-service.ts"]
+}

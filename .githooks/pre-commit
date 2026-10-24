@@ -1,8 +1,11 @@
 #!/bin/sh
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 if command -v pwsh >/dev/null 2>&1; then
-  pwsh -File scripts/check-public.ps1
+  pwsh -NoProfile -File scripts/check-public.ps1
+elif command -v powershell >/dev/null 2>&1; then
+  # Windows PowerShell 5.1 ships with every Windows install; pwsh does not.
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-public.ps1
 else
-  echo "pwsh not found; run scripts/check-public.ps1 before pushing" >&2
+  echo "neither pwsh nor powershell found; run scripts/check-public.ps1 yourself before committing" >&2
   exit 1
 fi

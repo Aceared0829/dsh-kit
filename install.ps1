@@ -1,7 +1,9 @@
 param(
   [string]$Profile,
   [string]$DshPath,
-  [string]$Home,
+  # Not $Home: that name collides with PowerShell's read-only automatic variable,
+  # and binding it fails before the script body runs. -Home remains a hidden alias.
+  [Alias('Home')][string]$HarnessHome,
   [switch]$DryRun,
   [switch]$SkipPreferences,
   [switch]$SkipShipped
@@ -12,7 +14,7 @@ $script = Join-Path $here 'scripts\install.mjs'
 $forward = @()
 if ($Profile) { $forward += @('--profile', $Profile) }
 if ($DshPath) { $forward += @('--dsh', $DshPath) }
-if ($Home) { $forward += @('--home', $Home) }
+if ($HarnessHome) { $forward += @('--home', $HarnessHome) }
 if ($DryRun) { $forward += '--dry-run' }
 if ($SkipPreferences) { $forward += '--skip-preferences' }
 if ($SkipShipped) { $forward += '--skip-shipped' }

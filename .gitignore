@@ -1,4 +1,6 @@
-node_modules/
+﻿node_modules/
+!/plugins/dsh-connect-workbuddy/node_modules/
+!/plugins/dsh-connect-workbuddy/node_modules/**
 sync.local.ps1
 *.bak-dsh-kit
 .DS_Store

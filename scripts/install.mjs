@@ -134,6 +134,17 @@ function loadManifest() {
   const manifest = JSON.parse(readFileSync(join(kitRoot, 'manifest.json'), 'utf8'))
   if (!Array.isArray(manifest.npm) || !Array.isArray(manifest.local)) fail('manifest.json 格式不对')
   for (const item of manifest.npm) {
+    // `spec` pins an install target that is not a plain registry semver range (a GitHub commit, say).
+    // `version` still records what that spec resolves to, so the install check can compare like with like.
+    if (item.spec !== undefined) {
+      if (typeof item.spec !== 'string' || !/^(?:github:|https?:|git\+)/.test(item.spec)) {
+        fail('拒绝不合法的安装来源: ' + item.name + ' -> ' + item.spec)
+      }
+      if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(item.version)) {
+        fail('spec 型条目的 version 必须是它解析到的确切版本: ' + item.name)
+      }
+      continue
+    }
     const spec = item.name + '@' + item.version
     if (!NPM_SPEC.test(spec)) fail('拒绝不合法的 npm 规格: ' + spec)
   }
@@ -422,9 +433,9 @@ function main() {
 
   const npmAdd = []
   for (const item of manifest.npm) {
-    const spec = item.name + '@' + item.version
+    const spec = item.spec ?? item.name + '@' + item.version
     if (installedVersion(dir, item.name) === item.version) {
-      console.log('已是目标版本，跳过 ' + spec)
+      console.log('已是目标版本，跳过 ' + item.name + '@' + item.version)
       continue
     }
     npmAdd.push(spec)
