@@ -1,0 +1,3 @@
+- insert:
+    - id: chatgpt-account
+      name: '@local/dsh-chatgpt-account'

@@ -23,6 +23,7 @@
 | `dsh-image-viewer` | 点开对话里的图片和工具截图，缩放、拖动查看 |
 | `harness-eval` | 会话证据面板：一轮活干坏在哪儿、花了多少、重试长什么样 |
 | `dsh-pet-lifecycle` | 让桌宠跟着 Harness 一起起停：启动时拉起，退出时关掉。装到别人机器上要自己配 `petDir`（见 `plugins/dsh-pet-lifecycle/LOCAL-CHANGES.md`） |
+| `dsh-chatgpt-account` | ChatGPT 订阅额度卡片（源码只在库里存档，还没启用、也没进 `manifest.json`，安装器不会装它） |
 
 **我改过的这些**（上游在 npm，我改的地方源码也放进来了，装的是我这份）：
 
@@ -130,6 +131,7 @@ I keep it as a repo you can install from with one command. Take the whole set, t
 | `dsh-image-viewer` | Open an image or tool screenshot from the transcript and zoom, pan around |
 | `harness-eval` | Session evidence tab: where a run broke down, what it cost, and what the retry looked like |
 | `dsh-pet-lifecycle` | Starts the desktop pet with Harness and shuts it down on exit. Set `petDir` yourself on another machine (see `plugins/dsh-pet-lifecycle/LOCAL-CHANGES.md`) |
+| `dsh-chatgpt-account` | A ChatGPT subscription usage card (source is archived in this repo only; it is not enabled and not listed in `manifest.json`, so the installer skips it) |
 
 **Plugins I modified** (upstream is on npm; my changed sources are here too, and my copy is what gets installed):
 
