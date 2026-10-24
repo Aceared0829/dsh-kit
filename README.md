@@ -25,7 +25,7 @@
 
 **别人做的这些**（从 npm 装，清单里锁了版本，我没把源码再拷一份）：
 
-`dsh-graph`（目标看板）、`dsh-context`、`@modusensus/dsh-mneme`（长期记忆）、`dsh-diff-approval`、`dsh-planning-with-files`、`dsh-better-sidebar`、`@changfenhuang/dsh-genui`（界面组件）、`@goodandready/*` 三个、`@linxin666/*` 六个、`dsh-connect-workbuddy`。
+`dsh-graph`（目标看板）、`dsh-context`、`@modusensus/dsh-mneme`（长期记忆）、`dsh-better-sidebar`、`@changfenhuang/dsh-genui`（界面组件）、`@goodandready/*` 两个（`dsh-context-lens`、`dsh-time-machine`）、`@linxin666/*` 三个（`session-archive`、`usage`、`client-ui-model-capabilities`）、`dsh-connect-workbuddy`。
 
 完整清单和版本在 [`manifest.json`](manifest.json)。
 
@@ -66,7 +66,7 @@ chmod +x install.sh
 
 第一次装的时候，安装器会往 profile 的 `pnpm-workspace.yaml` 里补几项，不然装不上：
 
-- `allowBuilds`：放行 `ssh2`、`cpu-features`（`dsh-ssh` 要用）和 Harness 运行时的原生包（`node-pty`、`koffi`、`protobufjs`、`@deepseek-ai/dsh-subprocess-local`、`@google/genai`）。pnpm 11 只要见到没批准的构建脚本就整次中止
+- `allowBuilds`：放行 Harness 运行时的原生包（`node-pty`、`koffi`、`protobufjs`、`@deepseek-ai/dsh-subprocess-local`、`@google/genai`），外加 `ssh2`、`cpu-features`——这两个是装 `dsh-ssh` 这类插件时才会用到的，先放行省得你之后自己加插件又被 pnpm 拦住。pnpm 11 只要见到没批准的构建脚本就整次中止
 - `nodeLinker: hoisted` 和 `autoInstallPeers: false`：跟 Harness 自己的 profile 布局保持一致
 
 只补你没有的。已经在用的 profile 不会被重写，改之前会备份成 `pnpm-workspace.yaml.bak-dsh-kit`。
@@ -94,6 +94,7 @@ git push
 
 - **`cordis.patch.yml` 不在这里**。那是你自己的运行时配置，需要的话单独拷
 - **WorkBuddy 要自己登录**。形状看 `settings/workbuddy.example.yml`，填好的别提交
+- **WorkBuddy 的版本是 npm 上的 5.7.0，我本机跑的是自己的中文本地构建**（`5.7.0-zh.1`，`link:` 进 profile）。那份构建不在这个库，别人装到的是 npm 版
 - **桌宠本体不在这个库**。要装 [dsh-pet](https://github.com/MerZlin/dsh-pet-indesktop)，然后按 `settings/pet.example.yml` 写 `petDir`
 - **版本是按我这台机器锁的**。你那边 Harness 如果缺某个实验包，会跳过；版本不兼容时 dsh 会拒绝安装，安装器不会自动做版本豁免——真要装得自己处理
 - **Desktop 和官方包 appId 一样**。已经在用自建包的机器，别再装官方安装包，会盖掉自建那份
@@ -125,7 +126,7 @@ I keep it as a repo you can install from with one command. Take the whole set, t
 
 **Plugins by other people**, installed from npm at the versions I pinned — I do not re-host their sources:
 
-`dsh-graph` (goal board), `dsh-context`, `@modusensus/dsh-mneme` (long-term memory), `dsh-diff-approval`, `dsh-planning-with-files`, `dsh-better-sidebar`, `@changfenhuang/dsh-genui` (UI components), three from `@goodandready/*`, six from `@linxin666/*`, and `dsh-connect-workbuddy`.
+`dsh-graph` (goal board), `dsh-context`, `@modusensus/dsh-mneme` (long-term memory), `dsh-better-sidebar`, `@changfenhuang/dsh-genui` (UI components), two from `@goodandready/*` (`dsh-context-lens`, `dsh-time-machine`), three from `@linxin666/*` (`session-archive`, `usage`, `client-ui-model-capabilities`), and `dsh-connect-workbuddy`.
 
 The full list and versions are in [`manifest.json`](manifest.json).
 
@@ -166,7 +167,7 @@ Common flags:
 
 On first install it writes a few keys into the profile's `pnpm-workspace.yaml`, because otherwise the install cannot complete:
 
-- `allowBuilds` — permits the build scripts of `ssh2` and `cpu-features` (needed by `dsh-ssh`) plus the Harness runtime's native packages (`node-pty`, `koffi`, `protobufjs`, `@deepseek-ai/dsh-subprocess-local`, `@google/genai`). pnpm 11 aborts the whole install when it finds an unapproved build script
+- `allowBuilds` — permits the Harness runtime's native packages (`node-pty`, `koffi`, `protobufjs`, `@deepseek-ai/dsh-subprocess-local`, `@google/genai`), plus `ssh2` and `cpu-features`, which are only needed once you add a plugin like `dsh-ssh` — approved up front so a later addition does not get blocked. pnpm 11 aborts the whole install when it finds an unapproved build script
 - `nodeLinker: hoisted` and `autoInstallPeers: false` — matches the layout Harness itself uses for a profile
 
 It only adds what you are missing. An existing profile is never rewritten, and the previous file is kept as `pnpm-workspace.yaml.bak-dsh-kit`.
@@ -194,6 +195,7 @@ git push
 
 - **`cordis.patch.yml` is not included.** That is your own runtime configuration; copy it separately if you want it
 - **WorkBuddy needs its own login.** The shape is in `settings/workbuddy.example.yml`; do not commit a filled-in copy
+- **WorkBuddy is pinned to npm 5.7.0; my machine runs my own Chinese local build** (`5.7.0-zh.1`, linked into the profile). That build is not in this repo — installing from here gets the npm one
 - **The desktop pet itself is not in this repo.** Install [dsh-pet](https://github.com/MerZlin/dsh-pet-indesktop) and set `petDir` following `settings/pet.example.yml`
 - **Versions are pinned against my machine.** If your Harness lacks an optional bundle, the installer skips it. When a version is incompatible, `dsh` refuses the install rather than silently exempting it — you would have to handle that yourself
 - **Desktop and the official package share an appId.** If you already run a self-built package, do not install the official build over it

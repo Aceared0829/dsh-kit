@@ -1,24 +1,18 @@
 {
   "name": "dsh-kit",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "npm": [
-    { "name": "@changfenhuang/dsh-genui", "version": "0.13.0" },
+    { "name": "@changfenhuang/dsh-genui", "version": "0.14.0" },
     { "name": "@goodandready/dsh-context-lens", "version": "0.1.33" },
-    { "name": "@goodandready/dsh-plugin-notify", "version": "0.4.4" },
     { "name": "@goodandready/dsh-time-machine", "version": "0.1.29" },
     { "name": "@linxin666/dsh-client-ui-model-capabilities", "version": "0.4.4" },
-    { "name": "@linxin666/dsh-client-ui-task-board", "version": "0.4.4" },
-    { "name": "@linxin666/dsh-client-ui-task-board-github", "version": "0.4.5" },
     { "name": "@linxin666/dsh-session-archive", "version": "0.4.4" },
-    { "name": "@linxin666/dsh-ssh", "version": "0.4.4" },
     { "name": "@linxin666/dsh-usage", "version": "0.4.4" },
-    { "name": "@modusensus/dsh-mneme", "version": "0.9.1" },
+    { "name": "@modusensus/dsh-mneme", "version": "0.9.4" },
     { "name": "dsh-better-sidebar", "version": "0.28.0" },
-    { "name": "dsh-connect-workbuddy", "version": "4.10.0" },
+    { "name": "dsh-connect-workbuddy", "version": "5.7.0" },
     { "name": "dsh-context", "version": "0.73.3" },
-    { "name": "dsh-diff-approval", "version": "0.35.0" },
-    { "name": "dsh-graph", "version": "0.21.0" },
-    { "name": "dsh-planning-with-files", "version": "1.0.1" }
+    { "name": "dsh-graph", "version": "0.21.0" }
   ],
   "local": [
     { "name": "dsh-connect-grok", "path": "plugins/dsh-connect-grok" },
