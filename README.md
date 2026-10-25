@@ -33,7 +33,7 @@
 
 **别人做的这些**（从 npm 装，清单里锁了版本，我没把源码再拷一份）：
 
-`dsh-graph`（目标看板）、`dsh-context`、`@modusensus/dsh-mneme`（长期记忆）、`dsh-better-sidebar`、`@changfenhuang/dsh-genui`（界面组件）、`@goodandready/*` 两个（`dsh-context-lens`、`dsh-time-machine`）、`@linxin666/*` 三个（`session-archive`、`usage`、`client-ui-model-capabilities`）、`billion-context`、`dsh-claude-style`、`dsh-super-code`、`ds-bot`、`dsh-github-connect`、`@tt-a1i/archify-dsh`、`@deepseek-ai/dsh-subagent-claude-code`。
+`dsh-graph`（目标看板）、`dsh-context`、`@modusensus/dsh-mneme`（长期记忆）、`dsh-better-sidebar`、`@changfenhuang/dsh-genui`（界面组件）、`@goodandready/*` 两个（`dsh-context-lens`、`dsh-time-machine`）、`@linxin666/*` 三个（`session-archive`、`usage`、`client-ui-model-capabilities`）、`billion-context`、`dsh-claude-style`、`dsh-super-code`、`ds-bot`、`dsh-github-connect`、`@tt-a1i/archify-dsh`、`@deepseek-ai/dsh-subagent-claude-code`、`@michengai/dsh-skills-manager`、`@leon___/dsh-client-liang-intensity-skin`。
 
 完整清单和版本在 [`manifest.json`](manifest.json)。
 
@@ -104,6 +104,7 @@ git push
 - **WorkBuddy 要自己登录**。形状看 `settings/workbuddy.example.yml`，填好的别提交
 - **版本是照我这台机器锁的**。装到别人机器上，npm 那些是同样的版本，我改过的和自建的（`dsh-connect-workbuddy`、`dsh-image-viewer`、`harness-eval` 等）是同一个仓库里的同一份源码，装出来跟我这边一致。升级 WorkBuddy 上游时按 `plugins/dsh-connect-workbuddy/LOCAL-CHANGES.md` 的流程走，别直接 `dsh plugin add` 覆盖
 - **版本是按我这台机器锁的**。你那边 Harness 如果缺某个实验包，会跳过；版本不兼容时 dsh 会拒绝安装，安装器不会自动做版本豁免——真要装得自己处理
+- **`link:` 插件的路径必须前后一致**。profile 的 `package.json` 写绝对 `link:` 时，`pnpm-lock.yaml` 里那条 `version` 也必须是同一个绝对路径。它一旦变成 `link:../../..`，pnpm 按相对层级重建成指向别处的悬空软链接，DSH 启动就报 `cannot resolve profile bundle`——此时按提示重跑 `dsh plugin install` 没用，会把同一条坏记录再建一遍。要改锁文件里那行 `version`，再重建链接
 - **Desktop 和官方包 appId 一样**。已经在用自建包的机器，别再装官方安装包，会盖掉自建那份
 
 ## 不会放进来的
@@ -141,7 +142,7 @@ I keep it as a repo you can install from with one command. Take the whole set, t
 
 **Plugins by other people**, installed from npm at the versions I pinned — I do not re-host their sources:
 
-`dsh-graph` (goal board), `dsh-context`, `@modusensus/dsh-mneme` (long-term memory), `dsh-better-sidebar`, `@changfenhuang/dsh-genui` (UI components), two from `@goodandready/*` (`dsh-context-lens`, `dsh-time-machine`), three from `@linxin666/*` (`session-archive`, `usage`, `client-ui-model-capabilities`), plus `billion-context`, `dsh-claude-style`, `dsh-super-code`, `ds-bot`, `dsh-github-connect`, `@tt-a1i/archify-dsh`, and `@deepseek-ai/dsh-subagent-claude-code`.
+`dsh-graph` (goal board), `dsh-context`, `@modusensus/dsh-mneme` (long-term memory), `dsh-better-sidebar`, `@changfenhuang/dsh-genui` (UI components), two from `@goodandready/*` (`dsh-context-lens`, `dsh-time-machine`), three from `@linxin666/*` (`session-archive`, `usage`, `client-ui-model-capabilities`), plus `billion-context`, `dsh-claude-style`, `dsh-super-code`, `ds-bot`, `dsh-github-connect`, `@tt-a1i/archify-dsh`, `@deepseek-ai/dsh-subagent-claude-code`, `@michengai/dsh-skills-manager`, and `@leon___/dsh-client-liang-intensity-skin`.
 
 The full list and versions are in [`manifest.json`](manifest.json).
 
@@ -211,6 +212,7 @@ git push
 - **`cordis.patch.yml` is not included.** That is your own runtime configuration; copy it separately if you want it
 - **WorkBuddy needs its own login.** The shape is in `settings/workbuddy.example.yml`; do not commit a filled-in copy
 - **Versions are pinned against my machine.** On someone else's box the npm entries resolve to the same versions, and the ones I modified or wrote myself (`dsh-connect-workbuddy`, `dsh-image-viewer`, `harness-eval`, …) come from the same sources in this repo, so an install lands on what I run. When upgrading WorkBuddy's upstream, follow `plugins/dsh-connect-workbuddy/LOCAL-CHANGES.md` — do not overwrite it with `dsh plugin add`
+- **A `link:` plugin needs the same path everywhere.** When the profile's `package.json` declares an absolute `link:`, the matching `version` in `pnpm-lock.yaml` must be that same absolute path. If it turns into `link:../../..`, pnpm rebuilds it by relative depth into a dangling symlink somewhere else, and DSH refuses to boot with `cannot resolve profile bundle`; re-running `dsh plugin install` as the message suggests only recreates the same bad record. Fix that `version` line and rebuild the link
 - **Desktop and the official package share an appId.** If you already run a self-built package, do not install the official build over it
 
 ## What is deliberately not here
