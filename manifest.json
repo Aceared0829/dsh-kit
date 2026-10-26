@@ -1,6 +1,6 @@
 {
   "name": "dsh-kit",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "npm": [
     {
       "name": "@changfenhuang/dsh-genui",
@@ -29,7 +29,7 @@
     },
     {
       "name": "@linxin666/dsh-session-archive",
-      "version": "0.4.4"
+      "version": "0.4.9"
     },
     {
       "name": "@linxin666/dsh-usage",
@@ -53,7 +53,7 @@
     },
     {
       "name": "ds-bot",
-      "version": "0.2.1"
+      "version": "0.2.2"
     },
     {
       "name": "dsh-better-sidebar",
@@ -61,11 +61,11 @@
     },
     {
       "name": "dsh-claude-style",
-      "version": "0.19.2"
+      "version": "0.19.3"
     },
     {
       "name": "dsh-context",
-      "version": "0.75.1"
+      "version": "0.77.0"
     },
     {
       "name": "dsh-github-connect",
