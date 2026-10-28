@@ -18,6 +18,28 @@ const prepareChatBody = mod[aliasMatch[1]];
 if (typeof prepareChatBody !== "function") throw new Error(`export ${aliasMatch[1]} is not a function`);
 console.log(`chunk: ${chunk[0]}\n`);
 
+// EVERY file in lib/ must reference the chunk that is actually here.
+//
+// WHY THIS IS A HARD GATE, and not a test below: on the 5.12.0 -> 5.12.4 upgrade
+// the chunk was renamed (xEJRdYaC -> guET27pw) and one caller kept the OLD name.
+// `bin.js` is the package's CLI entry (`bin` in package.json), so the shipped
+// command threw ERR_MODULE_NOT_FOUND on load. Nothing in the behavioural suite
+// could see it: the assertions below exercise the chunk directly, so a stale
+// specifier in a sibling file is invisible to them. A missing module is not a
+// style issue, it is a broken entry point, so this fails the run instead of
+// printing a line.
+const staleRefs = readdirSync(libDir)
+  .filter((name) => name.endsWith(".js"))
+  .flatMap((name) => {
+    const text = readFileSync(join(libDir, name), "utf8");
+    const refs = [...text.matchAll(/\.\/(host-heartbeat-[\w-]+\.js)/g)].map((m) => m[1]);
+    return refs.filter((ref) => !chunk.includes(ref)).map((ref) => `${name} -> ${ref}`);
+  });
+if (staleRefs.length > 0) {
+  throw new Error(`stale host-heartbeat specifier(s) pointing at a file that is not here: ${staleRefs.join(", ")}`);
+}
+console.log(`all lib/*.js reference ${chunk[0]}: OK\n`);
+
 
 const FALLBACK = "你乃AI辅助软件也。";
 const ZH = "你正通过 DeepSeek Harness 网页界面与用户对话";
