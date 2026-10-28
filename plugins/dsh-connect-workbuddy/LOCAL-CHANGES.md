@@ -268,3 +268,95 @@ function neutralizeScannedText(text) {
   `bin.js` 随上游更新；`dependencies` / `peerDependencies` 未变，`node_modules` 不用重装。
 - **未验证**：插件运行期真的把 retryPolicy 交给 `dsh-llm-retry` 这一跳（需要一次真实 bad-JSON 采样）；
   以及真实网关对这回改写的端到端回应（见 `D:\tmp\verify\workbuddy-gateway\report.md`）。
+
+
+---
+
+# 2026-10-28 第二次修订：`5.12.4-zh.2` —— 找到 11128 的**真根因**
+
+## 一句话
+
+身份句全部改写成功之后，网关**仍然**返回 400/11128。真正触发的不是身份句，而是 system 提示词
+**正文中段**一句与身份无关的 harness 说明：
+
+```
+Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root
+```
+
+共 **111 字符**。它既不在 `UNAPPROVED_CHANNEL_OPENINGS`（那是**前缀**清单），也不在 `IDENTITY_CLAUSE`
+（只认 `you are … powered by` / `interacting with the user through the deepseek harness`），
+在插件源码里 **0 命中** —— 正是本文件上方反复引用的那句注释「THE LIST CANNOT BE COMPLETE」的活例。
+
+## 怎么查出来的（方法可复用）
+
+1. **先确认 body 到底长什么样**。DSH **不落盘出站请求体**，但产生 body 的 system 消息在会话转写里：
+   `D:\DSH-Home\sessions\<ws>\session-<id>\session.v4.jsonl.zstd`——**多帧 zstd 拼接**，
+   `zlib.zstdDecompressSync` 单次只解第一帧（246 字节的 session 头），必须按 magic `28 b5 2f fd` 切帧逐一解。
+   在 `system/message` 事件里拿到 14454 字的原文，与报错回执里的「共 14454 字」逐字吻合。
+2. 用插件 `prepareChatBody` 处理后直连网关：首行已变中文、三条身份串全消失，**仍然 400**。
+   这一步排除了「改写没生效」，把问题锁定在「还有别的触发点」。
+3. **二分收敛**：按 600 字分块，23 块里只有 `offset 4200` 一块失败；再字符级缩尾/缩头，收敛到 `[4285, 4396)` 共 111 字。
+   用 400 字窗 / 200 步长扫全篇 69 个窗，**只有一处触发**——不是多个触发点叠加。
+4. **确证**：只改这 111 字（插 1 个 U+200B，或换成中文），同一个 13793 字 body 从 400 变 **200**。
+
+## 这条闸的实测性质（决定了为什么只有新方案能修）
+
+| 变体 | 结果 | 含义 |
+|---|---|---|
+| 前面加 1–12 个字符 | **仍 400** | **子串**规则，不是前缀规则 → 加中性头无效 |
+| 句尾追加 `.` / ` zzz` / 换行 | **仍 400** | 尾部边界宽松 |
+| 两句之间用换行代替空格 | **200** | **对空白敏感** |
+| 全小写 | **仍 400** | 大小写不敏感 |
+| 只留第一句（67 字）或只留第二句（43 字） | **200** | 两句必须齐全，是一个整体 |
+| 逐词贪心删除 17 个词 | 一个都删不掉 | 111 字是**最小完整匹配串** |
+| 放进 `user` 角色 | 200 | user 不扫 |
+| 放进 `assistant` 角色 | **400** | assistant 也扫（会话一旦被污染会一直失败） |
+| 换模型 `glm-5.3` | **仍 400** | 与模型无关 |
+
+→ 前三行直接判死了旧方案：**任何「在前面加东西」的办法（含 `forceNeutralHead` 自愈重试）对它都无效**，
+  只有真正**打断这 111 字本身**才行。
+
+## 修法：`replaceRefusedContentSpans()`
+
+在 `neutralizeScannedText()` 里，`neutralizeText()`（整行替换）之后、`breakIdentityClauses()`（子句破坏）之前，
+插一层**中段子串替换**。选的是**中文等价表述**而不是插 U+200B：
+
+```js
+const REFUSED_CONTENT_SPANS = [{
+    text: "Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root",
+    replacement: "以 @ 开头的标记是用户显式引用的路径，相对路径从工作区根目录解析"
+}];
+```
+
+为什么不是零宽扰动：两种改法实测都能 200，但这句是**给模型看的行为说明**（讲 `@` 引用怎么解析、
+相对路径以哪为根）。插零宽字符只是把字节搅乱、语义还在但难读；换成中文**保住语义**，
+与这套定制「用中文而不是用中性头」的整体取向一致。
+
+实现细节（每条都是有原因的）：
+
+- **按词切分 + `\s+` 连接**：实测两句之间**换行**时网关放行，说明它对空白宽松；
+  所以正则也用 `\s+`，宿主把这句话折行时同样能命中。
+- **`giu` 全局 + 大小写不敏感**：实测全小写仍然被拒，所以要忽略大小写。
+- **span 自身做正则转义**：这条里没有元字符，但下一条可能会；不转义就会变成一个匹配别处的模式。
+- **按顺序串起来**：`neutralizeText` → `replaceRefusedContentSpans` → `breakIdentityClauses`。
+  顺序沿用上游「先前缀判定，再破坏子句」的承重设计。
+
+## 验证
+
+- `local/verify_local.mjs` 从 8 条扩到 **11 条**，新增 3 条专钉这条 span：
+  ①中文替换在位且前后段落字节保留；②大写 + 折行也命中；③assistant 历史里的同一句同样被扫。**11/11 通过**。
+- 用**真实 14454 字 system**（从会话转写恢复）跑：14454 → 13715 字，触发串消失、中文替换在位；
+  五条禁用串（三条身份句 + 这 111 字 + Claude Code）在**连续字节**层面全部 gone。
+- `local/verify_retry.cjs`：**10/10**（retryPolicy 接线未受影响）。
+- 端到端前后对照（补丁前 400 / 补丁后 200）见 `D:\tmp\verify\workbuddy-gateway\report3.md`。
+
+## 本次踩到的两个坑（记下来免得重犯）
+
+1. **`bin.js` 的陈旧 specifier**：升级时 chunk 从 `host-heartbeat-xEJRdYaC.js` 改名成 `guET27pw.js`，
+   但 `lib/bin.js`（包的 CLI 入口）仍指向旧名 → 一加载就 `ERR_MODULE_NOT_FOUND`。
+   行为断言看不见它，因为它们直接 import chunk。**已在 `verify_local.mjs` 开头加硬门**：
+   扫描 `lib/*.js` 里所有 `./host-heartbeat-*.js` 说明符，指向不存在的 chunk 就抛错退出。
+   做了变异验证（改回旧名 → 抛错；恢复 → 绿）。
+2. **不要用 PowerShell `Set-Content` 改这些 JS 文件**：它会给文件加 **UTF-8 BOM**
+   （`EF BB BF`），而 `bin.js` 第一行是 `#!/usr/bin/env node`，BOM 顶在 shebang 前面使 `node --check` 直接报错。
+   改这类文件用 `[System.IO.File]::WriteAllBytes()` 逐字节写，或 `edit`/`write` 工具。

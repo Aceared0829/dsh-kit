@@ -1,0 +1,22 @@
+[
+  {
+    "label": "FALLBACK",
+    "old": "const WORKBUDDY_FALLBACK_SYSTEM_PROMPT = \"You are a helpful assistant.\";",
+    "new": "const WORKBUDDY_FALLBACK_SYSTEM_PROMPT = \"你乃AI辅助软件也。\";\nconst WEB_GUI_PROMPT_ZH = \"你正通过 DeepSeek Harness 网页界面与用户对话，界面地址以运行时上下文给出的为准。用户若说「这个页面」「这个界面」或「这个应用」且没有点名别的目标，指的就是这个界面。浏览器不会附带 DOM、路由或截图。客户端插件的热更新接收器是开着的，但只有同一检出里同时在跑 `pnpm run dev:web` 重建包时，插件改动才会不刷新页面就生效；承诺自动更新前先确认那个监视进程在跑。其余改动（apps/web 外壳和普通包）必须重新构建对应的 Web 产物，刷新页面后再核对这个地址。另开一个服务器不会更新当前界面。apps/web 的 Vite 入口只构建外壳，不是独立应用，因为只有 dsh web 会注入 window.__DSH_BOOT__。除非用户要求，不要再启动替代服务器；如果需要，用托管后台任务，并核对它的准确地址。\";"
+  },
+  {
+    "label": "OPENINGS",
+    "old": "const UNAPPROVED_CHANNEL_OPENINGS = [\"you are an ai agent powered by deepseek harness\", \"you are claude code, anthropic's official cli for claude\"];",
+    "new": "const UNAPPROVED_CHANNEL_OPENINGS = [\n\t{ prefix: \"you are interacting with the user through the deepseek harness\", replacement: WEB_GUI_PROMPT_ZH },\n\t{ prefix: \"you are an ai agent powered by deepseek harness\", replacement: WORKBUDDY_FALLBACK_SYSTEM_PROMPT },\n\t{ prefix: \"you are claude code, anthropic's official cli for claude\", replacement: WORKBUDDY_FALLBACK_SYSTEM_PROMPT },\n\t{ prefix: \"you are a helpful assistant\", replacement: WORKBUDDY_FALLBACK_SYSTEM_PROMPT }\n];"
+  },
+  {
+    "label": "PREDICATE",
+    "old": "function isUnapprovedChannelOpening(text) {\n\tconst opening = text.replace(/^\\s+/u, \"\").toLowerCase();\n\treturn UNAPPROVED_CHANNEL_OPENINGS.some((prefix) => opening.startsWith(prefix));\n}",
+    "new": "function unapprovedChannelOpeningOf(text) {\n\tconst opening = text.replace(/^\\s+/u, \"\").toLowerCase();\n\treturn UNAPPROVED_CHANNEL_OPENINGS.find((item) => opening.startsWith(item.prefix));\n}\nfunction isUnapprovedChannelOpening(text) {\n\treturn unapprovedChannelOpeningOf(text) !== void 0;\n}"
+  },
+  {
+    "label": "SCANNED",
+    "old": "function neutralizeScannedText(text) {\n\tconst broken = breakIdentityClauses(isUnapprovedChannelOpening(text) ? `${WORKBUDDY_FALLBACK_SYSTEM_PROMPT}\\n\\n${text}` : text);\n\treturn broken === text ? void 0 : broken;\n}",
+    "new": "function neutralizeText(text) {\n\tconst lines = text.split(\"\\n\");\n\tlet changed = false;\n\tfor (let index = 0; index < lines.length; index++) {\n\t\tconst opening = lines[index].replace(/^\\s+/u, \"\").toLowerCase();\n\t\tif (opening === \"\") continue;\n\t\tconst hit = unapprovedChannelOpeningOf(opening);\n\t\tif (hit === void 0) continue;\n\t\tlines[index] = hit.replacement;\n\t\tchanged = true;\n\t}\n\treturn changed ? lines.join(\"\\n\") : void 0;\n}\nfunction neutralizeScannedText(text) {\n\tconst replaced = neutralizeText(text) ?? text;\n\tconst broken = breakIdentityClauses(replaced);\n\treturn broken === text ? void 0 : broken;\n}"
+  }
+]

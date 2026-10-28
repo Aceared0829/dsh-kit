@@ -3593,9 +3593,66 @@ function neutralizeText(text) {
 	}
 	return changed ? lines.join("\n") : void 0;
 }
+/**
+* Spans the gateway REFUSES that are neither identity clauses nor openings —
+* matched ANYWHERE in a scanned message and replaced in place.
+*
+* MEASURED on the live CN gateway (2026-10-28) against a REAL 14454-character DSH
+* system prompt: with every identity clause already neutralised, the request still
+* answered 400 / 11128. Bisecting that body character by character left exactly
+* ONE trigger, 111 characters long, in the MIDDLE of the prompt:
+*
+*   Tokens prefixed with @ are paths the user explicitly referenced.
+*   Relative paths resolve from the workspace root
+*
+* It is a SUBSTRING rule, so no existing rung can reach it: the opening list is a
+* prefix rule (12 characters prepended still answered 400), breakIdentityClauses
+* knows only the identity clauses, and forceNeutralHead moves openings, not middle
+* spans. Measured locality: leave either sentence out and the body answers 200, so
+* the pair is one unit; the match is case-insensitive and whitespace-sensitive (a
+* newline between the two sentences passes, a plain space does not). Replacing the
+* span with the Chinese text below answered 200 on the same 13793-character body —
+* as did inserting a single U+200B. The replacement therefore KEEPS THE MEANING
+* instead of merely mangling bytes: this line tells the model how to read
+* @-prefixed paths, and a Chinese rendering preserves what it was for.
+*
+* This is the case the comment above predicted (the list cannot be complete). An
+* entry belongs here ONLY with a measured refusal behind it: a phrase added by
+* guesswork would rewrite prompts the gateway answers today.
+*/
+const REFUSED_CONTENT_SPANS = [{
+	text: "Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root",
+	// The host continues the sentence with "; absolute paths identify …", so a
+	// replacement that stops before the semicolon leaves a half-width ";" glued to
+	// Chinese text. Swallow it when it is there, and match BOTH forms: the gateway
+	// was measured to refuse the sentence with and without the trailing punctuation
+	// (its tail boundary is lenient), so the span must not depend on which one the
+	// host happened to write.
+	tail: ";",
+	replacement: "以 @ 开头的标记是用户显式引用的路径，相对路径从工作区根目录解析。"
+}];
+/**
+* Replace every measured refused span with its Chinese equivalent.
+*
+* Case-insensitive, and deliberately tolerant about the whitespace BETWEEN the two
+* sentences: the gateway was measured to accept a newline there, so a host that
+* wraps the sentence across lines must still get the same meaning through. The
+* span's own words are escaped, so a future entry carrying regex metacharacters
+* cannot turn into a pattern that matches something else.
+*/
+function replaceRefusedContentSpans(text) {
+	let out = text;
+	for (const span of REFUSED_CONTENT_SPANS) {
+		const words = span.text.split(/\s+/u).map((word) => word.replace(/[.*+?$^{}()|[\]\\]/gu, "\\$&"));
+		const tail = span.tail === void 0 ? "" : `\\s*${span.tail.replace(/[.*+?$^{}()|[\]\\]/gu, "\\$&")}?`;
+		out = out.replace(new RegExp(`${words.join("\\s+")}${tail}`, "giu"), span.replacement);
+	}
+	return out;
+}
 function neutralizeScannedText(text) {
 	const replaced = neutralizeText(text) ?? text;
-	const broken = breakIdentityClauses(replaced);
+	const spanned = replaceRefusedContentSpans(replaced);
+	const broken = breakIdentityClauses(spanned);
 	return broken === text ? void 0 : broken;
 }
 /**

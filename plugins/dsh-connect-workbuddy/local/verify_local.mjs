@@ -148,6 +148,56 @@ results.push(
   ),
 );
 
+// The refused-content span (2026-10-28). MEASURED: with every identity clause
+// already neutralised, a real 14454-character DSH prompt still answered 400 /
+// 11128 because of THIS 111-character sentence in the MIDDLE of it. None of the
+// identity rungs can reach a middle substring, so these three assertions pin the
+// one thing that does: same sentence gone, meaning kept, everything else untouched.
+const SPAN =
+  "Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root";
+// The replacement ends the sentence with a full stop so the host's own
+// "; absolute paths identify …" continuation does not leave a half-width ";"
+// glued to Chinese text — the span therefore swallows that semicolon too.
+const SPAN_ZH = "以 @ 开头的标记是用户显式引用的路径，相对路径从工作区根目录解析。";
+
+results.push(
+  run(
+    "refused content span is replaced with its Chinese equivalent",
+    [{ role: "system", content: `Preamble line.\n\n${SPAN}\n\nFollowing paragraph.` }],
+    (out) =>
+      !out.messages[0].content.includes(SPAN) &&
+      out.messages[0].content.includes(SPAN_ZH) &&
+      out.messages[0].content.includes("Preamble line.") &&
+      out.messages[0].content.includes("Following paragraph."),
+  ),
+);
+
+results.push(
+  run(
+    "refused content span matches case-insensitively across a line wrap",
+    [
+      {
+        role: "system",
+        content:
+          "TOKENS PREFIXED WITH @ ARE PATHS THE USER EXPLICITLY REFERENCED.\nRELATIVE PATHS RESOLVE FROM THE WORKSPACE ROOT\nEnd.",
+      },
+    ],
+    (out) => out.messages[0].content.includes(SPAN_ZH) && out.messages[0].content.includes("End."),
+  ),
+);
+
+results.push(
+  run(
+    "assistant history carrying the refused span is scanned too",
+    [
+      { role: "system", content: "clean system prompt" },
+      { role: "user", content: "hi" },
+      { role: "assistant", content: `${SPAN}` },
+    ],
+    (out) => out.messages[2].content === SPAN_ZH && !/[\u4e00-\u9fff];/u.test(out.messages[2].content),
+  ),
+);
+
 const failed = results.filter((r) => !r).length;
 console.log(`\n${results.length - failed}/${results.length} passed`);
 process.exit(failed === 0 ? 0 : 1);

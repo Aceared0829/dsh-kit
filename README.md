@@ -29,7 +29,7 @@
 
 | 插件 | 相对上游改了什么 |
 |---|---|
-| `dsh-connect-workbuddy` | 中文本地构建（`5.12.4-zh.1`）：固定的中文系统提示、Web GUI 段的中文版、把上游那些会触发网关拒答的英文指纹换成中文；另加 `retryPolicy` 配置项（默认码表不含 `MALFORMED_RESPONSE`）。改法与升级流程见 `plugins/dsh-connect-workbuddy/LOCAL-CHANGES.md` |
+| `dsh-connect-workbuddy` | 中文本地构建（`5.12.4-zh.2`）：固定的中文系统提示、Web GUI 段的中文版、把上游那些会触发网关拒答的英文指纹换成中文；**另外在提示词正文中段还会被网关拦的那句 harness 说明也换成中文**（11128 的真根因，实测定位到 111 字符）；另加 `retryPolicy` 配置项（默认码表不含 `MALFORMED_RESPONSE`）。改法与升级流程见 `plugins/dsh-connect-workbuddy/LOCAL-CHANGES.md` |
 
 **别人做的这些**（从 npm 装，清单里锁了版本，我没把源码再拷一份）：
 
@@ -140,7 +140,7 @@ I keep it as a repo you can install from with one command. Take the whole set, t
 
 | Plugin | What differs from upstream |
 |---|---|
-| `dsh-connect-workbuddy` | A Chinese local build (`5.12.4-zh.1`): fixed Chinese system prompt, a Chinese rendering of the Web GUI paragraph, and the upstream English fingerprints that the gateway rejects replaced with Chinese; plus a `retryPolicy` option, since the default retryable-code list omits `MALFORMED_RESPONSE`. The changes and the upgrade procedure are in `plugins/dsh-connect-workbuddy/LOCAL-CHANGES.md` |
+| `dsh-connect-workbuddy` | A Chinese local build (`5.12.4-zh.2`): fixed Chinese system prompt, a Chinese rendering of the Web GUI paragraph, the upstream English fingerprints that the gateway rejects replaced with Chinese, and — measured root cause of 11128 — a mid-prompt harness sentence (111 characters) replaced with its Chinese equivalent; plus a `retryPolicy` option, since the default retryable-code list omits `MALFORMED_RESPONSE`. The changes and the upgrade procedure are in `plugins/dsh-connect-workbuddy/LOCAL-CHANGES.md` |
 
 **Plugins by other people**, installed from npm at the versions I pinned — I do not re-host their sources:
 
