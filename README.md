@@ -29,7 +29,7 @@
 
 | 插件 | 相对上游改了什么 |
 |---|---|
-| `dsh-connect-workbuddy` | 中文本地构建（`5.7.0-zh.1`）：固定的中文系统提示、Web GUI 段的中文版、把上游那些会触发网关拒答的英文指纹换成中文。改法与升级流程见 `plugins/dsh-connect-workbuddy/LOCAL-CHANGES.md` |
+| `dsh-connect-workbuddy` | 中文本地构建（`5.12.4-zh.1`）：固定的中文系统提示、Web GUI 段的中文版、把上游那些会触发网关拒答的英文指纹换成中文；另加 `retryPolicy` 配置项（默认码表不含 `MALFORMED_RESPONSE`）。改法与升级流程见 `plugins/dsh-connect-workbuddy/LOCAL-CHANGES.md` |
 
 **别人做的这些**（从 npm 装，清单里锁了版本，我没把源码再拷一份）：
 
@@ -105,6 +105,8 @@ git push
 - **版本是照我这台机器锁的**。装到别人机器上，npm 那些是同样的版本，我改过的和自建的（`dsh-connect-workbuddy`、`dsh-image-viewer`、`harness-eval` 等）是同一个仓库里的同一份源码，装出来跟我这边一致。升级 WorkBuddy 上游时按 `plugins/dsh-connect-workbuddy/LOCAL-CHANGES.md` 的流程走，别直接 `dsh plugin add` 覆盖
 - **版本是按我这台机器锁的**。你那边 Harness 如果缺某个实验包，会跳过；版本不兼容时 dsh 会拒绝安装，安装器不会自动做版本豁免——真要装得自己处理
 - **`link:` 插件的路径必须前后一致**。profile 的 `package.json` 写绝对 `link:` 时，`pnpm-lock.yaml` 里那条 `version` 也必须是同一个绝对路径。它一旦变成 `link:../../..`，pnpm 按相对层级重建成指向别处的悬空软链接，DSH 启动就报 `cannot resolve profile bundle`——此时按提示重跑 `dsh plugin install` 没用，会把同一条坏记录再建一遍。要改锁文件里那行 `version`，再重建链接
+- **DSH home 是 junction 时，相对软链接只能活一半**。这是同一个坑更难看见的形态：`~/.dsh` 指向别处（比如 `D:/DSH-Home`）时，profile 有两条路能到——应用按 `~/.dsh` 启动，pnpm 在真实的盘上装。同盘的 `link:` 目标被 pnpm 写成相对路径（`..\..\..\..\deepseek-harness\plugins\harness-eval`），而相对路径是按「用哪条路走到它」解析的：从真实盘走能解开，从 `~/.dsh` 走就悬空。表现是插件列表显示**包不可用 / 包元信息错误**，插件静悄悄地不再加载，但一切看起来都装好了。修法是把该链接换成绝对 junction：`cmd /c rmdir "<link>"` 再 `cmd /c mklink /J "<link>" "<绝对目标>"`
+- **装完会自动查这件事**。安装器最后跑 `scripts/check-plugin-links.mjs`：只要某条链接只在一条路上活着，就中止安装并给出修复命令。平时也可以直接跑它自查，一条命令看清每个 profile 的每条链接在两条路上是否都通
 - **Desktop 和官方包 appId 一样**。已经在用自建包的机器，别再装官方安装包，会盖掉自建那份
 
 ## 不会放进来的
@@ -138,7 +140,7 @@ I keep it as a repo you can install from with one command. Take the whole set, t
 
 | Plugin | What differs from upstream |
 |---|---|
-| `dsh-connect-workbuddy` | A Chinese local build (`5.7.0-zh.1`): fixed Chinese system prompt, a Chinese rendering of the Web GUI paragraph, and the upstream English fingerprints that the gateway rejects replaced with Chinese. The changes and the upgrade procedure are in `plugins/dsh-connect-workbuddy/LOCAL-CHANGES.md` |
+| `dsh-connect-workbuddy` | A Chinese local build (`5.12.4-zh.1`): fixed Chinese system prompt, a Chinese rendering of the Web GUI paragraph, and the upstream English fingerprints that the gateway rejects replaced with Chinese; plus a `retryPolicy` option, since the default retryable-code list omits `MALFORMED_RESPONSE`. The changes and the upgrade procedure are in `plugins/dsh-connect-workbuddy/LOCAL-CHANGES.md` |
 
 **Plugins by other people**, installed from npm at the versions I pinned — I do not re-host their sources:
 

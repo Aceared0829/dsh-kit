@@ -1,4 +1,4 @@
-import { readdirSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -7,8 +7,17 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const libDir = join(dirname(fileURLToPath(import.meta.url)), "..", "lib");
 const chunk = readdirSync(libDir).filter((name) => /^host-heartbeat-.*\.js$/.test(name));
 if (chunk.length !== 1) throw new Error(`expected exactly one host-heartbeat chunk, found ${chunk.length}`);
-const { $: prepareChatBody } = await import(pathToFileURL(join(libDir, chunk[0])).href);
+// The export ALIAS is not stable across upstream builds: 5.7.0 exported it as
+// `$`, 5.12.0 renamed it to `rt`. Resolve whatever alias the chunk gave it,
+// so a version bump cannot silently leave this script testing `undefined`.
+const mod = await import(pathToFileURL(join(libDir, chunk[0])).href);
+const chunkSrc = readFileSync(join(libDir, chunk[0]), "utf8");
+const aliasMatch = /prepareChatBody as (\w+)/.exec(chunkSrc);
+if (aliasMatch === null) throw new Error("prepareChatBody is not exported by the chunk");
+const prepareChatBody = mod[aliasMatch[1]];
+if (typeof prepareChatBody !== "function") throw new Error(`export ${aliasMatch[1]} is not a function`);
 console.log(`chunk: ${chunk[0]}\n`);
+
 
 const FALLBACK = "你乃AI辅助软件也。";
 const ZH = "你正通过 DeepSeek Harness 网页界面与用户对话";

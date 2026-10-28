@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { C as defaultDesktopAuthCandidates, L as WorkBuddyUpstreamClient, M as workbuddyOwnAuthPath, Mt as hostPeersInfo, a as readHostHeartbeat, b as WorkBuddyCredentialStore, c as WORKBUDDY_CONNECT_VERSION, d as FALLBACK_WORKBUDDY_MODELS_GLOBAL, k as legacyWorkbuddyOwnAuthPath, l as piAiRuntimeInfo, o as workbuddyHostHeartbeatPath, r as isHeartbeatProcessAlive, u as FALLBACK_WORKBUDDY_MODELS, vt as WORKBUDDY_APP_EXECUTABLE_ENV, w as defaultDesktopAuthDirs, wt as findWorkbuddyAppExecutableWithSource, y as WORKBUDDY_AUTH_FILE_ENV } from "./host-heartbeat-CVz2J0Xt.js";
+import { C as WorkBuddyCredentialStore, D as defaultDesktopAuthDirs, E as defaultDesktopAuthCandidates, I as workbuddyOwnAuthPath, Lt as WORKBUDDY_APP_EXECUTABLE_ENV, M as legacyWorkbuddyOwnAuthPath, S as WORKBUDDY_AUTH_FILE_ENV, Ut as findWorkbuddyAppExecutableWithSource, V as WorkBuddyUpstreamClient, Zt as hostPeersInfo, a as readHostHeartbeat, c as WORKBUDDY_CONNECT_VERSION, d as rosterSeenPath, f as piAiRuntimeInfo, m as FALLBACK_WORKBUDDY_MODELS_GLOBAL, o as workbuddyHostHeartbeatPath, p as FALLBACK_WORKBUDDY_MODELS, r as isHeartbeatProcessAlive, u as describeRosterSeenPayload } from "./host-heartbeat-xEJRdYaC.js";
+import { readFile } from "node:fs/promises";
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 //#region src/bin.ts
@@ -25,8 +26,12 @@ import { fileURLToPath } from "node:url";
 * 3 → 4: added `hostPeers` (issue #47). Consumers that switch on the version
 * see the field appear rather than having to guess whether its absence means
 * "old build" or "no peer".
+*
+* 4 → 5: added `rosterSeen`, so a first-sighting history that is corrupt or in
+* a version this build cannot read is REPORTED rather than silently answered as
+* "no new models".
 */
-const JSON_SCHEMA_VERSION = 4;
+const JSON_SCHEMA_VERSION = 5;
 /** Both regions, in reporting order. */
 const REGIONS = ["cn", "global"];
 /** Region labels for human output. */
@@ -65,6 +70,39 @@ function makeAnyStore() {
 	const client = new WorkBuddyUpstreamClient();
 	return new WorkBuddyCredentialStore({ refresh: (credential) => client.refreshToken(credential) });
 }
+/**
+* Read one region's first-sighting history and describe its payload.
+*
+* Read-only: this CLI never writes history, so running `doctor` cannot change
+* who counts as new. The point is that a corrupt file or one written by a newer
+* build is REPORTED here — without this, both would surface as "no new models",
+* which is a statement about this machine's catalogue and never a file.
+*/
+async function describeRosterSeen(region) {
+	const path = rosterSeenPath(region);
+	let raw = null;
+	try {
+		raw = JSON.parse(await readFile(path, "utf8"));
+	} catch {
+		raw = null;
+	}
+	const described = describeRosterSeenPayload(raw);
+	if (described === null) return {
+		path,
+		present: raw !== null,
+		readable: false
+	};
+	const version = raw["version"];
+	return {
+		path,
+		present: true,
+		readable: true,
+		versionKnown: described.versionKnown,
+		...typeof version === "number" ? { version } : {},
+		ids: described.ids,
+		fresh: described.fresh
+	};
+}
 async function doctor(jsonOutput) {
 	const anyStore = makeAnyStore();
 	const desktopPresent = await anyStore.desktopFilePresent();
@@ -99,6 +137,10 @@ async function doctor(jsonOutput) {
 	* user can tell the two states apart without reading a stack trace.
 	*/
 	const hostPeers = await hostPeersInfo();
+	const rosterSeen = await Promise.all(REGIONS.map(async (region) => ({
+		region,
+		summary: await describeRosterSeen(region)
+	})));
 	const report = {
 		schemaVersion: JSON_SCHEMA_VERSION,
 		package: "dsh-connect-workbuddy",
@@ -164,12 +206,18 @@ async function doctor(jsonOutput) {
 			cn: FALLBACK_WORKBUDDY_MODELS.length,
 			global: FALLBACK_WORKBUDDY_MODELS_GLOBAL.length
 		},
+		rosterSeen: Object.fromEntries(rosterSeen.map(({ region, summary }) => [region, summary])),
 		hints: [
 			...anySignedIn ? [] : ["Sign in once in the WorkBuddy desktop app (either region), then run status again."],
 			...desktopPresent ? [] : [`No WorkBuddy desktop auth file at the expected path; set ${WORKBUDDY_AUTH_FILE_ENV} if it lives elsewhere.`],
 			...appExecutable === void 0 ? [`The WorkBuddy desktop app was not found, so encrypted credential fields cannot be opened. On Windows the install registration was already checked, so the app is either not installed or its uninstall entry is missing; set ${WORKBUDDY_APP_EXECUTABLE_ENV} to its executable if it is installed elsewhere.`] : [],
 			...hostAlive ? [] : ["Host bundle not running in this DSH profile (or the process exited). The browser card and providers are unavailable until DSH starts the plugin."],
-			...piAi.generation === "legacy" && piAi.resolvedLocally ? [`This plugin resolves pi-ai ${piAi.version ?? "(unreadable version)"} (the 0.85 context shape) while DSH 0.2.0+ hosts normalize with 0.87; the adapter bridges that gap, but if tools still misbehave, remove any nested pi-ai copy so the plugin resolves the host's.`] : []
+			...piAi.generation === "legacy" && piAi.resolvedLocally ? [`This plugin resolves pi-ai ${piAi.version ?? "(unreadable version)"} (the 0.85 context shape) while DSH 0.2.0+ hosts normalize with 0.87; the adapter bridges that gap, but if tools still misbehave, remove any nested pi-ai copy so the plugin resolves the host's.`] : [],
+			...rosterSeen.flatMap(({ region, summary }) => {
+				if (!summary.readable) return summary.present ? [`${REGION_LABELS[region]} first-sighting history is present but unreadable (${summary.path}); remove it to reseed on the next reconcile.`] : [];
+				if (summary.versionKnown === false) return [`${REGION_LABELS[region]} first-sighting history is version ${summary.version === void 0 ? "unknown" : summary.version}, which this build cannot read (${summary.path}); it is answered as empty, so the pill shows no new-model marker.`];
+				return [];
+			})
 		]
 	};
 	if (jsonOutput) printJson(report);
@@ -182,6 +230,13 @@ async function doctor(jsonOutput) {
 		`Host bundle: ${hostAlive ? `running (pid ${heartbeat.pid})` : heartbeat !== void 0 ? "stale heartbeat (process exited)" : "not started"}`,
 		...regionLists.flatMap(({ region, accounts }) => [`${REGION_LABELS[region]} accounts: ${accounts.length} (own copy ${workbuddyOwnAuthPath(region)})`, ...accounts.map((account) => `  - ${account.accountName === "" ? "(unnamed)" : account.accountName} (${account.id})${account.selected ? " [selected]" : ""} expires ${new Date(account.tokenExpiresAtMs).toISOString()}`)]),
 		`Static fallback models: CN ${report.fallbackModels.cn}, Global ${report.fallbackModels.global}`,
+		...REGIONS.map((region) => {
+			const summary = report.rosterSeen[region];
+			if (summary === void 0) return `New-model history (${REGION_LABELS[region]}): not available`;
+			if (!summary.readable) return `New-model history (${REGION_LABELS[region]}): ${summary.present ? "unreadable" : "not started"} (${summary.path})`;
+			if (summary.versionKnown === false) return `New-model history (${REGION_LABELS[region]}): version ${summary.version === void 0 ? "unknown" : summary.version} not readable (${summary.path})`;
+			return `New-model history (${REGION_LABELS[region]}): ${summary.ids ?? 0} recorded, ${summary.fresh ?? 0} new`;
+		}),
 		...report.hints.map((hint) => `Hint: ${hint}`),
 		""
 	].join("\n"));

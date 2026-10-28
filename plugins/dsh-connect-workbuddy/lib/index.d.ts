@@ -433,9 +433,21 @@ declare class WorkBuddyCredentialStore {
    * refuses to use is what made the dropdown look healthy while every request
    * failed with 401.
    *
+   * THE POOL'S RUNTIME OVERRIDE IS PART OF `current()`, SO IT IS PART OF THIS.
+   * `current()` consults `rotatedAccountId` FIRST; this method used to ignore it
+   * and answer from `accountId` alone. With the pool on, the two therefore
+   * disagreed on every rotation: the shim billed account B while the card marked
+   * account A — the reporter's screenshot showed 「当前选用」 on a rate-limited
+   * account while the pill's total belonged to the one actually serving. Worse,
+   * the usage document takes its `credential` from `current()` and its
+   * `account.accountId` from this list, so one document could name two accounts.
+   *
    * So an explicit selection that matches NO local account marks nothing as
    * selected (no silent fallback to a different account — see {@link current}).
    * The implicit default is marked only when nothing was explicitly chosen.
+   * A live rotation marker wins over both, mirroring `current()`'s precedence,
+   * and only while it still names a local account — `current()` falls through in
+   * that case, and so does this.
    */
   accounts(): Promise<WorkBuddyAccountChoice[]>;
   /**
@@ -609,6 +621,24 @@ interface WorkBuddyMediaModel {
   readonly id: string;
   readonly name: string;
   readonly tags: readonly string[];
+  /**
+   * 模型级视频生成配置（上游 `models[].videoGeneration`），只对视频模型出现，
+   * 图像链路从不读它。透传它是因为**同一份目录**同时喂生图与生视频两条链路：
+   * 视频工具要靠这里的 `minSeconds`/`maxSeconds` 在本地拦下越界时长，
+   * 而不是发上去等一个「unsupported video duration」的 400。
+   *
+   * 形状与 `video-gen.ts` 的 `WorkBuddyVideoModelConfig` 一致（那边是视频层的
+   * 同一份定义，两处必须同步——tests/video-gen.spec.ts 有一条对拍测试）。
+   */
+  readonly videoGeneration?: WorkBuddyMediaVideoGeneration;
+}
+/** `WorkBuddyMediaModel.videoGeneration` 的结构。字段缺席就是上游没给，不补默认值。 */
+interface WorkBuddyMediaVideoGeneration {
+  readonly resolutions?: readonly string[];
+  readonly defaultResolution?: string;
+  readonly defaultSeconds?: number;
+  readonly minSeconds?: number;
+  readonly maxSeconds?: number;
 }
 /** 上游成功响应的归一化结果。`url` 与 `b64` 至少有一个。 */
 interface WorkBuddyImageOutcome {
@@ -616,6 +646,22 @@ interface WorkBuddyImageOutcome {
   readonly b64?: string;
   readonly created?: number;
   readonly credit?: number;
+}
+//#endregion
+//#region src/video-gen.d.ts
+/** 提交任务后上游返回的任务元数据（task id）。 */
+interface WorkBuddyVideoSubmission {
+  readonly taskId: string;
+  readonly warnings: readonly string[];
+}
+/** 轮询完成后解析出的任务结果。 */
+interface WorkBuddyVideoOutcome {
+  /** 每个成品视频的下载 URL（`.mp4`）。 */
+  readonly videos: readonly string[];
+  /** 本次实际消耗的积分；上游没给就是 undefined。 */
+  readonly credit?: number | undefined;
+  /** 提交阶段就攒下的非致命告警。 */
+  readonly warnings?: readonly string[] | undefined;
 }
 //#endregion
 //#region src/promo.d.ts
@@ -954,6 +1000,17 @@ type UpstreamErrorKind = 'hard_credit' |
  * user; the second one is the actual remedy.
  */
 'model_busy' | 'session_dead' | 'policy_reject' |
+/**
+ * The upstream restricted THIS account for unusual activity (issue #127).
+ *
+ * Kept separate from {@link policy_reject}, even though both arrive as the
+ * `11140` family with the same `msg: "request illegal"`: that one is a CONTENT
+ * decision and switching accounts cannot help, while this is a CREDENTIAL
+ * decision and switching is exactly the remedy. `displayMsg` is the only
+ * discriminator upstream provides ("账号存在异常行为，已被限制使用" / "restricted
+ * due to unusual activity").
+ */
+'account_restricted' |
 /**
  * The gateway's channel gate refused the request itself (business code
  * 11128, "Illegal API invocation from an unapproved channel").
@@ -1311,6 +1368,31 @@ declare function regionOf(domain: string): WorkBuddyRegion;
  */
 declare function knownRegionOf(domain: string): WorkBuddyRegion | undefined;
 /**
+ * How the plugin should identify itself where the upstream only RECORDS the
+ * request (issue #132). One switch, because the two halves are one decision.
+ */
+interface WorkBuddyWireIdentity {
+  /**
+   * Adopt the official client's usage-page identity on chat requests.
+   *
+   * ON adds `X-IDE-Type` / `X-IDE-Name` / `X-IDE-Version` and switches the
+   * conversation-identity triple to the 32-hex UUIDv7 shape the official client
+   * uses (plus `X-Request-ID`, which mirrors the message id there).
+   *
+   * OFF by default, and the reason is the evidence tier, not the mechanism: the
+   * reporter measured HTTP 200 on their own build of this PLUGIN at 5.3.1
+   * (the WorkBuddy client itself was 5.8.3), and this plugin has not
+   * reproduced that against the live gateway. Nothing in either gate is documented
+   * as reading these headers — `11128`'s three doors are the message openings,
+   * the missing conversation id and a non-system first message, none of which a
+   * header can change — but this gateway has repeatedly refused requests for
+   * reasons visible only in the answer, so a display-only alignment ships behind a
+   * switch rather than as a silent upgrade for every account. `User-Agent` and the
+   * request BODY are untouched either way.
+   */
+  usageIdentity?: boolean;
+}
+/**
  * The model id a prepared body asks for, when it carries one (issue #61).
  *
  * Lives beside {@link prepareChatBody} because it reads the same shape: the
@@ -1319,6 +1401,57 @@ declare function knownRegionOf(domain: string): WorkBuddyRegion | undefined;
  * measurement that this id is needed for.
  */
 declare function modelIdOfBody(bodyJson: string): string | undefined;
+/**
+ * How a body should be prepared beyond the rules every request needs (issue #132).
+ *
+ * Both switches default to OFF, and that default is the point: each one changes
+ * bytes the upstream counts, so it must be a deliberate opt-in rather than a
+ * silent behaviour change on upgrade.
+ */
+interface PrepareChatBodyOptions {
+  /**
+   * Move the harness's injected `user` messages above the real prompt.
+   *
+   * WHY. The usage page's 请求 column is filled from the LAST `user` message in
+   * the body. The DSH harness appends its runtime context (time samples,
+   * `Current runtime context.`, `<system-reminder>` blocks) AFTER the user's real
+   * prompt, as extra `user` messages — so the model reads the real prompt but the
+   * usage page records only the injected tail, and a user comparing their usage
+   * history with what they typed sees rows that look like noise.
+   *
+   * The move is ORDER-ONLY and only within the trailing run: the injected
+   * messages are lifted out and re-inserted immediately BEFORE the real prompt,
+   * which keeps every message, its text and every tool result intact (the one
+   * textual edit is the recorded prompt's leading marker, documented at
+   * {@link ACP_LEADING_TAG}). It is
+   * therefore invisible to the model's instruction order (a runtime-context block
+   * is context wherever it sits) and it is what makes the usage column show what
+   * the user actually typed.
+   *
+   * It also removes the leading `<acp …>mNNNNN</acp>` marker from THAT prompt and no
+   * other message, because otherwise the recorded row still opens with the marker
+   * instead of the user's sentence. Marker only — no text is touched.
+   *
+   * Only messages that MATCH the harness's own injected prefixes are moved. A
+   * body from any other client is untouched: this must never reorder a
+   * conversation whose trailing user messages are real turns.
+   */
+  keepPromptLast?: boolean;
+  /**
+   * Additional leading markers that mark a trailing `user` message as injected
+   * context, one literal prefix per entry.
+   *
+   * WHY. The built-in pattern at {@link INJECTED_USER_PREFIX} knows only the
+   * prefixes measured at the time it was written; a companion plugin (or a DSH
+   * update) that starts injecting new text would silently fall back to having
+   * its blocks recorded as the prompt. Each entry is matched LITERALLY at the
+   * start of the message text (after leading whitespace and the
+   * `billion-context` marker, which the built-in pattern tolerates) and OR'ed
+   * with the built-ins; entries are escaped, so no configuration value can turn
+   * the pattern invalid.
+   */
+  extraInjectedPrefixes?: readonly string[];
+}
 /**
  * Normalize an OpenAI chat-completions body for the WorkBuddy upstream: force
  * `stream: true` (the upstream rejects non-streaming), flatten `tool_choice`
@@ -1336,7 +1469,7 @@ declare function modelIdOfBody(bodyJson: string): string | undefined;
  * upstream already answers keeps its prompt as close to byte-for-byte as these
  * rules allow.
  */
-declare function prepareChatBody(source: string): string;
+declare function prepareChatBody(source: string, options?: PrepareChatBodyOptions): string;
 /** Marker carried by {@link WorkBuddyCredentialRejectedError}; survives bundling. */
 declare const CREDENTIAL_REJECTED_CODE = "WORKBUDDY_CREDENTIAL_REJECTED";
 /**
@@ -1381,8 +1514,9 @@ declare function parseUpstreamModel(value: unknown): WorkBuddyUpstreamModel | un
  */
 declare class WorkBuddyUpstreamClient {
   private readonly onFallback?;
+  private readonly identity;
   /**
-   * Reports a fallback the catalog reader had to take.
+   * Reports an anomaly the reader or classifier had to tolerate.
    *
    * Injected rather than logged here because this module holds no logger on
    * purpose — it is pure transport + parsing, so it stays importable from
@@ -1390,7 +1524,7 @@ declare class WorkBuddyUpstreamClient {
    * `ctx.logger.warn` in; without a host the event is dropped, which is the
    * same silence the previous single-source reader had.
    */
-  constructor(onFallback?: ((message: string) => void) | undefined);
+  constructor(onFallback?: ((message: string) => void) | undefined, identity?: WorkBuddyWireIdentity);
   /** POST the chat endpoint; a successful answer is the raw SSE response. */
   chatStream(credential: WorkBuddyCredential, bodyJson: string, signal?: AbortSignal): Promise<WorkBuddyChatResult>;
   /**
@@ -1464,12 +1598,22 @@ declare class WorkBuddyUpstreamClient {
    */
   fetchModelBusy(credential: WorkBuddyCredential, modelIds: readonly string[], signal?: AbortSignal): Promise<Map<string, WorkBuddyBusyLevel>>;
   /**
-   * 读该账号所属区的产品配置，挑出带 `text-to-image` 标签的媒体模型。
+   * 读该账号所属区的产品配置，返回**全部**媒体模型（图 + 视频，按 tag 区分）。
    *
    * 走的是和 {@link fetchModels} 同一条 `/v3/config`（国内区与国际区都答），
    * 区别只在这里保留 `data.models` 的媒体条目、而不是投影成 CLI 聊天目录。
-   * 国内区实测 62 条模型里只有 `hunyuan-image-alpha` 带 `text-to-image`；
-   * 国际区一条都没有 —— 所以本方法对国际区返回空数组，而不是编一个模型出来。
+   * 两区实测（2026-10-25，同日各跑一次只读探针）：
+   *   - 国内区 61 条模型 / 17 条带 tag：`hunyuan-image-alpha`（`text-to-image`）、
+   *     `hunyuan-image-alpha-edit`（`image-to-image`）、`kling-video-v3` 与
+   *     `minimax-video-h3`（`text-to-video` + `image-to-video`）。
+   *   - 国际区 29 条 / 7 条带 tag：`hy-image-3.5`（`text-to-image` +
+   *     `image-to-image`）、`kling-video-v3`（两种视频 tag）。
+   * 两边目录完全不重叠，所以「国际区一条都没有」是 2026-10-21 的旧观测，
+   * 已经过期 —— 目录真的没标时才返回空数组（而不是编一个模型出来）。
+   *
+   * 返回的是**未分组**的全集：谁要 `text-to-image` 就自己按 tag 过滤
+   * （{@link selectMediaModels} / `pickMediaModel`）。生图工具、改图路径、卡片清单
+   * 因此共用这一次读取，而不是各读一遍目录。
    *
    * 这是一次 EXTRA 读取，不是「复用目录那一次」：`fetchModels` 的结果被投影成
    * 聊天目录就丢掉了媒体标签，所以这里必须再读一遍同一份文档。它是只读 GET、
@@ -1482,7 +1626,9 @@ declare class WorkBuddyUpstreamClient {
    * 发一次文生图请求。
    *
    * 端点、请求体、响应解析全部照抄官方 CLI 的 ImageService（见 `image-gen.ts`
-   * 的模块注释）。实测单张 5.71 credits，产物是 24 小时有效的 COS 签名 URL。
+   * 的模块注释）。产物是 24 小时有效的 COS 签名 URL；实扣积分随区与模型不同
+   * （国内区 `hunyuan-image-alpha` 5.71、国际区 `hy-image-3.5` 0.03），
+   * 只在响应的 `data.usage.credit` 里给出，调用方按实际值回报。
    *
    * 失败分两层：HTTP 非 2xx 交给 {@link describeImageFailure} 翻成带 code 的
    * 错误（401/403 提示重新登录、404 提示该区没有生图路由、429 提示限流）；
@@ -1493,6 +1639,67 @@ declare class WorkBuddyUpstreamClient {
     readonly prompt: string;
     readonly size?: string;
   }, signal?: AbortSignal): Promise<WorkBuddyImageOutcome>;
+  /**
+   * 发一次改图请求（`image-to-image`）。
+   *
+   * 端点换成官方 CLI `ImageService.editImage` 用的 `/v2/images/edits`，请求体是
+   * 生图那一套 + `image`（**必须是 data URL 字符串数组**）+ 可选 `input_fidelity`。
+   * 2026-10-25 国际区实测：`hy-image-3.5` + 一张 712×962 的截图 → 200、code 0、
+   * 一张 COS 签名 URL、`credit 0.03`。
+   *
+   * `image` 的形态由调用方（工具层）负责规整成 data URL——这一层只发请求、
+   * 不碰文件系统，和 {@link generateImage} 的分工保持一致。
+   */
+  editImage(credential: WorkBuddyCredential, request: {
+    readonly model: string;
+    readonly prompt: string;
+    readonly size?: string;
+    readonly image: readonly string[];
+    readonly inputFidelity?: string;
+  }, signal?: AbortSignal): Promise<WorkBuddyImageOutcome>;
+  /**
+   * 发一次生视频请求（提交任务，拿 task id）。
+   *
+   * 端点与请求体照抄官方 CLI 的 `VideoService.submitTask`：`POST /v2/videos/generations`，
+   * 请求体由 `buildVideoBody` 拼（prompt / model / seconds / negative_prompt /
+   * watermark:true / 图生视频时的 image_url / extra_parameters）。响应取
+   * `data.id` 作为 task id 返回，真正的视频要再轮询 `/v2/videos/tasks` 才拿得到。
+   *
+   * 这是一次**花钱**的请求（与生图一样），所以失败分类交给 {@link describeVideoFailure}：
+   * 401/403 提示重新登录、404 提示该区没有视频路由、429 提示限流、其它透传 msg。
+   * HTTP 200 但信封 `code !== 0` 由 {@link parseVideoSubmission} 处理。
+   */
+  submitVideo(credential: WorkBuddyCredential, request: {
+    readonly model: string;
+    readonly prompt: string;
+    readonly seconds: number;
+    readonly negativePrompt?: string | undefined;
+    readonly image?: string | undefined;
+    readonly lastImage?: string | undefined;
+    readonly resolution?: string | undefined;
+    readonly aspectRatio?: string | undefined;
+    readonly enableAudio?: boolean | undefined;
+  }, signal?: AbortSignal): Promise<WorkBuddyVideoSubmission>;
+  /**
+   * 轮询一个生视频任务直到完成或失败。
+   *
+   * `POST /v2/videos/tasks`（请求体 `{ task_id }`），官方 CLI 的 `VideoService.pollTask`
+   * 就是每 5 秒查一次、直到 `status === 'completed' | 'failed'`。这里照搬同样的
+   * 轮询节奏与整体超时（默认 ~600s，远大于生图的 180s，因为视频要生成几十秒到几分钟）。
+   *
+   * 注意：轮询**已经花过钱**（提交那次就扣了），所以轮询期间的网络抖动、超时要
+   * 当成真实失败——调用方据此进冷却。只有"提交那一次"因为参数写错 / 没登录而没
+   * 发出去，才不进冷却（同生图工具的设计）。
+   */
+  pollVideoTask(credential: WorkBuddyCredential, taskId: string, signal?: AbortSignal): Promise<WorkBuddyVideoOutcome>;
+  /**
+   * 下载一个视频 URL 到本地临时目录，返回绝对路径。
+   *
+   * 官方 CLI 的 `VideoService.downloadVideos` 把每条 `data[].url` 写成本地 `.mp4`
+   * （产物是 COS 签名 URL，和生图同源，但不是图片 MIME）。这里每次一条，工具层
+   * 负责把多条结果各自落盘并回 `file://` 给模型与用户。
+   */
+  downloadVideo(credential: WorkBuddyCredential, url: string, signal?: AbortSignal): Promise<string>;
   /** Query today's check-in status without changing account state. */
   fetchCheckinStatus(credential: WorkBuddyCredential): Promise<WorkBuddyCheckinStatus>;
   /**
@@ -1875,6 +2082,37 @@ interface WorkBuddyShimOptions {
    */
   channelPerturbation?: 'off' | 'failure' | 'always';
   /**
+   * Move the harness's injected `user` blocks above the real prompt (issue #132).
+   *
+   * The WorkBuddy usage page records the LAST `user` message as the request
+   * text, and the harness appends its runtime context after the user's real
+   * prompt — so the usage column shows injected noise instead of what was typed.
+   * The reorder is order-only (every message and its text survive), and it only
+   * ever moves messages that MATCH the harness's own injected prefixes; the single
+   * textual edit is stripping the recorded prompt's own leading marker.
+   *
+   * Default false: it changes bytes the upstream counts, so it is opt-in.
+   */
+  keepPromptLast?: boolean;
+  /**
+   * Extra literal prefixes (issue #133) treated like the harness's injected
+   * markers under `keepPromptLast`, for context blocks a companion plugin
+   * injects that the built-in list does not know about. Only read when
+   * `keepPromptLast` is on.
+   */
+  extraInjectedPrefixes?: readonly string[];
+  /**
+   * Move the host's session-title request onto the hidden lightweight model
+   * (issues #132/#133). Disabled by default; when enabled, a body recognized
+   * as the one-message title prompt is re-pointed at `model` (default
+   * `wb-lite`, measured 0 credits) instead of billing the main paid model.
+   * See `rewriteSessionTitleModel` for the fail-closed detection rules.
+   */
+  sessionTitle?: {
+    enabled?: boolean;
+    model?: string;
+  };
+  /**
    * Pool failover for chat requests. Absent means no failover at all — the
    * pre-pool behaviour, where the selected account serves and its failure is
    * reported as-is.
@@ -2095,6 +2333,22 @@ interface WorkBuddyAdapterOptions {
    * them. Production callers leave it unset.
    */
   piAiGeneration?: PiAiGeneration;
+  /**
+   * Drop foreign thinking blocks pi-ai would publish as prose (issue #147).
+   *
+   * OFF by default, and read LIVE (a getter, not a boolean) so the switch takes
+   * effect on the next request without reloading the plugin: turning it on
+   * mid-session is the whole point — the user sees the working-notes turn,
+   * flips the switch, and the next turn is answered normally.
+   */
+  dropForeignThinking?: () => boolean;
+  /**
+   * Told which foreign thinking blocks a request dropped, so the reply can name
+   * the condition instead of leaving the user to conclude the model broke
+   * (issue #147 asks for at least a visible hint). Called at most once per
+   * request; failures are swallowed.
+   */
+  onForeignThinking?: (blocks: readonly ForeignThinkingBlock[]) => void;
 }
 /** What {@link createWorkBuddyAdapter} hands back. */
 interface WorkBuddyAdapter {
@@ -2146,6 +2400,32 @@ declare function workBuddyDisplayName(info: WorkBuddyModelInfo): string;
  * treats undeclared capability.
  */
 declare function workBuddyThinkingLevelMap(info: WorkBuddyModelInfo): WorkBuddyThinkingLevelMap | undefined;
+/**
+ * One foreign thinking block that pi-ai would publish as PROSE, and the reason it
+ * would (issue #147).
+ *
+ * `variant` is not cosmetic: the two are handled by the same repair but they
+ * mean different things, and the card explains them differently.
+ *
+ * - `flattened`: `stopReason` is a normal completion, so `transform-messages`
+ *   turns the block into `{type:'text', text: thinking}` — the whole reasoning
+ *   body lands in the visible answer.
+ * - `dropped`: `stopReason` is `error`/`aborted`, so the entire message is
+ *   skipped; nothing reaches the wire and nothing reaches the user. It is
+ *   reported anyway, because it still costs context: the model's answer to
+ *   "why did my last turn say nothing" is this line, and a caller cannot see it
+ *   from the transcript.
+ */
+interface ForeignThinkingBlock {
+  /** Index of the message in the context's `messages`. */
+  messageIndex: number;
+  /** Index of the block within that message's `content`. */
+  blockIndex: number;
+  /** How many characters of reasoning the block carried. */
+  characters: number;
+  /** Whether pi-ai would flatten it into prose or drop the whole message. */
+  variant: 'flattened' | 'dropped';
+}
 /**
  * Assemble the adapter. The provider's `getModels` reads the live catalog,
  * and every model's `baseUrl` is re-resolved per read so the shim's
@@ -2597,7 +2877,15 @@ declare function probeRequestBody(modelId: string, inputTokens?: number): string
  * instead of what it is — the gateway objecting to the PROMPT, not the account
  * (issues #87–#90).
  */
-type WorkBuddyProbeOutcome = 'ok' | 'rate-limited' | 'model-busy' | 'out-of-credit' | 'credential-rejected' | 'policy-rejected' | 'channel-rejected' | 'unavailable' | 'not-found' | 'failed';
+type WorkBuddyProbeOutcome = 'ok' | 'rate-limited' | 'model-busy' | 'out-of-credit' | 'credential-rejected' | 'policy-rejected' |
+/**
+ * The upstream restricted this credential for unusual activity (issue #127).
+ *
+ * Split from `policy-rejected` because the pool's response differs: this is
+ * an account-level exclusion, while a content-policy refusal is about the
+ * request and must not teach the pool that the credential is unusable.
+ */
+'account-restricted' | 'channel-rejected' | 'unavailable' | 'not-found' | 'failed';
 /**
  * One probe result, as the card renders it.
  *
@@ -2791,6 +3079,15 @@ interface WorkBuddyPoolAccount {
   id: string;
   /** Human name, or `''` when the desktop app recorded none. */
   accountName: string;
+  /**
+   * This account belongs to an enterprise/education tenant (issue #124/#129).
+   *
+   * A projection fact, carried from the credential's `enterpriseId` rather than
+   * inferred from any benefit or check-in response: upstream can advertise
+   * campaigns and `active:false` for enterprise members while refusing every
+   * write with `10001`.
+   */
+  enterprise?: boolean;
 }
 /**
  * What the pool knows about ONE account's last test of the target model.
@@ -3357,6 +3654,22 @@ type WorkBuddyWebUsage =
    */
   imageToolEnabled?: boolean;
   /**
+   * Whether the model may call the video-generation tool here (opt-in).
+   * Same opt-IN travel semantics as `imageToolEnabled` — an absent value
+   * is NOT consent, so a stale mirror cannot leave the spending capability on.
+   */
+  videoToolEnabled?: boolean;
+  /**
+   * The video model pinned per tag here (`text-to-video` /
+   * `image-to-video`), as a model id from this region's catalog.
+   *
+   * Travels on the Host's answer for the same measured reason as the switches
+   * above: the picker has to render the pin the TOOL will read, and the
+   * browser settings mirror is stale for this namespace on the affected 0.1.7
+   * deployments. Absent reads as "nothing pinned", never as a made-up id.
+   */
+  preferredVideoModels?: Readonly<Record<string, string>>;
+  /**
    * Whether the OPTIONAL CodeBuddy CLI route is mounted (tool `codebuddy_ask`
    * + command `/codebuddy`).
    *
@@ -3367,6 +3680,55 @@ type WorkBuddyWebUsage =
    * must not be read as consent.
    */
   cliBridgeEnabled?: boolean;
+  /**
+   * The model the OPTIONAL CodeBuddy CLI route runs on, or `''` for
+   * "nothing is pinned, the CLI uses its own default".
+   *
+   * GLOBAL like `cliBridgeEnabled`. Travels on the Host's answer for the
+   * same measured reason: on the stale-mirror 0.1.7 deployment a picker that
+   * read the settings mirror alone would keep showing a pin that had just
+   * been cleared (or had not landed yet).
+   */
+  cliBridgeModel?: string;
+  /**
+   * The reasoning effort the OPTIONAL CodeBuddy CLI route runs on, or `''`
+   * for "nothing is pinned, the CLI uses its own default".
+   *
+   * GLOBAL and Host-carried for the same reasons as `cliBridgeModel`.
+   */
+  cliBridgeEffort?: string;
+  /**
+   * The order the OPTIONAL CodeBuddy CLI route walks the credential
+   * regions in — a comma-separated region list such as `'cn,global'` — or
+   * `''` for "nothing is pinned, the CLI walks its own default order".
+   *
+   * GLOBAL and Host-carried for the same reasons as `cliBridgeModel`.
+   */
+  cliBridgeRegionOrder?: string;
+  /**
+   * Whether the request path drops foreign thinking blocks (issue #147).
+   *
+   * Optional and absent reads as OFF: the repair changes bytes the upstream
+   * counts, so a Host that cannot answer must not be read as consent.
+   */
+  dropForeignThinking?: boolean;
+  /**
+   * What the LAST request had to drop, for the card's explanation of a turn
+   * that arrived looking like working notes (issue #147).
+   *
+   * Absent means "no report", not "feature off" — the two are different facts
+   * and the card says different things about them. Process-local and
+   * last-wins: it describes the turn the reader is looking at.
+   */
+  lastForeignThinking?: {
+    blocks: readonly {
+      messageIndex: number;
+      blockIndex: number;
+      characters: number;
+      variant: 'flattened' | 'dropped';
+    }[];
+    atMs: number;
+  };
   /**
    * The LIVE load level per model id, for the card's icon.
    *
@@ -3421,6 +3783,16 @@ type WorkBuddyWebUsage =
    */
   imageToolEnabled?: boolean;
   /**
+   * Whether the model may call the video-generation tool here (opt-in).
+   * Same opt-IN travel semantics as `imageToolEnabled`.
+   */
+  videoToolEnabled?: boolean;
+  /**
+   * The video model pinned per tag here; see the signed-out variant for why
+   * this travels on the Host's answer instead of the browser mirror.
+   */
+  preferredVideoModels?: Readonly<Record<string, string>>;
+  /**
    * Whether the OPTIONAL CodeBuddy CLI route is mounted (tool `codebuddy_ask`
    * + command `/codebuddy`).
    *
@@ -3431,6 +3803,55 @@ type WorkBuddyWebUsage =
    * must not be read as consent.
    */
   cliBridgeEnabled?: boolean;
+  /**
+   * The model the OPTIONAL CodeBuddy CLI route runs on, or `''` for
+   * "nothing is pinned, the CLI uses its own default".
+   *
+   * GLOBAL like `cliBridgeEnabled`. Travels on the Host's answer for the
+   * same measured reason: on the stale-mirror 0.1.7 deployment a picker that
+   * read the settings mirror alone would keep showing a pin that had just
+   * been cleared (or had not landed yet).
+   */
+  cliBridgeModel?: string;
+  /**
+   * The reasoning effort the OPTIONAL CodeBuddy CLI route runs on, or `''`
+   * for "nothing is pinned, the CLI uses its own default".
+   *
+   * GLOBAL and Host-carried for the same reasons as `cliBridgeModel`.
+   */
+  cliBridgeEffort?: string;
+  /**
+   * The order the OPTIONAL CodeBuddy CLI route walks the credential
+   * regions in — a comma-separated region list such as `'cn,global'` — or
+   * `''` for "nothing is pinned, the CLI walks its own default order".
+   *
+   * GLOBAL and Host-carried for the same reasons as `cliBridgeModel`.
+   */
+  cliBridgeRegionOrder?: string;
+  /**
+   * Whether the request path drops foreign thinking blocks (issue #147).
+   *
+   * Optional and absent reads as OFF: the repair changes bytes the upstream
+   * counts, so a Host that cannot answer must not be read as consent.
+   */
+  dropForeignThinking?: boolean;
+  /**
+   * What the LAST request had to drop, for the card's explanation of a turn
+   * that arrived looking like working notes (issue #147).
+   *
+   * Absent means "no report", not "feature off" — the two are different facts
+   * and the card says different things about them. Process-local and
+   * last-wins: it describes the turn the reader is looking at.
+   */
+  lastForeignThinking?: {
+    blocks: readonly {
+      messageIndex: number;
+      blockIndex: number;
+      characters: number;
+      variant: 'flattened' | 'dropped';
+    }[];
+    atMs: number;
+  };
   /**
    * The LIVE load level per model id, for the card's icon.
    *
@@ -3454,6 +3875,24 @@ type WorkBuddyWebUsage =
    * selection, seeded from the built-in rule the first time it is read.
    */
   offModelIds: readonly string[];
+  /**
+   * Ids of THIS region's roster that this machine first saw inside the
+   * new-model window, oldest first — the data behind the composer pill's
+   * "· N 新模型" segment.
+   *
+   * "新" means "this machine first recorded the id in its catalog", NOT "the
+   * gateway added it": the upstream list carries no listed-since field, so
+   * claiming an upstream fact would be fabricating one. Absent means "nothing
+   * is new right now" or "this Host predates the feature" — never "0".
+   */
+  newModelIds?: readonly string[];
+  /**
+   * A sentence explaining why no new-model readout is shown, present only
+   * when the on-disk first-sighting history is in a version this build cannot
+   * read. Kept separate from the field above so "no new models" is never the
+   * story for a file that simply was not read.
+   */
+  rosterSeenVersionNote?: string;
   credits?: WorkBuddyWebCredits;
   creditsError?: string;
   /**
@@ -3531,6 +3970,13 @@ type WorkBuddyWebProbeOutcome = 'ok' | 'rate-limited' |
  */
 'model-busy' | 'out-of-credit' | 'credential-rejected' | 'policy-rejected' |
 /**
+ * The upstream restricted this credential for unusual activity (issue #127).
+ *
+ * Separate from `policy-rejected`: a content refusal is about the request,
+ * while this is about the credential and needs re-authentication or an appeal.
+ */
+'account-restricted' |
+/**
  * The gateway's channel gate refused the request itself (upstream code 11128).
  *
  * Kept apart from `failed` because its whole point is the question it answers:
@@ -3605,7 +4051,12 @@ type WorkBuddyWebPoolExclusion = 'unusable' | 'rate-limited' |
  * showing "被限流" next to an ACCOUNT name asserts something the measurement
  * does not say (issue #56).
  */
-'model-busy' | 'out-of-credit' | 'credential-rejected' | 'not-found' | 'unavailable' | 'failed';
+'model-busy' | 'out-of-credit' | 'credential-rejected' |
+/**
+ * The upstream restricted this account (issue #127); unlike a request policy
+ * refusal, another account can serve and this one should be benched.
+ */
+'account-restricted' | 'not-found' | 'unavailable' | 'failed';
 /** One claimable benefit, as the card renders it (issue #79). */
 interface WorkBuddyWebBenefit {
   /** Which campaign: compensation (crash补偿) or gift (新人首月赠送). */
@@ -3634,6 +4085,14 @@ interface WorkBuddyWebBenefit {
 interface WorkBuddyWebPoolAccount {
   accountId: string;
   accountName: string;
+  /**
+   * The credential belongs to an enterprise/education tenant (issues #124/#129).
+   *
+   * Carried through the pool row so the card can render the two actions the
+   * upstream does not support for those accounts (daily check-in and benefit
+   * claiming) as explicitly unavailable rather than as pending work.
+   */
+  enterprise?: boolean;
   /** Total remaining credits, absent when the credits route failed. */
   credits?: number;
   /** Credits expiring within 3 days. */
@@ -3862,6 +4321,14 @@ declare function unwrapVolatileDeep<T>(value: T): T;
  */
 declare const WORKBUDDY_SETTINGS_NS: "workbuddy";
 //#endregion
+//#region src/roster-seen-store.d.ts
+/** A first-sighting readout, assembled read-only by the usage route. */
+interface RosterSeenReadout {
+  newModelIds: readonly string[];
+  /** A sentence when the on-disk history is in a version this build cannot read. */
+  versionNote?: string;
+}
+//#endregion
 //#region src/web-status.d.ts
 /** Constructor dependencies. */
 interface WorkBuddyStatusRouteOptions {
@@ -3885,6 +4352,33 @@ interface WorkBuddyStatusRouteOptions {
   contextBudgets(region: WorkBuddyRegion): Readonly<Record<string, number | undefined>>;
   /** Re-read the live catalog of one region from the upstream. */
   discoverModels?(region: WorkBuddyRegion, signal?: AbortSignal): Promise<readonly WorkBuddyModelInfo[]>;
+  /**
+   * Which ids of the requested region's roster THIS machine first saw inside the
+   * new-model window (the "· N 新模型" segment), plus a note when the on-disk
+   * first-sighting history is in a version this build cannot read.
+   *
+   * READ-ONLY: the usage route never writes first-sighting history — only the
+   * catalog reconciler does (`src/index.ts`), so a panel poll can never change
+   * "who is new". Region-scoped because the two regions keep separate catalogs
+   * and therefore separate first-sighting tables.
+   *
+   * Optional, and absent means the Host predates the feature: the pill then
+   * renders no segment at all rather than a made-up "0 新模型".
+   */
+  rosterSeen?(region: WorkBuddyRegion): Promise<RosterSeenReadout>;
+  /**
+   * Read the region's MEDIA models (image + video) for the card's read-only
+   * roster block.
+   *
+   * Optional: a Host that mounts these routes without the upstream client
+   * simply answers 503, and the card hides the block. Returns the same rows the
+   * image tool consumes, so the card's list and the tool's model validation
+   * cannot disagree about what exists in a region.
+   */
+  mediaModels?(region: WorkBuddyRegion, options?: {
+    readonly signal?: AbortSignal;
+    readonly refresh?: boolean;
+  }): Promise<readonly WorkBuddyMediaModel[]>;
   /**
    * Whether the requested region's provider is currently offered to DSH. The
    * card renders this as the tab's on/off checkbox, so the switch reflects the
@@ -3920,6 +4414,22 @@ interface WorkBuddyStatusRouteOptions {
    */
   imageToolEnabled?(region: WorkBuddyRegion): boolean;
   /**
+   * Whether the model may call the video-generation tool in this region.
+   * Optional, absent reads as OFF — same opt-IN semantics as `imageToolEnabled`
+   * (the model decides to spend, so an older Host must not be read as consent).
+   */
+  videoToolEnabled?(region: WorkBuddyRegion): boolean;
+  /**
+   * The video model pinned per tag in this region (`text-to-video` /
+   * `image-to-video`), as a model id from that region's own catalog.
+   *
+   * Optional, and absent reads as "nothing pinned" — the same direction as
+   * `videoToolEnabled`: an older Host that cannot answer must not invent a
+   * choice the user never made. The card uses it to render the per-mode picker
+   * from the committed value the tool will actually read.
+   */
+  preferredVideoModels?(region: WorkBuddyRegion): Readonly<Record<string, string>>;
+  /**
    * Whether the OPTIONAL CodeBuddy CLI route is mounted (`codebuddy_ask` tool +
    * `/codebuddy` command).
    *
@@ -3932,6 +4442,55 @@ interface WorkBuddyStatusRouteOptions {
    * deployments, and a stale `true` here would claim a spending capability is on.
    */
   cliBridgeEnabled?(): boolean;
+  /**
+   * The model the OPTIONAL CodeBuddy CLI route runs on, or `''` for "the CLI's
+   * own default".
+   *
+   * GLOBAL like `cliBridgeEnabled` — one route, one pin, so no argument.
+   * Optional, and absent is the same as `''`: the route then runs on the CLI's
+   * default. The card carries it on the Host's answer for the same measured
+   * reason as `cliBridgeEnabled` — the browser's settings mirror is stale for
+   * this namespace on the affected 0.1.7 deployments, so a picker reading the
+   * mirror alone would keep showing a pin that had just been cleared.
+   */
+  cliBridgeModel?(): string;
+  /**
+   * The reasoning effort the OPTIONAL CodeBuddy CLI route runs on, or `''` for
+   * "the CLI's own default". GLOBAL, optional, and absent-as-`''` for the same
+   * reasons as {@link cliBridgeModel}.
+   */
+  cliBridgeEffort?(): string;
+  /**
+   * The order the OPTIONAL CodeBuddy CLI route walks the credential regions in
+   * (a comma-separated list such as `'cn,global'`), or `''` for "the CLI's own
+   * default order". GLOBAL, optional, and absent-as-`''` for the same reasons
+   * as {@link cliBridgeModel}.
+   */
+  cliBridgeRegionOrder?(): string;
+  /**
+   * Whether the request path drops foreign thinking blocks (issue #147).
+   *
+   * Optional, absent reads as OFF: the repair changes bytes the upstream counts,
+   * so a Host that cannot answer must not be read as consent.
+   */
+  dropForeignThinking?(): boolean;
+  /**
+   * What the LAST request had to drop, for the card's explanation of a turn that
+   * arrived looking like working notes (issue #147).
+   *
+   * Optional, and absent means "nothing to report" — the card then renders no
+   * warning rather than a permanent one. Process-local and last-wins: it
+   * describes the turn the user is looking at, not a historical tally.
+   */
+  latestForeignThinking?(): {
+    blocks: readonly {
+      messageIndex: number;
+      blockIndex: number;
+      characters: number;
+      variant: 'flattened' | 'dropped';
+    }[];
+    atMs: number;
+  } | undefined;
   /**
    * The LIVE load level per model id, for the card's icon.
    *
@@ -4245,6 +4804,7 @@ interface WorkBuddyPoolDeps {
   otherAccounts?(region: WorkBuddyRegion): Promise<readonly {
     id: string;
     accountName: string;
+    enterprise?: boolean;
   }[]>;
   /** The account currently billing traffic for the region, when known. */
   currentAccountId?(region: WorkBuddyRegion): Promise<string | undefined>;
@@ -4379,6 +4939,25 @@ interface WorkBuddyRegionState {
    * upgrade — or a config whose value could not be read — must leave it off.
    */
   imageToolEnabled?: boolean;
+  /**
+   * Same opt-IN shape as `imageToolEnabled`, but for the video-generation tool
+   * (`workbuddy_draw_video`). Absent means OFF, for the same reason: the model
+   * decides to spend, so an upgrade must never hand out a spending capability.
+   */
+  videoToolEnabled?: boolean;
+  /**
+   * The video model the user pinned in the card, keyed by video tag
+   * (`text-to-video` / `image-to-video`), value is a model id from this
+   * region's own catalog.
+   *
+   * Per-REGION and per-TAG on purpose: the two modes can be served by different
+   * models (a catalog may carry a text-to-video-only row), and model ids do not
+   * cross regions (CN publishes `kling-video-v3` and `minimax-video-h3`,
+   * international only `kling-video-v3`). Absent or stale is NOT an error: the
+   * tool falls back to the first model of the group, because a preference the
+   * catalog no longer carries must not fail a generation the user asked for.
+   */
+  preferredVideoModels?: Record<string, string>;
   /**
    * WHERE this region's credit readout sits (issue #62).
    *
@@ -4551,6 +5130,76 @@ interface Config {
    * `off` keeps only the post-failure rescue ladder.
    */
   channelPerturbation?: 'off' | 'failure' | 'always';
+  /**
+   * Adopt the official client's usage-page identity on chat requests (issue #132).
+   *
+   * Adds `X-IDE-Name: WorkBuddy` (which is what fills the upstream's 使用端
+   * column) and sends the conversation-identity triple in the 32-hex UUIDv7
+   * shape the official client uses. Off by default: the reporter measured it at
+   * HTTP 200, this plugin has not reproduced that against the live gateway, and a
+   * display-only change should not be the reason an account starts failing.
+   */
+  usageIdentity?: boolean;
+  /**
+   * Move the harness's injected context above the real prompt (issue #132).
+   *
+   * The WorkBuddy usage page records the last `user` message as the request
+   * text, and DSH appends its runtime context after the user's prompt — so the
+   * usage column shows the injected block instead of what the user typed. The
+   * reorder is order-only and matches only the harness's own injected prefixes.
+   *
+   * Off by default: it changes the message order the upstream counts, so it is
+   * an explicit opt-in rather than a silent change on upgrade.
+   */
+  keepPromptLast?: boolean;
+  /**
+   * Extra literal prefixes (issue #133) treated like the harness's injected
+   * context markers when `keepPromptLast` is on, for injected blocks a
+   * companion plugin produces that the built-in list does not recognize. Each
+   * entry is matched literally at the start of a trailing `user` message.
+   */
+  extraInjectedPrefixes?: string[];
+  /**
+   * Drop foreign thinking blocks pi-ai would publish as prose (issue #147).
+   *
+   * When a session moves between providers, `dsh-llm-pi-ai` rebuilds the other
+   * provider's assistant turns with `api: 'dsh-foreign'`, and pi-ai's
+   * `isSameModel` then fails — so it does not DROP their `thinking` blocks, it
+   * rewrites each one to plain `text` (`transform-messages.js:87–90`). The
+   * other model's working notes therefore arrive as this turn's answer, and the
+   * model copies that shape on every later turn.
+   *
+   * On, those blocks are removed from the request instead: they carry no
+   * `thinkingSignature` (the host builds them without one), so they could never
+   * be replayed as reasoning anyway — their only possible contribution to the
+   * wire was the prose they turned into. Text blocks and tool calls are
+   * untouched, and so is every message's identity.
+   *
+   * OFF by default: it changes bytes the upstream counts, so it is an explicit
+   * opt-in on the same rule as {@link Config.usageIdentity}.
+   */
+  dropForeignThinking?: boolean;
+  /**
+   * Move the host's session-title request onto the hidden lightweight model
+   * (issues #132/#133). Off by default: it is a real upstream request either
+   * way, and the rewrite changes which bucket it is billed against.
+   */
+  sessionTitle?: {
+    /**
+     * Whether title requests are re-pointed at {@link sessionTitle.model}.
+     * The host still fires the request exactly once per new session; the
+     * reporter measured the lightweight model at 0 credits for these calls
+     * (request volume still counts, and the evidence is reporter-level, not
+     * reproduced by this plugin).
+     */
+    enabled?: boolean;
+    /**
+     * Target model for the rewritten title request. Defaults to `wb-lite`,
+     * the hidden model the reporter measured; configurable in case the id
+     * changes or a region exposes a different one.
+     */
+    model?: string;
+  };
 }
 /**
  * Mark a schema's field as volatile on the DSH lines that support it.
@@ -4588,6 +5237,31 @@ declare function regionStateOf(config: Config, region: WorkBuddyRegion): WorkBud
  * about a region's state.
  */
 declare function regionEnabled(config: Config, region: WorkBuddyRegion): boolean;
+/**
+ * The region that owns the image tool right now, or `undefined` when no region
+ * has it switched on.
+ *
+ * BOTH gates are required, and both are read live: the region's provider switch
+ * must be ON (`regionEnabled`, opt-OUT) and the user must have opted IN to the
+ * model spending credits there (`imageToolEnabled`, opt-IN). Absence of
+ * `imageToolEnabled` is never consent.
+ *
+ * CN wins when both regions qualify, and that order is the only backward
+ * compatible one: before the international gateway carried a `text-to-image`
+ * model (measured 2026-10-25: `hy-image-3.5`) CN was the only region that could
+ * ever be opted in, so a profile that opted in there keeps using CN even after
+ * the global tab is switched on as well. That is exactly `REGION_KEYS`' order;
+ * it is not incidental.
+ */
+declare function imageToolRegionOf(config: Config): WorkBuddyRegion | undefined;
+/**
+ * Region that owns the video tool right now, or `undefined` when no region has
+ * it switched on. Mirrors `imageToolRegionOf` but reads `videoToolEnabled`
+ * (the video-generation opt-in). Both gates required, read live: region provider
+ * switch ON (`regionEnabled`, opt-OUT) and the user opted IN (`videoToolEnabled`,
+ * opt-IN). CN wins when both qualify (see `REGION_KEYS`).
+ */
+declare function videoToolRegionOf(config: Config): WorkBuddyRegion | undefined;
 /**
  * The account id a region should select, or `undefined` for the documented
  * default: follow whatever the WorkBuddy app is currently signed in as.
@@ -4638,4 +5312,4 @@ declare function legacyAttributionRegion(value: Config, accountsFor: (region: Wo
  */
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { CREDENTIAL_REJECTED_CODE, Config, DEFAULT_PROBE_INPUT_TOKENS, ENCRYPTED_CREDENTIAL_CODE, FALLBACK_WORKBUDDY_MODELS, FALLBACK_WORKBUDDY_MODELS_GLOBAL, NATIVE_MODALITY_BY_MODEL_ID, PROBE_INPUT_TOKEN_CHOICES, PROBE_MAX_TOKENS, PROBE_SYSTEM_PROMPT, REFUSES_OFF_MODEL_IDS, type UpstreamErrorKind, WORKBUDDY_ACCOUNTS_REFRESH_PATH, WORKBUDDY_APP_EXECUTABLE_ENV, WORKBUDDY_AUTH_FILENAME, WORKBUDDY_AUTH_FILE_ENV, WORKBUDDY_CHECKIN_PATH, WORKBUDDY_CONNECT_VERSION, WORKBUDDY_GLOBAL_PROVIDER, WORKBUDDY_HOST_HEARTBEAT_FILENAME, WORKBUDDY_MODELS_REFRESH_PATH, WORKBUDDY_PROBE_PATH, WORKBUDDY_PROVIDER, WORKBUDDY_PROVIDERS, WORKBUDDY_PROVIDER_DISPLAY_NAMES, WORKBUDDY_REGIONS, WORKBUDDY_REGION_PARAM, WORKBUDDY_SETTINGS_NS, WORKBUDDY_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY_TPS_PATH, WORKBUDDY_USAGE_PATH, type WorkBuddyAccountChoice, type WorkBuddyAdapter, type WorkBuddyAuthStatus, type WorkBuddyCandidateFailure, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCredential, type WorkBuddyCredentialRecovery, WorkBuddyCredentialRejectedError, WorkBuddyCredentialStore, type WorkBuddyCreditPackage, type WorkBuddyCredits, WorkBuddyEncryptedCredentialError, type WorkBuddyEncryptedField, type WorkBuddyHostHeartbeat, type WorkBuddyModelInfo, type WorkBuddyNativeModality, WorkBuddyPoolPreferences, type WorkBuddyProbeClient, type WorkBuddyProbeOutcome, type WorkBuddyProbeResult, type WorkBuddyProbeStore, type WorkBuddyReasoning, type WorkBuddyRecoveryCandidate, type WorkBuddyRefreshOutcome, WorkBuddyRegionState, type WorkBuddyShim, type WorkBuddyStatusRouteOptions, type WorkBuddyStoreOptions, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyUsabilityProbeOptions, apply, asVolatile, authFileName, classifyUpstreamError, clearAtRestKeyCache, clearHostHeartbeat, cooldownOf, createAccountUsabilityProbe, createWorkBuddyAdapter, createWorkBuddyShim, creditOfStream, defaultDesktopAuthCandidates, defaultDesktopAuthDirs, defaultDesktopAuthPath, defaultOffModelIds, deriveAtRestKey, deriveAtRestKeyId, deriveCatalog, fallbackModelsFor, fetchAtRestKeyPayload, findWorkbuddyAppExecutable, hasEncryptedCredentialFields, imageDefaultFor, inject, isCredentialRejectedError, isEncryptedCredentialError, isEncryptedFieldWrapper, isHeartbeatProcessAlive, isWorkbuddyBundle, knownRegionOf, legacyAttributionRegion, legacyWorkbuddyOwnAuthPath, macosBundleExecutable, macosNestedAppBundles, modelIdOfBody, name, nativeModalityOf, nextRegionEnabled, nextRegionSlots, offDefaultFor, openEncryptedField, outcomeOfFailure, parseCreditMultiplier, parseReasoning, parseRetryAfter, parseUpstreamModel, parseWorkBuddyAuth, prepareChatBody, probeModel, probeRequestBody, probeSucceeded, processStartTimeMs, readAtRestKey, readHostHeartbeat, regionCleared, regionEnabled, regionEnabledOf, regionOf, regionOfProvider, regionOfStatusUrl, regionStateOf, regionsFieldIsCorrupt, regionsMapOf, registerWorkBuddyStatusRoute, resolveCredentialRecovery, selectAccountFor, settingsNamespaceOf, toPersistedWorkBuddyModel, unwrapVolatileDeep, withEffectiveOff, withWorkBuddyRegion, workBuddyDisplayName, workBuddyModelInput, workBuddyThinkingLevelMap, workBuddyWebStatus, workbuddyAccountId, workbuddyAppExecutableCandidates, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, writeHostHeartbeat };
+export { CREDENTIAL_REJECTED_CODE, Config, DEFAULT_PROBE_INPUT_TOKENS, ENCRYPTED_CREDENTIAL_CODE, FALLBACK_WORKBUDDY_MODELS, FALLBACK_WORKBUDDY_MODELS_GLOBAL, NATIVE_MODALITY_BY_MODEL_ID, PROBE_INPUT_TOKEN_CHOICES, PROBE_MAX_TOKENS, PROBE_SYSTEM_PROMPT, REFUSES_OFF_MODEL_IDS, type UpstreamErrorKind, WORKBUDDY_ACCOUNTS_REFRESH_PATH, WORKBUDDY_APP_EXECUTABLE_ENV, WORKBUDDY_AUTH_FILENAME, WORKBUDDY_AUTH_FILE_ENV, WORKBUDDY_CHECKIN_PATH, WORKBUDDY_CONNECT_VERSION, WORKBUDDY_GLOBAL_PROVIDER, WORKBUDDY_HOST_HEARTBEAT_FILENAME, WORKBUDDY_MODELS_REFRESH_PATH, WORKBUDDY_PROBE_PATH, WORKBUDDY_PROVIDER, WORKBUDDY_PROVIDERS, WORKBUDDY_PROVIDER_DISPLAY_NAMES, WORKBUDDY_REGIONS, WORKBUDDY_REGION_PARAM, WORKBUDDY_SETTINGS_NS, WORKBUDDY_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY_TPS_PATH, WORKBUDDY_USAGE_PATH, type WorkBuddyAccountChoice, type WorkBuddyAdapter, type WorkBuddyAuthStatus, type WorkBuddyCandidateFailure, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCredential, type WorkBuddyCredentialRecovery, WorkBuddyCredentialRejectedError, WorkBuddyCredentialStore, type WorkBuddyCreditPackage, type WorkBuddyCredits, WorkBuddyEncryptedCredentialError, type WorkBuddyEncryptedField, type WorkBuddyHostHeartbeat, type WorkBuddyModelInfo, type WorkBuddyNativeModality, WorkBuddyPoolPreferences, type WorkBuddyProbeClient, type WorkBuddyProbeOutcome, type WorkBuddyProbeResult, type WorkBuddyProbeStore, type WorkBuddyReasoning, type WorkBuddyRecoveryCandidate, type WorkBuddyRefreshOutcome, WorkBuddyRegionState, type WorkBuddyShim, type WorkBuddyStatusRouteOptions, type WorkBuddyStoreOptions, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyUsabilityProbeOptions, apply, asVolatile, authFileName, classifyUpstreamError, clearAtRestKeyCache, clearHostHeartbeat, cooldownOf, createAccountUsabilityProbe, createWorkBuddyAdapter, createWorkBuddyShim, creditOfStream, defaultDesktopAuthCandidates, defaultDesktopAuthDirs, defaultDesktopAuthPath, defaultOffModelIds, deriveAtRestKey, deriveAtRestKeyId, deriveCatalog, fallbackModelsFor, fetchAtRestKeyPayload, findWorkbuddyAppExecutable, hasEncryptedCredentialFields, imageDefaultFor, imageToolRegionOf, inject, isCredentialRejectedError, isEncryptedCredentialError, isEncryptedFieldWrapper, isHeartbeatProcessAlive, isWorkbuddyBundle, knownRegionOf, legacyAttributionRegion, legacyWorkbuddyOwnAuthPath, macosBundleExecutable, macosNestedAppBundles, modelIdOfBody, name, nativeModalityOf, nextRegionEnabled, nextRegionSlots, offDefaultFor, openEncryptedField, outcomeOfFailure, parseCreditMultiplier, parseReasoning, parseRetryAfter, parseUpstreamModel, parseWorkBuddyAuth, prepareChatBody, probeModel, probeRequestBody, probeSucceeded, processStartTimeMs, readAtRestKey, readHostHeartbeat, regionCleared, regionEnabled, regionEnabledOf, regionOf, regionOfProvider, regionOfStatusUrl, regionStateOf, regionsFieldIsCorrupt, regionsMapOf, registerWorkBuddyStatusRoute, resolveCredentialRecovery, selectAccountFor, settingsNamespaceOf, toPersistedWorkBuddyModel, unwrapVolatileDeep, videoToolRegionOf, withEffectiveOff, withWorkBuddyRegion, workBuddyDisplayName, workBuddyModelInput, workBuddyThinkingLevelMap, workBuddyWebStatus, workbuddyAccountId, workbuddyAppExecutableCandidates, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, writeHostHeartbeat };

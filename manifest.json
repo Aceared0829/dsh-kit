@@ -4,7 +4,7 @@
   "npm": [
     {
       "name": "@changfenhuang/dsh-genui",
-      "version": "0.14.0"
+      "version": "0.15.0"
     },
     {
       "name": "@deepseek-ai/dsh-subagent-claude-code",
@@ -12,11 +12,11 @@
     },
     {
       "name": "@goodandready/dsh-context-lens",
-      "version": "0.1.33"
+      "version": "0.1.35"
     },
     {
       "name": "@goodandready/dsh-time-machine",
-      "version": "0.1.29"
+      "version": "0.1.31"
     },
     {
       "name": "@leon___/dsh-client-liang-intensity-skin",
@@ -25,19 +25,19 @@
     },
     {
       "name": "@linxin666/dsh-client-ui-model-capabilities",
-      "version": "0.4.4"
+      "version": "0.4.6"
     },
     {
       "name": "@linxin666/dsh-session-archive",
-      "version": "0.4.9"
+      "version": "0.4.11"
     },
     {
       "name": "@linxin666/dsh-usage",
-      "version": "0.4.4"
+      "version": "0.4.11"
     },
     {
       "name": "@michengai/dsh-skills-manager",
-      "version": "1.2.18"
+      "version": "1.2.20"
     },
     {
       "name": "@modusensus/dsh-mneme",
@@ -49,19 +49,19 @@
     },
     {
       "name": "billion-context",
-      "version": "0.1.206"
+      "version": "0.1.208"
     },
     {
       "name": "ds-bot",
-      "version": "0.2.2"
+      "version": "0.2.3"
     },
     {
       "name": "dsh-better-sidebar",
-      "version": "0.28.0"
+      "version": "0.28.2"
     },
     {
       "name": "dsh-claude-style",
-      "version": "0.19.3"
+      "version": "0.19.5"
     },
     {
       "name": "dsh-context",
@@ -74,11 +74,11 @@
     },
     {
       "name": "dsh-graph",
-      "version": "0.21.0"
+      "version": "0.22.0"
     },
     {
       "name": "dsh-super-code",
-      "version": "0.3.6"
+      "version": "0.3.8"
     }
   ],
   "local": [

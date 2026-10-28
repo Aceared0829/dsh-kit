@@ -1,5 +1,664 @@
 # Changelog
 
+## 5.12.4 (2026-10-28)
+
+> issue #159 的**报告现象成立，归因不成立**。现场确实出现了「三级救援一级都没跑」的 `11128`，但把它
+> 唯一地归到 `!controller.signal.aborted` 上不成立：**这个 shim 里 `signal` 只有 `res.on('close')`
+> 一个来源**（`src/shim.ts:1657`，客户端真的断开了），不存在 issue 假设的那个「宿主内部中止」的第二来源；
+> 而按建议删掉三处 `&&` 经实测会把**诊断改坏**（见下）。顺着这条线索查同一个阶梯，找到的**真实缺陷是另一个**：
+> 密集救援 rung 在真实大小的 body 上是 **O(n²)**，现场那种 130 KB 提示词要跑**分钟级同步 CPU**，
+> 于是「救援等于没跑」有了一个不依赖 abort 的解释，且这个解释是实测出来的。
+
+### Fixes
+
+- **密集扰动 rung 的 O(n²)：92 KB 的 body 要 82.7 秒，130 KB 的现场提示词要两分多钟（#159 衍生）**
+  - **根因**：`perturbChannelFingerprints(body, true)` 用 `replace(/(?=\S)/gu, cb)`，回调里为**每一个**
+    匹配位置重新取「上一个非空白字符」，写法是 `source.slice(0, offset).match(/\S(?=\S*$)/u)` ——
+    对每个位置做一次 O(offset) 的前缀切片 + 正则，整体 O(n²)。
+  - **实测（本机 Node 25，2026-10-28，改动前）**：
+
+    | body | 耗时 |
+    | --- | --- |
+    | 11,575 字符 | 1.3 s |
+    | 23,075 字符 | 5.2 s |
+    | 46,075 字符 | 22.8 s |
+    | 92,075 字符 | **82.7 s** |
+    | 184,075 字符 | 322.8 s |
+
+  - **为什么这条比「救援没跑」更该先修**：这一级只在网关已经拒过两次之后才走，也就是**恰好**落在大 body
+    的真实会话上；而 92 KB 就是一次普通的长会话，#159 现场那条 `system` 是 130,345 字符。这一级是**同步**
+    CPU，先跑完才发请求，而 `chatStream` 对自己**刻意不设超时**（它自己的注释解释了原因：真实答案要预填
+    整个提示词，卡一个够用的上限必然切掉慢而正常的答案）。于是救援会先被读者自己的等待熬过去，而**从外面看，
+    「跑得太慢」和「根本没跑」是同一件事** —— 这正是 #159 观察到的那个现象。
+  - **修法**：把这条规则改成**一次累加扫描**（`spaceDenseBreaks`）。规则本身一字未改，输出**逐字节相同**：
+    旧写法那句 `/\S(?=\S*$)/u` 要求「其后全部非空白」，所以它取回的其实是**当前这段非空白串的首字符**，
+    而不是上一个字符 —— 这个反直觉的细节正是重写时最容易写错的地方（本轮就写错过两次，靠下面的等价测试
+    发现）。**这不是「顺手优化」**：改动只碰耗时，字节不动，因为换一个字节就是换一份没人测过的 body。
+  - **实测（同一台机器，改动后）**：92 KB 由 **82.7 s → 10 ms**（约 8000 倍）；130 KB 的等价 body 在
+    **10 ms 量级**完成。
+  - **两条新测试各钉住一半**：`tests/issue159-dense-rescue-cost.spec.ts` 用**旧规则的逐字转录**做参照，
+    22 个定点用例 + 1500 例定种子随机语料比对**字节相等**；并钉住耗时 —— 130 KB 在 2 s 内完成，
+    320 KB 的中位数在 5 s 内完成（真正线性的实现在该尺寸约 15 ms，旧规则约 15 分钟，两者相差三个数量级，
+    所以这个上限既不误报也绝不放过）。
+  - **耗时断言的度量方式本身改过两次，两次都是被 CI / 变异测试纠正的**：第一版钉 60 KB→120 KB 的
+    **比值 < 8**，变异测试显示旧规则在该尺寸的比值恰好 **4.0** —— 8 倍把二次方实现**放过去了**，等于没钉；
+    收紧到 **< 3** 后，**CI 又在正确实现上把它跑红**（ubuntu 实测 60 KB 10 ms、120 KB 34 ms，比值 3.4）——
+    在个位数毫秒的样本上，比值量到的是计时粒度、GC 和固定开销，不是被主张的增长。最终改为**在能区分两种
+    实现的尺寸上钉绝对上限**（320 KB / 5 s，中位数），依据是 40→640 KB 的实测每翻倍约 2 倍
+    （3.5 / 7.3 / 11.2 / 28.8 / 69.3 ms）。
+
+- **未采纳 issue 建议的那一行补丁，并给出实测理由（`tests/issue159-abort-gate.spec.ts`）**
+  - issue 的建议是删掉三处 `&& !controller.signal.aborted`，理由是「中止已由下传的 `signal` 在
+    `chatStream` 内部保证，外层这道 `&&` 是重复且有害的检查」。**「重复」只对了一半**：删掉之后
+    `chatStream` 确实会立刻因 abort 返回，但它返回的是 `{status: 0, kind: 'server'}`（被 abort 的
+    `fetch` 抛 `AbortError`，在客户端被兜成传输失败）—— 这个结果会**盖掉**真正的 `channel_reject`
+    诊断，读者收到的从「网关拒了这条请求」变成「上游服务器错误」；`reportFailures` 还会为一个**根本没
+    上线的请求**记一笔账号失败。
+  - **实测对照**（真挂断，客户端按真实 `chatStream` 对 abort 的处理返回）：
+
+    | | 保留门（HEAD） | 删掉门（issue 建议） |
+    | --- | --- | --- |
+    | 断线后额外调用上游 | **0 次** | 2 次 |
+    | 最终 kind | `channel_reject`（真实原因） | `server`（自己造出来的） |
+    | 账号测量 | **不记** | 记一笔假的 |
+
+  - 保留的正是 #159 真正关心的那一半：**请求还活着时的 11128，三级照跑**。这一半由
+    `issue113-channel-gate-evidence.spec.ts` / `issue98-shim.spec.ts` 覆盖，本轮又加了一条同文件内的
+    对照用例，防止将来有人以「救援没跑」为名再把门删掉。
+  - 变异验证：把三处 `&&` 删掉 → 新增的断线用例**变红**（`the shim spent a rescue on an aborted signal:
+    expected 1 to be +0`），对照用例**仍绿**。
+
+### 未改动（据实说明）
+
+- issue 里「`retries` 为空」这个字段名**在本仓库不存在**：实际实现是失败文案里的「，并已用…重试过」
+  （`src/shim.ts:2067-2071`），`Error` 信封里没有 `retries` 字段。报告者读到的可能是宿主侧的包装，
+  本仓库无法据该字段反推，故不据此改动任何判定。
+- issue 的另一半（5.12.3 的 `IDENTITY_CLAUSE` + `neutralizeScannedText` 已修好）与本次改动无关，未触碰。
+
+### 验证
+
+- 端到端对照：同一个 **116,939 字符**的现场形状 body（三段身份句 + 无标点长 prose + 20 轮 assistant
+  历史）走完整 shim，三级阶梯全部跑完后答 200 —— **修复后 29 ms，修复前 144,260 ms（2 分 24 秒）**。
+  这一条是本次的真正判据：旧代码不是「永远救不回来」，而是慢到读者早已放弃。
+- 变异验证（每条都确认会让对应用例变红）：删掉三处 `&& !controller.signal.aborted` → 新增断线用例
+  **变红**（`the shim spent a rescue on an aborted signal: expected 1 to be +0`）；把密集规则退回 O(n²)
+  实现 → **160 KB 实测 204,670 ms**，超过 5 s 上限 40 倍，**变红**；而正确实现在同一尺寸约 15 ms
+  （320 KB 在变异版上跑满 10 分钟未完成，已终止，未作为判据）。
+- 全量：`tsc` 双配置 0 错误，**148 文件 / 2563 通过（2 条按平台跳过）**，`tsdown` 构建通过。
+
+## 5.12.3 (2026-10-28)
+
+> issue #155 的**两个独立 Bug**：**① 业务码按字节匹配 JSON**——`11128`/`14003`/`14018` 用
+> `body.includes('"code":11128')` 判定，于是同一个信封 `{"code":11128}` 认得、多一个空格的
+> `{"code": 11128}` 和写成字符串的 `{"code":"11128"}` 都不认，渠道闸被静默判成 `client`，
+> **整条救援阶梯不再运行**（#113 的修复等于被一个空格关掉）；**② 删账号只清内存、不清持久化选择**——
+> 磁盘上 `accounts.cn` 仍写着死 id，下次 `applySelection` 把它读回来，CN 整块变「已保存的账号在本机
+> 已不存在」且账号列表一条不渲染。
+
+### Fixes
+
+- **渠道闸/限流/耗尽三族业务码按字节匹配，一个空格就漏判（#155）**
+  - **现象**：报告者贴回来的那条消息里**自相矛盾**——正文写着 `code 11128`，同一句却带
+    `"type":"client"`，收尾是「请按上面的提示调整后重试」。两半出自同一个信封、同一份 body。
+  - **根因**：分类器判族用 `body.includes('"code":11128')`——对**一种序列化**做字节测试；上游 JSON 里
+    多一个空格、或把码写成字符串，判据就落空。而 `code 11128` 那半走 `parseUpstreamErrorDetail`
+    （`JSON.parse`），照旧读得到。**以下矩阵是把每行都跑在 HEAD 代码上测出来的**，不是推理：
+
+    | body 写法 | HEAD classify | HEAD detail.upstreamCode |
+    | --- | --- | --- |
+    | `{"code":11128}` | `channel_reject` | 11128 |
+    | `{"code": 11128}` | `client` ← 漏 | 11128 |
+    | `{"code":"11128"}` | `client` ← 漏 | `undefined` ← 也漏 |
+    | `{"error":{"code":11128}}` | `channel_reject` | `undefined` ← **反向**不一致 |
+    | `{"CODE":11128}` | `client` ← 漏 | `undefined` |
+  - **两种不同的错位**，报告者只能贴出第一种。第 2 行就是 #155 那条消息：分类器按 substring 说
+    `client`，展示那半按 `JSON.parse` 读到**顶层数字** `11128` 照旧打印 —— 一条回复里，诊断和它自己的
+    证据互相打脸。第 3–5 行对支持更糟、对用户不可见：不但两个读取器不一致，**连要求用户提供的那个码都
+    整个消失**，`channel_reject` 贴出来却没有 `11128` 可锚。第 4 行方向相反（substring 恰好命中嵌套的
+    `"code":11128`，解析器当时只认 `error.data.code`），说明这不是「换成解析器就完了」—— 两侧都得读同一个
+    事实，才可能一致。
+  - **代价不只是文案**：渠道救援阶梯**只认 `channel_reject`**（`src/shim.ts` 的门是
+    `result.kind === 'channel_reject'`），所以漏判成任何别的类别都等于整条阶梯不跑 —— `forceNeutralHead` 与两级
+    扰动一次都不会触发，用户被要求「调整请求后重试」，而插件根本没试过救援。`14003` 同族实测降级目标**随 HTTP
+    状态而变**：`429 {"code": 14003}` → `soft_rate`、`400` → `client`，而 `model_busy` 是三个**不换号**的类别之一
+    （`isFailoverWorthy`）—— 落到 `soft_rate` 就是让整个账号池挨个烧一次真实请求去学一个模型级的事实。
+    `14018` spaced 单独看会掉成 `client`，实测只有当 `msg` 里带上了 `Credits exhausted` 那句话时才被
+    措辞标记救回 `hard_credit` —— 措辞一改就失效，正是本仓库反复记录的那类脆弱判据。
+  - **修法**：新增 `statesBusinessCode(body, code)`，`CHANNEL_REJECT_CODE`/`MODEL_BUSY_CODE`/
+    `CREDITS_EXHAUSTED_CODE` 三个常量从字符串形态改成数字，6 处家族判断统一走它。**三段读取，顺序即安全性**：
+    ① 信封自己声明的码是最终答案，**绝不再做文本扫描** —— 否则 `extError` 里嵌套的 `"code":11128` 会盖掉外层
+    `14003` 的自判，正好是 #127 反过来要的精度；② 解析成功却没在已知三种形态里声明码的 body，仍走带引号锚点
+    的文本扫描 —— 这条是**严格扩量**：#127 只留解析器，反而把 `{"error":{"code":11140}}` 这种旧文本匹配本来
+    认得的写法**收窄**掉了；③ 扫描锚在 `"code":<n>` 而非裸数字，十六进制 requestId 恰好含 `11128` 仍不能把
+    无关 body 提上来（原文本形态存在的理由，一并保留）。
+  - **一处先前例**：`CONTEXT_TOO_LONG_CODE`（`11115`，#101）早就写成 `/"code"\s*:\s*11115(?!\d)/u` —— 本仓库
+    **第三次**独立撞上同一个坑，前两次各修各的族，这就是为什么这次收成一个共享读取器，而不是第四处正则。
+  - **顺带修两处同源缺陷**：`envelopeError()` 已把 `code` 解析成数字，却只把 `msg` 交给分类器 —— 而 `msg`
+    永远不含 `"code":…`，于是每个「靠业务码判定」的族在这里都不可见，答案一律落到 `client`（#144 那条
+    `workbuddy upstream client (http 400): 请求被拦截，请重新发送` 就是一个插件已经握有其码的信封）；改为按
+    规范形重建 body 再分类。`parseUpstreamErrorDetail()` 原先只认**顶层**且 `typeof === 'number'` 的 `code`，
+    现与分类器共用 `businessCodeOfDocument`（补上 `{"error":{"code":…}}`，排在 `error.data.code` 之后以免
+    细节盖掉判定）—— 不再出现「按码判了类、却不打印码」。
+- **删掉一个账号后，该区域的持久化选择复活成死 id（#155 第二份报告）**
+  - **现象**：「删了一个账号就这样了」——CN 整块变「未登录」，提示「已保存的账号在本机已不存在」，而上方账号
+    列表**一条都不渲染**；`usage?region=cn&detail=fast` 答 `status=signed-out selectionLost=true`，但同一份
+    响应里明明还有 3 个 token 未过期的账号，国际版正常。报告者自己定位到 `cordis.patch.yml` 里
+    `accounts: cn: <本机已不存在的 id>`，并靠手发 `POST /__save {"field":"accounts","value":{"cn":""}}`
+    恢复的 —— 本条就是把那个手动动作变成自动。
+  - **根因是「只清了一半」**：`removeAccount()` 确实清了内存里的 `this.accountId`，所以**本次会话内一切正常**、
+    删除也回报成功；但设置文档里的死 id 一个字节都没动，下一次 `applySelection`（重启，或**任何一次设置保存**）
+    把它读回来重新 pin，区域随即掉进死胡同：`current()` 找不到 → `resolve()` 抛 no signed-in account →
+    走 `signed-out` 分支，而该状态下卡片的建议指向一个它自己并不渲染的列表。会话内看不出问题、故障延后到重启才
+    现形，正是这两步之间的缝隙让报告者和「删账号」连不起来。**只存在于内存的忘记不是修复，是拖延。**
+  - **修法**：`removeOne` 之后调用 `clearRegionAccountSelection()`，**只在被删账号正是本区持久化 pin 时**
+    写 `accounts[region] = ''`。判定与写入同在一个函数里，调用方无法只挑一半。四条约束都是这条修复的一部分：
+    - **写 `''`，绝不删键**：`''` 是「跟随 App 当前登录」的哨兵（也是全新安装的默认值，所以这是**恢复**而非
+      发明状态）；删掉的键含义是「从未配置」，会回落到旧版扁平 `accountId`，把用户**悄悄切到另一个账号**。
+    - **只清 pin 了该号的区域**：无关的删除必须零次写入 —— 内存里 `current()` 都拒绝回退到别的账号，
+      删除不能绕过它、从设置文件里做同样的事（换账号等于换人计费）。
+    - **整字段合并**：`accounts` 是两个区域共用的一张平表，按调用方视角重建会抹掉兄弟区域的 pin；判定与写入
+      都读 `describe()` 的权威文档，且先 `unwrapVolatileDeep` —— 把 volatile 的 `{get}` 活引用写进 payload，
+      settings 服务会整次拒绝（`found a function at $.ops[0].value.get`）。
+    - **同时覆盖旧版扁平 `accountId`**：pre-split 配置的 `accounts` 是空的、只靠扁平字段 pin，
+      `regionPinsAccount` 认这条；而哨兵会**终止**那次回落，所以一次写入同时 settle 两种写法。
+    - **fail-soft**：写设置失败只记 warn，绝不回报「删除失败」—— 凭证文件此刻已经真删了，说它还在是第二个谎。
+
+### Tests
+
+- `tests/issue155-envelope-spelling.spec.ts` 新增 23 条（#155）：紧凑/带空格/字符串码/嵌套四种写法 ×
+  11128/14003/14018/11140 四族；`{"CODE":11128}` 归族（这一半是**恢复**不是保留：member 层先前对 body
+  做了 `toLowerCase()` 因而认大写、`tests/issue98-channel-gate` 钉的是 member，而 family 层测的是原始 body、
+  不认 —— 现在一个读取器同时回答两侧）；十六进制 requestId 含 `11128` 不得被提上来；嵌套 `11128` 不得盖掉外层
+  `14003` 的自判；**分类器与展示给用户的那条码不许互相矛盾**。
+- `tests/issue155-account-removal.spec.ts` 新增 17 条（#155）：`regionPinsAccount` 四个方向（本区 pin 了=清 /
+  兄弟区 pin 了别的=不清 / 已在跟随 App=不写 / 只靠扁平字段 pin=清，且扁平字段只归它被归属的那个区）；
+  `nextAccountsSelection` 保兄弟区、只答 `accounts` 字段而非整个 section、`''` 作为数据保留（区别于缺键）；
+  volatile 活引用不得漏进 payload；无服务/无命名空间时零写入。
+- `tests/issue155-removal-e2e.spec.ts` 新增 5 条（#155 的**接线**）：真实 `apply()` + 真实路由 + 真实 config
+  对象（settings 双按引用答 `describe()`、`mutate` 原地提交并广播 `loader/volatile-update`），断言
+  「删除 → 触发那次重读（等价于重启或任何一次设置保存的 `applySelection`）→ 区域仍 `signed-in` 且
+  `selectionLost` 消失」这条旧代码做不到的完整链条；另测兄弟区 pin 存活、无关删除零次写入、写失败时删除仍回报
+  200。单独存在的理由与 `tests/pool-e2e.spec.ts` 相同：纯 helper 用例对着我自己写的 double，摘掉 `index.ts`
+  里的接线它们全绿。
+- 变异验证（每条都确认会让对应用例变红）：分类器退回 `body.includes('"code":N')` → **11 条红**；删掉
+  「本区是否 pin 了该号」的判定 → **4 条红**；写整个 section 而非 `accounts` 字段 → **4 条红**；
+  `removeOne` 退回只清内存 → **1 条红**（正是那条延后到重启才现形的链）。
+- 全量：`tsc` 双配置 0 错误，**146 文件 / 2536 通过（2 条按平台跳过）**，`tsdown` 构建通过。
+
+## 5.12.2 (2026-10-27)
+
+> 两处修复：**① 装完重启插件消失**（#151）——把宿主提供的 `@earendil-works/pi-ai` 标成 optional
+> peer，使安装期不再因「闭包里解析不到它」而拒绝整个 generation；**② DSML 工具名一字之差**
+> （#152）——`pwdsh` → `pwsh` 这类与本次声明工具只差一个字符的名字，现在按那个工具恢复，
+> 不再整段回退成正文。两处都保持 fail-closed 的默认：候选集只来自请求自己的 `body.tools`，
+> 不凭空造名。
+
+### Fixes
+
+- **安装成功但重启后插件消失：generation peer validation 拒绝了安装（#151）**
+  - **现象**：插件市场安装显示 `generation-install: promoted to …`，接着
+    `generation peer validation failed: @earendil-works/pi-ai does not resolve from the generation or
+    installation closure`，`exit=1`；重启后该 generation 被扫掉（`swept N unreferenced plugin generation(s)`），
+    用户得重装。
+  - **根因不是"插件依赖没装"，而是"它不可能被装上"**：pi-ai 由**宿主**提供 —— `dsh-llm-pi-ai` 把它列为自己的
+    `dependencies`（`^1.1.0`），宿主用运行期拦截层应答这个裸包名；而 profile 是按 `autoInstallPeers: false` 建的，
+    peer 从不进入 profile 的 `node_modules`。所以一份「必需 peer」在安装闭包里**永远解析不到**，校验必然失败。
+  - **修法**：`package.json` 增加 `peerDependenciesMeta`，把 `@earendil-works/pi-ai` 标为 `optional: true`。
+    **范围一个字符都没动**（仍是 `>=0.85.0 <0.88.0 || >=1.0.0-0 <2.0.0`）——`optional` 说的是「不要
+    求我自己带一份」，不是「我不支持这些版本」；运行期版本探测（`pi-ai-runtime.ts`）与语义边界仍以该范围为准。
+  - 为什么不是干脆删掉这条 peer：插件**静态 import** 了 pi-ai（`adapter.ts:19–21`），它不是可选依赖，
+    声明必须留着；只有"安装期强制"这一层需要让开。
+  - 报告里那句「`@deepseek-ai/cordis` 已有同样处理，照此办理即可」**不成立** —— 本仓库此前
+    `peerDependenciesMeta` 是空的，cordis 也从未标 optional。修法本身没问题，但依据是上面那条，不是先例。
+
+- **DSML 泄漏时工具名一字之差，整段标记回退成正文（#152）**
+  - **现象**：模型把工具调用写进正文时把名字写成 `pwdsh`，而请求声明的是 `pwsh`。第二道闸按名字拒绝
+    （这是对的：那个名字从未被提供过），于是整块按原文显示 —— 用户看到一堵乱码墙。
+  - **新证据**：幻觉名与真实名之间存在**可预测的一字变形**（`pwdsh` = `pwsh` 中间多插一个 `d`，
+    编辑距离 1）。这跟此前记录过的 `validate` 那种「名字整段被换掉」不同，是可以低成本兜底的。
+  - **修法**：第二道闸在拒绝之前先试一次受限纠正（`repairNearMissName`，由 shim 开启）：
+    - 候选集**只来自本次请求的 `body.tools`** —— 永远不会选中一个没被提供的名字，更不会凭空造名；
+    - 写出名与候选名的**编辑距离必须 ≤ 1**，且**恰好一个**候选落在这个距离内（两个就放弃）；
+    - 双方长度都 **≥ 4**（`cat`/`cut`、`bash`/`dash` 这类三字母的一字之差不是证据）；
+    - 写出名若**已精确命中**声明名，直接用它，绝不"纠正"到邻居；
+    - **只纠正 `invoke name=`**；`parameter name=` 一律不动（改参数名等于改调用语义，比显示正文更糟）；
+    - `tool_choice` 的钉选、第四道闸（必需参数缺失即截断）**都在纠正后的名字上照旧生效**。
+  - 默认仍是 fail-closed：`repairNearMissName` 不传就是关闭，只有 shim 的请求路径打开它。
+
+### Tests
+
+- `tests/dsml-recovery.spec.ts` 新增 10 条（#152）：真实捕获形态 `pwdsh` → `pwsh` 被恢复；不开关时仍拒绝；
+  两个候选在距离内则放弃；短名（写出名 3 字 / 候选 3 字）两种方向都拒绝；已精确命中的名字不被"纠正"；
+  不在声明集里的近邻不被凭空选中；钉选与必需参数两道闸在纠正后仍生效；**参数名不被纠正**。
+- `tests/shim-recovery.spec.ts` 新增 1 条（#152 的**接线**）：走真实 shim 与真实响应流，断言 `pwdsh`
+  在声明 `pwsh` 时被恢复成 `pwsh`、在只声明 `bash` 时**仍回退成正文**。这条单独存在的理由与 #149 相同：
+  纯函数用例自己传开关，摘掉 `shim.ts` 里的 `repairNearMissName: true` 时它们全绿 —— 实测该变异只让这条变红。
+- `tests/dsh-line.spec.ts` 新增 1 条（#151）：断言 `peerDependenciesMeta['@earendil-works/pi-ai'].optional === true`，
+  且 peer **范围**未因此改动。
+- 变异验证（每条都确认过会让对应用例变红）：去掉编辑距离判断 → 1 条红；去掉唯一性判断 → 1 条红；
+  去掉两个长度下限 → 2 条红；忽略 opt-in（默认开启）→ 1 条红；摘掉 shim 的接线 → 1 条红；移除 `optional` → 1 条红。
+- 全量：`tsc` 双配置 0 错误，**143 文件 / 2491 通过（2 条按平台跳过）**，`tsdown` 构建通过。
+
+## 5.12.1 (2026-10-26)
+
+> 修正 5.12.0 的 `dropForeignThinking` 漏判的一条腿：`isSameModel` 判据是 provider **且** api
+> **且** model id 三者全等，而 5.12.0 的 `isForeignAssistant` 只比了前两条。于是**在同一个区域内
+> 换模型**（`hy3` → `deepseek-v4.1-flash`，两者都由本插件提供、都盖 `provider: workbuddy`）时
+> 一个块也检不出，开关看起来无效，而 pi-ai 照样把历史 thinking 摊平成正文。修复只补判据与传参，
+> 不传时行为与 5.12.0 完全一致；开关默认仍为关闭。
+
+### Fixes
+
+- **同一区域内换模型时，`dropForeignThinking` 检不出任何块（#147 的第三条腿）**
+  - **病因是判据少了一条腿。** pi-ai 的 `isSameModel` 是 `provider === … && api === … && model === model.id`（`transform-messages.js:68–70`，0.85.1 与 1.1.0 行号一致）；5.12.0 的 `isForeignAssistant` 只比较 provider 与 api。换区场景（provider 变了）能检出，**换模型场景（只有 model 变了）检不出**——症状与 #147 一模一样，却没有诊断、开关也无效。
+  - **修法**：`isForeignAssistant` 增加可选的 `requestModelId`，补上 model 腿；`foreignThinkingOf` / `dropForeignThinking` 透传它；`withLegacyContext` 的 `prepare()` 在 `stream` / `streamSimple` 两个入口、legacy / modern 两个分支共四处传 `model.id`。**不传时行为完全不变**（只判前两条腿），所以卡片等只读 surface 与既有调用点零影响。
+  - 传 `model.id` 而**不是** `record['model']`：`dsh-llm-pi-ai` 的 `replayedAssistant` 在 `response.api === 'anthropic-messages'` 时会取 `responseModel ?? model`（`lib/index.js:218`），而 `isSameModel` 比的是 `model.id`，这里与它对齐。
+  - **顺带澄清一处不成立的顾虑**：卡片那条路径**不需要**单独传 model id。卡片读的是 status 端点的 `lastForeignThinking`，该值由 `onForeignThinking` 在**请求路径**里填充，因此天然带着 `model.id`——「换模型导致的摊平」在卡片上同样可见，无需 follow-up。
+  - **两处已失效的表述同步改正**：`alignAssistantIdentities` 的文档（`src/adapter.ts:671`）原写「换模型仍会降级……（有测试覆盖）」，但当时并无任何测试覆盖这条腿；README 中「同一区域内换模型仍会降级」一句现在补明「降级本身消除不了，但它变成正文这件事可以」。
+
+### Tests
+
+- 新增 `tests/issue147-model-leg.spec.ts`（9 条），走**真实 pi-ai 的 `transformMessages`**：缺陷本身可复现 / 旧两腿调用检不出（盲区钉成对照）/ 三腿调用检出并删除 / 外来 provider 仍检出（第三条腿是追加不是替换）/ 同 model 的消息一个不动且返回同一对象 / 无 `model` 字段不误报 / 外来轮次 model id 恰好相同也不洗白 / 一次真实切换里只删旧模型的轮次 / 幂等。
+- 新增 `tests/issue147-model-leg-wiring.spec.ts`（12 条），补上**接线**而不是判据：legacy 与 modern 两个分支 × `stream` / `streamSimple` 两个入口 × 三种状态（换模型时删、同名模型时留、开关关闭时原样），都经过真实 `createWorkBuddyAdapter`，断言 api 收到的上下文里 thinking 块的去留、以及 `onForeignThinking` 是否触发。
+  - **这条为什么必须单独存在**：把四处 `prepare(context, model.id)` 全部改回 `prepare(context)`（即修复被静默摘掉），**整套 2467 条测试依然全绿**——纯函数测试自己调判据，没有任何东西发现 wrapper 没传 id。补上后该变异使其中 4 条全红。这与 `tests/adapter.spec.ts` 当初为 issue #24 建的洞同型。
+  - 后两种状态是防止「一概删除」也能通过的对照：若判据退化成「凡 assistant 轮次都算外来」，删除会把**当前模型自己的**推理一起删掉（#102 的反向回归），所以同 model 与开关关闭两条必须看到 thinking 保留。
+- 变异验证：model 腿恒 `false` → 2 条红；恒 `true` → 3 条红（含 #147 原有 suite 1 条）；摘掉 `model.id` 传参 → 接线测试 4 条红；把修复整体短路（`if (true) return aligned`）→ 接线测试 4 条红。
+- 全量：`tsc` 双配置 0 错误，**143 文件 / 2479 通过（2 条按平台跳过）**，`tsdown` 构建通过。
+- 真实会话数据复核（`session-356f6889`，5,158 事件）：同网关换模型场景（80 条本插件自己的轮次）下，旧的两腿调用检出 **0 块**，三腿调用检出 **76 块 / 134,943 字符**，带正文消息 72 → 56，正文字符 195,867 → 60,984；单模型转录检出 0 块并返回同一对象（no-op 契约成立）。
+
+## 5.12.0 (2026-10-26)
+
+> 特性版本：新增 `dropForeignThinking`（**默认关闭**），修 issue #147——跨 provider 切换后
+> pi-ai 把外来轮次的 thinking 改写成正文，模型随后照抄这个格式，整轮回答变成英文工作笔记。
+> 关闭时请求字节与 5.11.0 完全一致；打开后只删「本来会被压成正文、且不可能作为带签名 reasoning
+> 重放」的外来 thinking 块，正文块、工具调用与每条消息的身份都不动。请求路径、provider 路由、
+> 计费与凭据处理一律未变。
+
+### Fixes
+
+- **思考变正文：跨 provider 切换后模型把工作笔记写进回答（#147）**
+  - **病因在 pi-ai，不在本插件。** `transform-messages.js:68` 用 `isSameModel`（provider **且** api **且** model id）决定一条历史 thinking 能否按 reasoning 重放；不成立时它**不丢弃**该块，而是改写成 `{type:'text', text: thinking}`（`:87–90`）——也就是答案通道。会话一旦跨 provider 切换过，另一个模型的内部工作笔记就以「本轮回答」的身份出现，模型读到「我过去的思考全是正文」这个形状后持续照抄。
+  - **实测复现（本机 pi-ai 0.85.1 + 真实 `transformMessages`）**：`api: 'dsh-foreign'` 的外来轮次 → `[text]`（200/300 字符全部进正文）；本插件自己的轮次 → `[thinking]`；把该块丢掉 → `[]`（不产生任何正文）。报告者的一轮真实会话里，80 条 assistant 消息中 56 条带正文而 `reasoning` ≤ 1 字符，20 条英文工作笔记合计 58,960 字符，CJK 占比跌到 1.37%；会话从 696,966 涨到 758,005 total token。
+  - **为什么是「删除」而不是「保留为 thinking」**：`isSameModel` 只比对消息自身字段，唯一的满足方式是把这个外来轮次宣称为本模型的输出——那正是 #111 刚删掉的来源谎言。而这些块由宿主 `foreignAssistant()` 构造、**不带 `thinkingSignature`**，即便被宣称也无法作为带签名 reasoning 重放，它们对线上唯一的贡献就是被压成的那段正文。
+  - **修法**：新增 `src/adapter.ts` 的 `foreignThinkingOf()`（只读诊断）与 `dropForeignThinking()`（实施删除），在 `withLegacyContext` 的 `prepare` 里、**`alignAssistantIdentities` 之后**执行。顺序是承重的：国际区自己的轮次到达时同样带 `api: 'dsh-foreign'`，先诊断会把它误判成外来轮次并删掉它自己的推理（#102 的反向回归）。
+  - **开关**：`dropForeignThinking`（volatile，默认 `false`）。用 getter 读活值，拨动后**下一个请求**即生效，不需要重载插件——用户正是在看着那条工作笔记时打开它。
+  - **诊断可见**：被删的块数与位置写入 status 端点的 `lastForeignThinking`（进程内、last-wins、重启即忘），`dropForeignThinking` 开关本身也随 status 下发，供卡片渲染提示。
+
+### Tests
+
+- 新增 `tests/issue147-foreign-thinking.spec.ts`（15 条），全部经过**真实 pi-ai 的 `transformMessages`**，而不是桩：缺陷本身可复现、开启后不产生正文、关闭时原对象返回（零改动）、本插件国内外两区轮次都保留 thinking、正文与工具调用不被触碰、redacted 与空块不误报、错误轮次报 `dropped` 变体、顺序必须在 alignment 之后、幂等。
+- 变异验证：把 `dropForeignThinking` 改成空操作 → 4 条变红；把判断放宽到所有 assistant 轮次 → 7 条变红。
+- 全量：**142 文件 / 2458 通过（2 条按平台跳过）**；两个 tsconfig 均 exit 0。
+
+## 5.11.0 (2026-10-26)
+
+> 特性版本：新增 `workbuddy_draw_video`（文生视频 / 图生视频，异步任务「提交 → 轮询 → 下载」，
+> 逐区 opt-in、默认关闭），卡片「能力」栏新增视频开关与**按模式钉模型**；同期把生图 `size`
+> 的描述补上实测的大图档位与 419 万像素上限（**执行层零改动**，改的是模型对「能画多大」的先验）。
+> 视频工具落地后按现场报错修了三处：**时长校验形同虚设**、**参数错误也白等 60 秒冷却**、
+> 以及**显式 `resolution` 在拿不到目录清单时被静默丢弃**。请求路径、provider 路由与凭据处理
+> 一律未变：视频打的是官方 CLI `VideoService` 早已在用的两条 `/v2/videos/*` 路由，选模型仍只看
+> 该区 `/v3/config` 的媒体标签。
+
+### Features
+
+- **新增 `workbuddy_draw_video`：文生视频 / 图生视频，国内区与国际区都能注册，逐区 opt-in**
+  - **它不是「接一次 `submitVideo()`」**：视频是异步任务——`POST /v2/videos/generations` 只回一个 `taskId`，还要轮询 `POST /v2/videos/tasks` 到 `completed`（5 秒一次，上限 600 秒），再 `GET` 每条 `data[].url` 把 mp4 拉到本地。旧文档「加视频只是接一次 `submitVideo()`」少说了后两段，已在 `docs/VIDEO_GEN.md` 对账。
+  - **参数层与选模型层是复用的**：`MEDIA_TAGS`、`VIDEO_TAG_*`、`fetchMediaModels`、卡片媒体清单原本就认得两个视频标签，所以参数校验与选模型只补了一层 `src/video-gen.ts`；**执行层是全新异步代码**（`src/upstream.ts` 的 `submitVideo` / `pollVideoTask` / `downloadVideo`）。
+  - **花钱的三条红线照搬生图**：独占执行（不声明 `isConcurrencySafe`）、失败后 60 秒冷却、冷却**只看请求是否真的发出**（参数错、未登录、读不到输入图一律不进冷却）；工具**逐区 opt-in**，不勾时根本不注册，模型看不到它。
+  - **产物落本地临时目录**：视频是二进制，不进对话体，工具只回 `file://` 路径 + 渲染成链接（`os.tmpdir()/workbuddy-video-gen/<model>-<时间戳>.mp4`）。
+  - **顺手改对一处描述**：`seconds` 原写「越界会被夹回默认值并提示」，而 `resolveVideoParams` 实际抛
+    `INVALID_ARGS`（不会夹取）——描述会教调用方传 30 秒再等一个 5 秒的结果，然后把报错当成 bug。
+  - **验证**：`tsc` 两套配置 0 error；`vitest run` 141 个文件 / **2445 条**通过（含新增
+    `tests/video-gen.spec.ts`、`tests/video-tool.spec.ts`、`tests/video-tool-optin.spec.ts`）；
+    `tsdown` 构建通过。
+
+- **实测单价与产物规格写进文档了（`docs/VIDEO_GEN.md`「实测单价与产物规格」）**
+  - **国内区实测单价**：图生视频 4 秒 `minimax-video-h3` 57.14 / `kling-video-v3` 68.57；
+    文生视频 5 秒 `minimax-video-h3` 71.43 / `kling-video-v3` 128.57 积分。`minimax-video-h3`
+    文生图生同价（14.29/s），`kling-video-v3` 图生比文生便宜（17.14/s 对 25.71/s）——
+    「一条 5 秒多少积分」要连模式一起看。
+  - **产物实测**（解析 mp4 的 `moov` 盒，不靠上游自报）：H.264 + AAC、**24fps**、
+    `1280x720` 或 `1344x768`（这两个尺寸是**默认档位**下的产物；见下方 Fixes 第三条——
+    「没有 1080p」此前被记成上游行为，实则其中一部分是本插件把 `resolution` 丢掉了），
+    视频码率 3.66–11.47 Mbps、体积 2.0–7.0 MB；**实际时长按帧数走**，请求 5 秒拿回
+    5.09–5.17 秒，请求 4 秒拿回 4.04–4.46 秒。`enable_audio: true` 也不保证有音轨。
+- **卡片上按模式钉住视频模型（软约束，与显式 `model` 分工明确）**
+  - **起因**：国内区每个视频标签组都有 2 个模型（`kling-video-v3` / `minimax-video-h3`），调用方多半省掉 `model`，于是永远拿到目录里的第一个；口头说一次不持久。
+  - **按区、按标签存**：`regions.<区>.preferredVideoModels` 是 `{ [tag]: modelId }`——两种模式可能由不同模型提供，且模型 id 不跨区（`minimax-video-h3` 在国际区不存在）。
+  - **软约束**：显式 `model` 是调用方为这一次写的，写错就报 `NO_VIDEO_MODEL`；卡片偏好是用户以前写的，钉住的模型已从目录里消失时**静默回落组内第一个**。两条方向相反的规则各有测试钉住。
+  - **清空 = 删 key**，不是写空串；卡片读值先问 Host（`statusByRegion`），浏览器配置快照只作回落。
+  - **写入走与开关同一条「写后回读校验」路径**（`writeRegionPreferredVideoModels`），不是裸 `scope.set`。
+
+### Fixes
+
+- **视频工具：显式 `resolution` 在拿不到目录清单时被静默丢弃（视频同步找到的第三处）**
+  - **症状与上面那条同源**：`resolveVideoParams` 用 `new Set(config?.resolutions ?? [])` + `has()`
+    判断，于是「模型不支持这个值」与「我们根本没有这份清单」两条路径合流——**任何**显式
+    `resolution` 在目录没下发 `videoGeneration.resolutions[]` 的账号上都被丢掉，`buildVideoBody`
+    收到的已是 `undefined`，请求体里连 `resolution` 字段都没有，却还打印一句
+    「resolution 1080P 不被模型 · 支持；改用 上游默认」，看起来像上游拒绝。
+  - **同一条判据修正**：只有真的拿到 `resolutions[]` 才做回落，拿不到就**原样透传**交给上游判
+    ——与 `seconds` 的「拿不到区间就不盲拒」完全一致。
+  - **顺带修掉大小写**：清单匹配改为大小写不敏感，命中后发**目录的拼写**。官方 CLI 的兜底档位是
+    `["720P","1080P"]`，而工具描述一直举 `720p`/`1080p` 的例子，精确匹配会把一个其实可用的值
+    判成不支持。
+  - **工具描述与 `docs/VIDEO_GEN.md` 同步改正**（文档此前把这个 bug 的现象记成了上游的行为，
+    并据此写了「`resolution: "1080p"` 对 `minimax-video-h3` 不成立」——那条结论在拿不到清单的
+    账号上从未真正验证过）。
+  - **验证**：`tests/video-gen.spec.ts` 新增 2 条（无清单/空清单透传、大小写命中），全量
+    `vitest run` 141 个文件 / **2445 条**通过。
+
+- **视频工具：`seconds: 1` 被上游 400 退回后还要白等 60 秒（两处真 bug）**
+  - **现场**：`Error: workbuddy video: 提交生视频任务失败（HTTP 400）: code 14407: Create video failed with error: unsupported video duration: 1 seconds, supported range: 4-15 seconds`，紧接着第二次调用被挡成「请 38 秒后再试」。用户的判断是「上游返回这种错误，也要等半天」。
+  - **根因一（本地时长校验是死代码）**：`src/video-tool.ts` 调 `resolveVideoParams({...})` 时**没传第二个参数 `config`**；而 `src/video-gen.ts` 的 `minSeconds`/`maxSeconds` 校验只在 config 存在时才跑。更上游还有一处：`src/image-gen.ts` 的 `selectMediaModels` 只搬 `{id,name,tags}`，把条目上的 `videoGeneration` 丢了——所以即使传了也拿不到。
+  - **根因二（没花钱的失败也进冷却）**：`describeVideoFailure` 把提交阶段的一切非 401/403/404/429 都归成 `UPSTREAM`，而 `UPSTREAM` 在冷却集合里。可 400 是「建任务之前就被退回」，没有 task、没有扣积分。
+  - **修法**：`selectMediaModels`（video 与 image 两处）保留并透传 `videoGeneration`（`readVideoGeneration` 只搬已知字段，缺字段不补默认值），工具把它喂给 `resolveVideoParams`——越界时长现在**在本地就被拦下，一次付费请求都不发**；提交阶段其它 4xx 单独归类为 `REJECTED`（不进冷却，错误里明说「没有创建任务、没有扣积分」并保留上游原文）。
+  - **顺带学会区间**：目录不带 `videoGeneration` 的账号（实测部分国内区账号的 `/v3/config` 条目只有 `{id,name,tags}`）本地无从校验，只能让上游先拒一次；`parseSupportedSecondsRange` 从它的文案里读出 `supported range: 4-15`，按**区域 + 模型 id**记在本次进程里，第二次同样的越界值**零请求、零冷却**直接报「时长必须在 4 到 15 秒之间」。读不出区间（例如拒的是宽高比）就什么都不记——不猜。
+  - **验证**：`tsc` 两套配置 0 error；`vitest run` 141 个文件 / **2445 条**通过（`tests/video-gen.spec.ts`
+    35→48、`tests/video-tool.spec.ts` 7→12；新增用例钉住「提交 400 之后下一次仍会真的发请求」
+    与「学到区间后第二次不出进程」）。
+
+- **`size` 的描述让人以为只能出 1024 级方图，而实测上限是约 419 万像素**
+  - **起因**：5.10.0 把 `size` 描述从单个 `1024x1024` 例子改成方 / 竖 / 横三个例子，解决了
+    「只能出方图」那个错误先验；但三个例子全是 1024 级，模型据此认为「大图也就是这个量级」，
+    用户要桌面壁纸、竖屏壁纸时只会得到一张 1024 宽的照片。
+  - **2026-10-25 逐档实测（国内区 `hunyuan-image-alpha`）**：`2048x2048`（4.19 MP）、
+    `2048x1536`（3.15 MP）、`2048x1152`（2.36 MP）、`2560x1440`（3.69 MP）、
+    `2560x1600`（4.10 MP）**全部成功，输出宽高与请求完全一致**——不是把大图静默压回原生
+    尺寸再放大，画面里的刻度文字与纹理是独立线条。`2560x2560`（6.55 MP）、`3072x3072`
+    （9.44 MP）、`4096x4096`（16.8 MP）**全部被直接拒绝**，不会退回一个较小尺寸。
+  - **据此定上限**：约 **419 万总像素**，任意长宽比。这**推翻**了流传的判断「原生上限约
+    1536 长边」——那个数字来自官方 CLI `.describe()` 的三个例子与 bundled OpenAI SDK 类型
+    定义的取值范围，从来没有实测过；实测表明 2560 长边是真实可用的。
+  - **修法**：`src/image-tool.ts` 的 `size` 描述加入 `2048x2048` / `2048x1536` /
+    `2560x1440` / `2560x1600` 四个**实测通过**的档位、写明「约 419 万像素」上限、并点名
+    `2560x2560` / `3072x3072` / `4096x4096` 会被拒（防止模型往 4K 上撞）。
+  - **只写实测过的尺寸**：`1440x2560`（手机竖屏壁纸的常见答案）**没有单独跑过**，它与已通过
+    的 `2560x1440` 像素数相同、只转 90°，按像素阈值推断可用，但描述里不写它——描述只给实测
+    通过的宽高；`docs/IMAGE_GEN.md` 的「尺寸与比例」小节把 `1440x2560` 单列一行并标注
+    「未单独实测」。
+  - **验证**：`tests/image-gen.spec.ts` 新增 1 条（描述同时含 `2048x2048` / `2560x1440` /
+    `419` / `4096x4096`，防止以后有人把上限改回「只给三个 1024 例子」）；
+    `docs/IMAGE_GEN.md` 的「尺寸与比例」换成 11 行实测对照表 + 按用途选尺寸表；
+    README 中英各补一句。
+
+---
+
+## 5.10.0 (2026-10-25)
+
+> 特性版本：`workbuddy_draw_image` 从「只在国内区注册、只能文生图」扩成「国内区与国际区都能用、文生图 + 改图（图生图）」，卡片「能力」栏新增该区媒体模型的只读清单。**请求路径、provider 路由、计费口径与凭据处理一律未变**：改图打的是官方 CLI `ImageService.editImage` 早就用的 `POST /v2/images/edits`，选模型仍然只看该区 `/v3/config` 的媒体标签。
+
+### Features
+
+- **国际区账号也能用 `workbuddy_draw_image`（逐区授权，国内优先）**
+  - **起因**：此前文档与代码都写着「只有国内区有生图模型，国际区一条都没有」，工具因此硬编码成 `regionEnabled(config, 'cn')` 才注册。那句话是 **2026-10-21 的观测**，已经过期。
+  - **2026-10-25 跨区实测**：国际区 `GET /v3/config` 29 条模型里 `hy-image-3.5` **同时**带 `text-to-image` 与 `image-to-image`；同一份凭据 `POST /v2/images/generations` + `hy-image-3.5` → HTTP 200、`usage.credit = 0.03`、产物是 `ap-singapore` 的 COS 签名 URL。`buildImageBody()` 的「其它」分支（带 `response_format: 'b64_json'`）被原样接受，**协议层一行都不用改**。同一轮探针确认国际区 `/v2/api-keys` 回 503、`/agenttool/v1/tempkey` 回 500（而国内区后者回 200）——即 3D 那条临时密钥链路在国际区整个不存在，与生图无关。
+  - **修法（区域选择集中到一处）**：`src/index.ts` 新增 `imageToolRegionOf(config)`——按 `REGION_KEYS`（`cn` 在前）遍历，跳过被关闭的供应商，返回第一个**既启用又打开了「允许模型自主生图」**的区域，都不满足返回 `undefined`。`syncImageTool()` 的注册判定改为 `imageToolRegionOf(value) !== undefined`；`resolveCredential` 改为每次调用时读当前配置、遍历被授权的区逐个 `resolve()`，某区未登录就试下一个区，全失败返回 `undefined`。**CN 优先是唯一向后兼容的顺序**：升级前这个工具只能走国内区，升级不能悄悄把老用户的支出挪到另一个网关。
+  - **文案层同步拆除「只有国内区」的前提**：`ImageToolDeps` 删掉 `regionLabel` 字段；工具描述改为「两个区都可用 + 各自的模型名 + 单价随区与模型不同 + 以返回的 `credit` 为准」；`NOT_LOGGED_IN` 改为「要么两个区都没登录，要么已登录的那个区没打开该开关」；`hint` 不再写死 5.71，有 `credit` 时印本次实扣；`describeImageFailure()` 的 404 文案与 `pickImageModel()` 的空目录文案不再断言「国际区没有生图模型」。
+  - **卡片**：`imageToolPreference` 不再包在 `activeRegion === 'cn' ? … : null` 里，两个 tab 都显示；勾选仍然只写**当前这一区**的 `imageToolEnabled`，两区都关着时工具根本不注册。
+  - **价格口径（README 中英各改一段）**：5.71（国内 `hunyuan-image-alpha`）与 0.03（国际 `hy-image-3.5`）是**两个模型 × 两个区域**同时变化的结果，不是同一张图的跨区差价；两区的积分池彼此独立，两个数字之间没有任何汇率含义。
+- **改图（image-to-image）：同一个工具，给了 `image` 就切模式**
+  - **起因**：`/v2/images/edits` 与 `hunyuan-image-alpha-edit` 的存在早在 4.13.2 取证时就写在 `docs/IMAGE_GEN.md` 的「没做的事」里——没做，是因为当时没跑通一次真实调用。这次跑通了，才把它接出来。
+  - **模式由「有没有输入图」唯一决定，不新增 `mode` 参数**：多一个参数就多一个「`mode=edit` 但没给图」的自相矛盾状态。`image` 存在 → `editImage` + `image-to-image` 组；不存在 → `generateImage` + `text-to-image` 组。
+  - **`model` 的校验跟着模式走**：`pickMediaModel(models, requested, tag)` 按当次标签组挑模型。拿文生图模型点名去改图会直接报「目录里没有图生图模型「xxx」。可用：…」，而不是把不匹配的 id 发上去换一个上游 404——那样报错只会是 `route config not found`，读者无从知道是名字写错了。`selectMediaModels` 同时接受单个标签与标签数组，目录一次读回四类媒体标签（`MEDIA_TAGS`），为将来的视频留位。
+  - **`image` 收官方 CLI `processImageInput` 的全部四种形态**：本地绝对路径、`file://`、`http(s)`（宿主侧下载、30 秒超时）、data URL，另加裸 base64（长度 ≥ 100、无路径分隔符、字符集合法才认，否则当路径）。**一律先归一成 `data:<mime>;base64,…`** —— 上游唯一接受的形态。mime 判定顺序：HTTP `Content-Type` 的 `image/*` → 按扩展名 → 按魔数嗅探（PNG / JPEG / GIF / WEBP / BMP，兜底 `image/png`）。
+  - **不做缩放、裁剪、格式转换**（`MAX_INPUT_IMAGE_BYTES = 8 MB` 只是上限）：用户给什么就传什么。悄悄改输入图是比失败更糟的行为。
+  - **输入图的所有毛病都在「请求没发出去」之前**，所以统一 `INVALID_ARGS`、不进 30 秒冷却、不花积分：读不到文件、下载失败、data URL 格式不对、空文件、超 8 MB。紧接着再调一次仍能立刻执行——判据与既有规则一致（冷却只看「请求是否真的发出去了」）。
+  - **返回值与 `render` 区分两种模式**：output schema 新增必填 `mode`（`'generate'` | `'edit'`），`render` 显示「改图 · 模型：`xxx`」、markdown alt 由「WorkBuddy 生图」改为「WorkBuddy 文生图/改图」。
+  - **上游**：`src/upstream.ts` 新增 `editImage(credential, {model, prompt, size?, image, inputFidelity?})`，`src/image-gen.ts` 新增 `buildEditBody()`（在 `buildImageBody` 之上追加 `image` 数组，`input_fidelity` 仅在非空时写入）。
+- **卡片的「能力」栏新增媒体模型只读清单**
+  - `POST /plugins/dsh-connect-workbuddy/media-models`（`WORKBUDDY_MEDIA_MODELS_PATH`）：405 非 POST → 403 外部 Origin → 503 未接线 → `region` 查询参数（缺省 `cn`）→ 200 `{models:[{id,name,tags}]}`。空清单是**合法回答**（网关不发布媒体模型），不是错误——卡片为它单独写了一句话，而不是显示一个失败。
+  - **为什么单独一条端点**：`models/refresh` 返回的是**聊天**目录，投影时媒体条目被 `selectCliModels` 丢掉，刷新它永远看不到图像模型。
+  - 宿主侧 5 分钟缓存（复用 `MEDIA_MODEL_TTL_MS`），`refresh=1` 绕过——刚在上游启用了图像模型的用户不该等 TTL 到期才看见。读失败不写缓存。
+  - **只读，不做下拉**：两区今天每个标签组只有 1 个模型，长度 1 的下拉是假选择。切换能力的方式就是工具的 `model` 参数。清单**惰性读取**（只在能力面板打开时读、每区只读一次），失败只落在块内，绝不并进 `statusByRegion`——那会把图像模型写进 `lastCatalog`，adapter 就会拿它当聊天模型。
+- **文案与文档**：`docs/IMAGE_GEN.md` 新增「改图」整节（四种形态、模式自动判定、每组模型、8 MB 上限、为什么不给 `mode` 参数），并把「图生图没做」那条从「没做的事」里删掉；README 中英各补一段。
+
+### Fixes
+
+- **超限的 data URL 会绕过 8 MB 与空文件闸门，被原样发到上游，然后按「已计费失败」冷却 30 秒（本轮合并前审核发现）。**
+  - **症状**：`resolveImageInput` 的 `data:` 分支校验完格式就 `return text`，而空文件与 `MAX_INPUT_IMAGE_BYTES` 的检查都在 `encodeInputImage` 里——只有 `http(s)`、裸 base64、本地路径这三条路径会走到它。于是 `data:image/png;base64,<12 MB>`（解码后 9 MB）会被整个塞进请求体发出去；上游拒绝后 `sent` 已是 `true`，再吃一次 30 秒冷却。
+  - **与本 PR 自己的声明直接冲突**：工具描述、`docs/IMAGE_GEN.md` 的「输入图的失败不进冷却」小节，以及 `image-tool.ts` 里 `inputImageError()` 的注释都写着「输入图的一切毛病都发生在请求发出去之前，所以统一 `INVALID_ARGS`、不花积分、不进冷却」。这不是缺一条边界用例，是四条路径里有三条遵守、一条不遵守。
+  - **修法**：新增 `assertInputImageBytes(byteLength, source)` 作为唯一的体积/空文件闸门，`encodeInputImage` 与 `data:` 分支都调它——文案因此只有一份，四条路径不可能再各自漂移。
+  - **口径**：体积按**解码后**的字节数比上限，不按 base64 字符串长度。base64 比原始字节长约 4/3，拿字符串长度比会把一张合法的 6 MB 图（8 MB base64 字符）误判成超限，并在错误信息里报出一个虚高的 MB 数。
+  - **验证**：`tests/image-gen.spec.ts` 新增 3 条——超限 data URL 报 `INVALID_ARGS` 且 `editImage` 没被调用、紧接着再调一次**不进冷却**；6 MB 输入（8 MB base64 字符）仍被接受；`data:image/png;base64,====`（形似 data URL 但解码为空）报 `INVALID_ARGS`。变异验证：把 `data:` 分支改回直接 `return`，前两条与空内容那条中的两条立刻变红。
+
+### Tests
+
+- `tests/image-gen.spec.ts`：38 → **60 条**。新增 `pickMediaModel` 按组校验（含国际区 `hy-image-3.5` 两组都能选、拿文生图模型去改图的报错文案）、`selectMediaModels` 的多标签形态、`buildEditBody`（字段顺序 / `n:1` / 空 `input_fidelity` 不写入 / `image` 是拷贝）、输入图归一（扩展名大小写、五种魔数 + 兜底、data URL 只认 `data:image/*;base64,`、裸 base64 的字符集判定、8 MB 常量），以及改图路径的 9 条端到端（走 `editImage` 且 `mode:'edit'`、不给图走 `generateImage`、读不到图 `INVALID_ARGS` 且**不进冷却**、`data:text/plain` 被拒、**超限 data URL 被拒且不进冷却**、**上限按解码后字节数算**、**空内容 data URL 被拒**、点名错组模型不发请求、`render` 文案）。国际区夹具换成真实形状（`hy-image-3.5` 双标签 + `kling-video-v3`），新增「国际区目录同样能选出默认模型」「工具描述同时交代两个区」「`render` 原样印出 0.03（不能被抹成 0）」；404 与未登录两条用例从「断言点名国内区」翻转为「断言不再点名」。一条旧断言从「WorkBuddy 生图」改为「WorkBuddy 文生图」——`render` 现在分两种模式。
+- `tests/image-tool-optin.spec.ts`：12 条。新增 `imageToolRegionOf` 四条（都没授权 → `undefined`、供应商关着时勾选不算授权、只开国际区 → `'global'`、两区都开 → `'cn'`），卡片源码断言改为「不再 CN-only」。
+- `tests/web-status.spec.ts`：新增媒体端点 7 条（200 只回 id/name/tags 且 region 透传、空清单 200、`refresh=1` 透传且 `refresh=0`/缺省读作 false、GET 405、外部 Origin 403、未接线 503、上游抛错 500），以及路由顺序断言。
+- `tests/card-media-models.spec.tsx`（新文件，6 条，jsdom 真渲染）：只在能力面板打开后**每区读一次**、按钮才带 `refresh=1`；行里同时显示 name / 工具要用的 `id` / 翻译过的 tag；空清单读成一句话而不是失败；上游 500 只落在块内、同面板的其它开关照常可用；半形行被丢弃而不是抛异常（一个只读列表不值得把整张卡带下去）。
+- 全量 `vitest run`：138 文件 / 2362 条通过（本功能相关的 image-gen 60 + image-tool-optin 12 + card-media-models 6 共 78 条）；两个 tsconfig 的 `tsc` 均 0 错。
+
+## 5.9.0 (2026-10-25)
+
+> 健壮性与诊断版本：活动徽标的时窗解析不再能因非字符串端点而抛错，上游改格式时徽标不再**静默**消失，配置区渲染失败不再退化成一片空白；同时修掉一个**徽标被冻结在保存时刻**的静默缺陷。**发往上游的请求体、provider 注册、凭据、计费、换号与路由门禁一律未变**——本轮不新增任何上游请求，也不改动入站路由。
+
+### Fixes
+
+- **`minutesOfClock` 缺运行时类型守卫，非字符串端点会在渲染期抛 `value.trim is not a function`（issue #139）。**
+  - **症状（机制属实，但 issue 的根因链不成立）**：函数签名是 `(value: string)`，只靠调用方 `parseDaily` 的 `text()` 维持不变式。一旦 `{ start: 1380, end: 470 }` 这样的数字端点到达 `withinDailyWindows`（`src/promo.ts:530`），渲染期抛 `TypeError`，宿主 `SlotErrorBoundary` 把它吞成一个空的 `<div data-slot-error>`——页面上表现为「插件像没装上」：卡片只剩头部，配置区整块消失。
+  - **issue 的根因不成立，已核**：客户端 bundle 里 `modelPromotions` / `parseDaily` 的命中数是 **0**（徽标的 `promos` 由宿主解析后经 `status-paths` → `web-status` 投影下来），且宿主 `parseDaily` 对数字端点是**丢弃而非抛错**（`text()` 先挡）。实测国内区三台主机 × 四种 UA，`schedule.daily` 端点全部是字符串（`"23:00"` / `"7:50"` / `"0:00"` / `"23:59"`），无一个数字。另外 `TypeError` 与时刻无关，issue 描述的「只在夜间崩」自相矛盾（13:00 与 23:30 抛的是同一个错）。
+  - **但那条路径并非不可达**：`toPersistedWorkBuddyModel` 保留 `promos`，settings 的 `modelConfig` schema 不剥离未知键，`resolveRoster` 原样携带——所以 `lastCatalog` 是一条**真实的第二入口**，且客户端对它**零运行时校验**。这就是补守卫而不是「纯纵深防御」的理由。
+  - **修法**：签名改 `(value: unknown)`，首行 `if (typeof value !== 'string') return undefined`。**没有**采纳 issue 建议的「数字按当日分钟数解释」：`1380` 确实等于 23:00，但没有任何上游发布过这种形状，为一条上游从未描述过的活动凭空造出时段，正是本模块要防的「说多」。
+  - **验证**：`tests/promo.spec.ts` 新增 2 条——数字端点 `selectPromoBadge` / `selectPromoMultiplier` 均不抛错且返回 `undefined`；`parseWorkBuddyPromos` 对数字端点产出 `dailyUnusable`（「永不运行」）而非「无时段 = 全天」。变异验证：删掉守卫 → 该条变红。
+
+- **上游的促销变更被冻结在用户保存目录的那一刻（本轮审核发现，影响面大于 #139）。**
+  - **症状**：用户只要保存过一次模型目录，`promos` 就被写进 `lastCatalog`，此后**上游的促销变更再也不生效**——徽标与折后价用的都是保存那一刻的快照。两个方向都实测过：saved 无 `promos` + live 有 → 徽标**完全不出现**；saved 有旧 `promos` + live 有新 → **旧的赢**。极端情形：一条无 `schedule` 的常驻徽标（如「订阅优先」）在上游撤下后仍会**永远**挂在模型行上，因为它没有绝对窗口能让它自己过期。
+  - **根因**：`promos` 不在 `LIVE_OWNED_FIELDS`（`src/catalog-sync.ts:77`），而 `overlayLiveCapabilities` 返回 `{ ...saved, ...overlay }`——saved 的 `promos` 原样留下，live 的被整个丢掉。这与 `src/promo.ts` 文件头「徽标是时钟的函数，不是抓取的函数」直接矛盾：它冻在了**保存**时。
+  - **修法**：`promos` 改为 live-owned，但**不能**复用 `LIVE_OWNED_FIELDS` 那个循环（它只写 live 有值的字段，无法表达「清除」）。改为在 `overlayLiveCapabilities` 里单独处理：live 有 `promos` 就整体覆盖；live 没有就**按 key 删除** saved 的那份（不能用 `undefined`——显式 `undefined` 会存活 `structuredClone`，并被设置写入路径的严格 JSON codec 整单拒绝，与 `busyLevel` 的处理同理）。
+  - **验证**：`tests/catalog-sync.spec.ts` 新增 5 条覆盖四个方向 + 直接调用 `overlayLiveCapabilities`。变异验证：让 `promosDiffer` 恒为 false → 4 条变红。
+  - **已知未改**：`catalogFingerprint` 仍不含 `promos`，`lastCatalog` 里那份 `promos` 现在是纯冗余。持久化形状的调整会牵动严格 JSON codec 的历史教训，留待另议。
+
+- **配置区渲染失败时页面一片空白，无法与「插件没装上」区分（issue #139 的报告者正是被这一点拖住）。**
+  - **症状**：宿主 `SlotErrorBoundary` 的失败面是**空** `<div data-slot-error>`，只留一行 `console.error`。issue 贴的 `slot entry crashed in 'plugins.bundle.config': value.trim is not a function` 与该边界逐字吻合。
+  - **修法**：在卡片 **body** 层包一层 `CardBodyBoundary`（**不含 header**——配置区崩了也要能折叠/展开，且 header 是纯静态标记，不可能是抛错源）。失败面显示「配置区渲染失败」+ **错误摘要原文** + 一句「模型服务本身未受影响」，并照旧 `console.error`（含 `componentStack`），因此**不遮蔽**任何本该暴露的错误。
+  - **边界条件**：`SlotAssemblyError`（宿主装配故障）**原样重抛**，不降级——把响亮的装配错误变成安静的「配置失败」是错的。
+  - **范围声明**：React 边界只捕获 render / 生命周期 / 构造期错误，**不捕获**事件处理器、定时器与 promise 回调里的抛错；那些路径仍按原样呈现。本次崩溃发生在 render 期（栈顶 `promo.ts:263`），落点正确。
+  - **验证**：直接渲染抛错的子组件，确认失败面出现、摘要为 `value.trim is not a function`、且 `console.error` 被调用。
+
+- **上游发布了活动时段却一条都读不懂时，徽标静默消失，界面上没有任何解释。**
+  - **症状**：`dailyUnusable` 让该活动按「永不运行」处理（正确），但用户看到的是徽标不见了——与「活动已结束」无法区分。**这才是上游将来改格式时用户真正会遇到的症状**（不崩，静默消失），而 issue 猜的是崩溃。
+  - **修法**：诊断栏的 `row.diagFailures` 行计入 `promoUnreadable`，显示「N 条活动时段读不懂 —— 徽标已隐藏」。`dailyUnusable` 本来就已传到客户端，只是从未显示过。
+  - **验证**：`tests/promo-card.spec.tsx` 新增 2 条（有 `dailyUnusable` 时诊断行出现且不画徽标；全部可解析时该行不出现）。变异验证：删掉该行 → 变红。
+
+- **`parseDaily` 丢弃窗口时完全静默，上游改格式在日志里也留不下痕迹。**
+  - **修法**：丢弃时打一行 `console.warn`，带活动 id 与端点的 `typeof`（`number` 单独命名，因为它正是未来格式变更可能的样子）。
+  - **位置是刻意的**：日志打在**宿主侧** `parseDaily`（每个上游文档跑一次），**不是**客户端 `withinDailyWindows`（卡片每 60s 轮询、每个模型每轮都重算，打在那里会变成每分钟几十行）。
+  - **不泄露上游内容**：只报 `typeof`，不回显原始值。
+
+## 5.8.5 (2026-10-24)
+
+> 安全与健壮性版本：给设置卡片的 13 条路由（10 条 POST + 3 条 GET）补上缺失的 `Host` 校验（DNS-rebinding），并让测速探针不再发送一个自造的档位值。**发往上游的请求体、provider 注册、凭据、计费与换号规则一律未变**——唯一的上游侧行为变化是测速请求少了一个字段；入站侧（本插件对浏览器请求的接受范围）**确有变化**，见下文两条：Host/Origin 判据的扩展与空 Origin 的统一。
+
+### Fixes
+
+- **测速探针硬编码 `reasoning_effort: 'none'`，导致部分模型的速度永远测不出来。**
+  - **症状**：在 global 区对 `gpt-6-astra`（以及其它拒绝该字面量的模型）点「测速」，三次采样全部失败，卡片显示无速度；同类模型在 CN 区正常。
+  - **根因（推论，不是本仓实测）**：`src/tps.ts` 的 `tpsProbeRequestBody()` 无条件带上 `reasoning_effort: 'none'`，而 `none` 不是任何模型目录声明过的档位值（`supportedEfforts` 只有 low/medium/high/xhigh/max），属于我们自造的拼写。**本仓库没有记录过任何模型对该字面量的反应**——这条结论来自对一个社区分支（`longge1213812138/dsh-workbuddy-connect`）源码的阅读，其注释称 `none` 被 GPT-5.6 家族与 GLM 接受、被 `gpt-6-astra` 拒绝，我们未复测。已知的相邻事实只有 `src/off-thinking.ts` 记的「10 个模型拒绝字面量 `off`，而省略该字段全数返回 200」。因此这个修复的**确切收益是「不再发送一个自造的、未经验证的档位值」**，而不是「修好了一个已证实的 400」。
+  - **修法**：**不发这个字段**，而不是换一个拼写。依据是 `docs/reasoning-investigation.md` §4/§5 的两网关实测：请求不带 `reasoning_effort` 时上游返回 **0 个思考字符**——注意那批实测覆盖的是单数 `effort` 形态的模型（deepseek / hy3 / kimi / minimax 一类），**不含 `gpt-6-astra`**，所以对后者「省略即零思考」是合理推断而非已证事实。结论上仍然成立：不思考本来就不需要任何拼写，而任何拼写都可能被某个模型拒绝。注意这与 `dropRefusedReasoning()` 只是**结论**一致，不是同一段代码——那个函数只对 `REFUSES_OFF_MODEL_IDS` 名单内的模型删字面量 `'off'`，TPS 根本不经过它。
+  - **验证**：`tests/tps.spec.ts` 的断言从 `reasoning_effort === 'none'` 改为 `'reasoning_effort' in body === false`，并把模型 id 换成 `gpt-6-astra` 且额外断言 `body.model` 确实进入请求体——这样这条用例描述的是「该模型 + 无该字段」这个组合，而不是任意 id 都成立的巧合。用 `in` 而不是 `=== undefined` 是有意的：后者在「忘了做决定」的 body 上也会通过。变异验证：把字面量加回去 → 该条变红。
+
+- **设置卡片的 13 条路由（10 条 POST + 3 条 GET）只校验 `Origin`、不校验 `Host`，DNS-rebinding 页面可以打到其中的读路由。**
+  - **症状**：安全缺口，无用户可见现象。**真实的暴露面是 3 条读路由**（`usage` / `account-credits` / `cli-live`）——浏览器对同源 POST 一定带 `Origin`，所以 rebinding 页面打 10 条 POST 时会被旧的 Origin 门拒掉；而同源 GET 不带 `Origin`，旧门直接放行。修复价值真实，但「13 条写路由全可被打」的说法不成立。
+  - **根因**：回环判定被写了两份。`src/shim.ts` 的 chat 路由有 `hostIsLoopback` + `originIsLoopback` 两道门，而 `src/web-status.ts` 的 13 条卡片路由只有 `originIsLoopback`（名为 `loopbackOrigin`）。**Origin 挡不住 rebinding**：攻击页面由攻击者域名提供，浏览器把**那个域名**写进 `Host`，socket 却落在 127.0.0.1，于是一条只查 Origin 的 GET 路由会放它过去。这个缺口在 `docs/UPSTREAM-0.7.0-REVIEW.md:27` 早有记录，不是新发现；两份实现各自内部一致，是这次抽共享模块才把差异摆到一处。
+  - **修法**：把回环判定抽到新模块 `src/loopback.ts`，shim 与 web-status 共用同一份；13 条路由统一改走 `requireLoopback(req, res)`，即 Host + Origin 两道门，拒绝时分别回 `host-not-trusted` / `origin-not-trusted`。**缺失 `Host` 一律拒绝**（HTTP/1.1 要求该头，在能花积分面上不值得网开一面）；**缺失 `Origin` 仍然放行**（这正是插件自己 fetch 与 curl 的形态，拒了会打断插件自身调用）。
+  - **Host 判据不是「必须是回环」，而是「必须是本机地址」**（`hostMatchesListener(host, req.socket.localAddress)`），且「本机」包含整个 IPv4 回环段 `127/8` 与本次连接落在的那个接口。这一点是审核阶段两次纠正的：初稿只认 `127.0.0.1`/`localhost`/`[::1]` 三个字面量，而**宿主实际运行的 0.2.1-rc.3 虽然拒绝 wildcard 绑定（其报错原文要求「bind one concrete IPv4 or IPv6 address of a local interface」），却允许绑定任意一个具体的本机地址——包括局域网 IP**；宿主自己的信任层就接受「监听绑定的那个 IP 字面量，任意端口」。只认回环字面量会把这类部署的 3 条**读路由**从「可用」打成 403（10 条 POST 在旧代码下本来就因 Origin 是局域网地址被拒，所以回归面只在这 3 条 GET）。`localAddress` 是连接实际落到哪个接口的事实，攻击者伪造不了：rebinding 的 Host 是攻击者域名而连接落在 127.0.0.1 或某个本机地址，两者不等即被拦下。`0.0.0.0` / `[::]` 显式排除（bind 通配符，不是客户端会合法发出的地址）。**同时把 Host 与 Origin 两条路径的「本机」判定统一为同一个 `isLocalHostname()`**：此前 `127.0.0.2` 与尾点（`localhost.`）在两条路径上给出不同答案，同一个概念两套解析必然漂移。
+  - **审核阶段自查出的一处实现缺陷（已修）**：初版 `hostMatchesListener` 直接用 `hostname === localAddress` 比较，于是当两侧都是同一个**主机名**时也返回 true。生产环境里 `localAddress` 来自 socket、永远是 IP 字面量，所以这不是可达的漏洞；但它把「比较两个地址」写成了「比较两个字符串」，一旦有人把主机名传进来（测试替身、未来某个代理头），门禁就会静默放宽成「只要名字相同就放行」。现在右侧必须是 IP 字面量才参与比较，答案重新变成关于地址的判断。同时处理了 IPv6 的括号差异（Host 带括号、`localAddress` 不带）。
+  - **Origin 判据同步对齐（审核发现的「只修了一半」）**：Host 判据升级为「本机地址」后，`originIsLoopback` 仍只认回环，而真实局域网浏览器对**同源 POST** 一定发 `Origin: http://192.168.1.5:3000` ——于是 Host 门放行、Origin 门拒绝，10 条写路由（签到 / 测速 / 探针 / 保存模型 / OAuth / 转存 / 账号池）对局域网部署仍然全 403。初版的一处测试把 LAN 场景写成「只有 Host、没有 Origin」，恰好让这个缺口躲过了自己的测试。现在 `originIsLoopback(origin, localAddress)` 与 Host 复用同一套 `isLocalHostname` + `hostMatchesListener` 判定（只比 hostname，不比端口——Origin 永远带页面端口而 `localAddress` 不带），LAN 测试的 fixture 也补上了真实浏览器会发的 `Origin`。变异验证：把 Origin 门改回不传 `localAddress` → 该条立即变红。
+  - **已知限制（未能消除，两条）**：
+    1. **任何主机名形式的访问都会 403**，不只是 `trustedHosts` 里的域名——`my-mac.local`（mDNS）、反向代理域名、自定义 hosts 条目都算，因为判据只认 IP 字面量与 `localhost`。插件无从知道某个任意域名指向本机，也不该去猜；要用域名访问就得让插件路由进入宿主的信任层，那是另一个改动。
+    2. **Origin 只比对 hostname，不比对端口**。同主机其它端口上的页面会通过 Origin 门。这不是本次能消除的威胁（那需要本机已运行代码，等价于本地权限），且反向代理常常在另一个端口终结 TLS、再转发到本机的本端口，比对端口会误伤这类部署。这一取舍写在 `src/loopback.ts` 的注释里。
+  - **一处有意的语义统一**：空字符串 / 纯空白的 `Origin` 从「拒绝」变成「放行」。旧 `web-status` 只判 `origin === undefined`，而 shim 的实现一直判 `origin.trim() === ''`——两个文件对同一件事有两种答案，正是这次重构要消除的分裂，所以统一取 shim 的语义。安全性无变化（浏览器对 http(s) 请求不可能发空 Origin，能发空 Origin 的非浏览器客户端本就伪造得了 Host），在此记录以免日后被当成缺陷。
+  - **这不是认证，也没有更硬的第二道防线**：两者都能被本机进程、或被任何能连到该端口的对端伪造。它挡的是「外部页面里的浏览器」（浏览器替我们决定 Origin，rebinding 又过不了 Host 比对），挡不住「已经能对这个端口开 socket 的程序」。**`src/web-status.ts` 里没有任何按路由的密钥**——`req.headers` 只读 `host` 与 `origin` 两个字段。所以会花积分、会返回 token 材料的路由与只读路由受同等保护，一旦把监听绑到非回环地址，这些路由就等于对局域网开放。这是整个面的性质，不是本函数能解决的；审核阶段发现初稿把「已有进程内密钥」当成了既有防线，那是错的，已删。
+  - **验证**：路由级逐条用例（13 条路径的表驱动块，含「注册集合与表一致」的守卫断言，并断言每条 403 来自门禁而非上游、且上游计数器为 0）与 5 条专项用例——恶意 `Host` → 403 且 `error: 'host-not-trusted'`；完全无 `Host` → 403；四种合法回环 `Host` → 200（**正向对照**，没有它前两条在「全拒」的实现上也会通过）；局域网 `Host` + 同接口 `localAddress` → 200（**证明 0.0.0.0 回归已消除**）；局域网接口上伪造 `Host` → 403。另有 `tests/loopback.spec.ts` 29 条单元用例覆盖两个判据本身。变异验证三次：删掉 Host 那一支 → 2 条红；把判据退回「只认回环」 → LAN 放行那条红；删掉 Origin 那一支 → Origin 门禁条红。
+  - **顺带修掉一个既有缺陷**：`hostnameOfHost()` 对 `[::1]evil.example` 这种「方括号回环前缀 + 任意尾巴」的输入会截成 `[::1]` 并判为回环——也就是说它把**外来源**读成了本机。真实浏览器不会发这种 Host，但这是安全边界，解析器应当 fail closed 而不是抢救前缀。现在方括号后只允许空或 `:<数字>`，其余一律整串返回（不匹配任何回环名）。这个缺陷此前一直躺在 `shim.ts` 里，抽出共享模块时才暴露出来。
+  - **代价**：测试替身需要补 `host` 头（5 个调用点 + 新增的 loopback 单测），因为它们此前构造的是浏览器**永远不会发出**的请求形态。这是修 fixture 而不是放宽实现。
+
+### Docs
+
+- **修正注释里一句与代码不符的描述（issue #138）。** `WorkBuddyModelLabel.tsx` 的文件头写着本组件「renders nothing at all for a provider that is not ours」，但它实际返回 `<span>{model.name}</span>`——**渲染纯目录名**，只是不去装饰。
+  - 这不是纯文字问题：该槽是 `kind: "single"`，**占位由注册决定，与组件输出什么无关**，所以返回 `null` 也不会释放格子。那句注释让「丢掉别人的装饰」这个代价看起来无害，issue #138 报告者正是引着它来论证，并在外部把它当成了 bug。
+  - **行为一行未改**：保留 §零 的取舍（不做联动、不读别人的注册、`-0.5` 优先级），也**不加**「不占用模型标签槽」开关、**不做**按 provider 动态注册。理由是注册是全局一次性的而 `provider` 是逐行传入的，动态注册会造成空格闪烁并引入对宿主选中状态的观察；这三条处置与理由已写进 `docs/DESIGN.md` §零，供下次讨论直接引用，不必重新论证。
+  - 三处注释同步：`WorkBuddyModelLabel.tsx` 文件头（说清「渲染纯目录名 ≠ 什么都不渲染」）、`WorkBuddyModelLabel()` 里那个 `return <span>` 分支（说清代价发生在这行）、`index.tsx` 的 `registerModelLabel` 上方（说清代价由宿主 1017 的行承担，且这是 §零 的价格而非缺陷）。
+  - 守卫测试的 docblock 也补了对应关系：`tests/model-label-slot-coexistence.spec.tsx` 那条 `renders the plain catalog name for a foreign row` 的 fixture 正是宿主的 1017 行（`deepseek-official` + `deepseek-flash` + `DeepSeek-V4.1-Flash`），断言 `<span>DeepSeek-V4.1-Flash</span>` 且不含 `1017` —— 它就是 issue #138 的机器可验证形式。
+
+## 5.8.4 (2026-10-24)
+
+> 修复版本：热重载一次之后设置卡片上一半按钮永久 405 的那一格（issue #86）。根因不是「宿主在跑旧代码」——是 `benefit/claim` 路由的 disposer 从未被调用，泄漏的路由让**下一次**热重载在它身上抛错，于是排在它后面的 8 条路由一条都没注册上。**请求路径、provider 注册、凭据、计费与换号规则一律未变**；改动是 cleanup 列表里的一行。
+
+### Fixes
+
+- **`benefit/claim` 路由的 disposer 从未被调用，热重载一次之后卡片上一半按钮永久 405 空响应（issue #86 的真正触发条件）。**
+  - **症状**：设置卡里点「一键签到」「一键测试」「删除」「扫码登录」「保存」等按钮，报「批量操作接口没有应答（HTTP 405，无响应体）」，或扫码登录报 `登录失败: Failed to execute 'json' on 'Response': Unexpected end of JSON input`。模型本身照常能用——坏掉的只有卡片上的这些接口。
+  - **判定**：插件每个 handler 都回 JSON，**包括它自己的 405**（`json(res, 405, {error:'method not allowed'})`，带 `Content-Type` 与 body）；宿主 HTTP 层回的 405 **没有 body**。所以「405 + 空 body」= 该路径在宿主路由表里根本不存在。
+  - **根因**：`registerWorkBuddyStatusRoute()` 里 13 条路由都写成 `const disposeXxx = ctx.webServer.register({...})`，**唯独 `benefit/claim` 那条声明了 `disposeBenefitClaim` 却没把它放进 cleanup 列表**（`tsc` 不报错：`noUnusedLocals` 未开）。宿主 `WebServer.register()` 对同一 `(kind, path)` 第二次注册**直接抛错**（`webserver: duplicate exact route "…"`，已核 `@deepseek-ai/dsh-host-webserver/lib/index.js:328`），且路由只在 disposer 运行时才从表里移除。于是：第一次挂载 → `benefit/claim` 泄漏；热重载再挂 → 按注册顺序走到它撞上重复路径 → 抛错 → 整个 `ctx.effect` 回调中断 → 排在它后面的 8 条路由（`models/refresh`、`probe`、`tps`、`pool`、`__save`、`oauth`、`transfer`、`cli-live`）一次都没注册上。
+  - **这解释了 issue #86 里「具体触发条件未复现」的那一格**：触发条件不是启动时序，是**热重载过一次**——只有第二次挂载才会撞上第一次的泄漏。所以「重启即恢复」只是把泄漏的那一份清掉，下次热重载再复发，这正是它看起来像「偶发」的原因。
+  - **修法**：把 `disposeBenefitClaim()` 补进 cleanup 列表，与其余 12 条对称。一处一行。并在 cleanup 列表处补注释说明「每条注册都必须在此出现」，因为这个缺陷的代价不是多一个 handler，而是让下一次挂载丢掉一半路由。
+  - **验证**：新增 3 条回归用例（`tests/web-status.spec.ts` → `registerWorkBuddyStatusRoute re-mount (issue #86)`），用一个**按宿主真实语义**的 `webServer` 替身（同路径第二次 `register` 抛错、只有 disposer 才移除）——宽松的替身会带着 bug 一起通过，所以这条属性必须照抄。变异验证：注释掉 `disposeBenefitClaim()` → 2 条变红并复现同一句 `webserver: duplicate exact route "/plugins/dsh-connect-workbuddy/benefit/claim"`。
+  - **代价**：无。请求路径、provider 注册、凭据、计费与换号规则一律未变。
+
+## 5.8.3 (2026-10-24)
+
+> 体验版本：把 #132/#133 那几项「只能手改 `cordis.patch.yml` 才生效」的开关搬进插件卡片，用户可以直接勾选，不用再编辑 profile 里的 YAML、也不用知道那个文件在哪。**请求路径、默认字节、计费行为均未改动**：四个开关的默认值与采样时机与 5.8.0 完全一致（三个布尔默认关闭），这次只新增了一条写入它们的 UI 路径。
+
+### Features
+
+- **上游标识开关进入设置卡片（#133 建议 2/3）。**
+  - 卡片「能力」页新增一组开关：`usageIdentity`（让用量页把调用记成官方客户端的样子）、`keepPromptLast`（让用量页记录你真正输入的话）、`sessionTitle`（会话标题请求改用轻量模型）。这三项此前只存在于 `cordis.patch.yml`，用户要手改 profile 里的 YAML 才知道有这个功能。
+  - 每个开关都带一行说明和一个「改完需重载插件或重启 DSH」的统一提示——这四项都在插件挂载时采样进 shim，配置改了但没重载就看不到变化。`sessionTitle` 开启时额外显示当前目标模型（只读：该 id 仍由 `sessionTitle.model` 配置，不在这里做第二个未经校验的编辑入口）。
+  - `extraInjectedPrefixes` **故意不给输入框**：它是一个字符串数组，塞进复选框形状的 UI 只会比配置文件更难用。改为在 `keepPromptLast` 开启时**报告**当前生效条数，让手写过前缀的用户能确认插件确实看见了。
+  - 新增 Host 端点字段：`__save` 现在接受 `usageIdentity` / `keepPromptLast` / `extraInjectedPrefixes` / `sessionTitle` 四个顶层字段，各自 `set` 自己的路径。**不是**塞进 `cliBridge` 块：那四项管的是所有 provider 共享的请求形态，塞进去会让「关掉 CLI 路由」看起来像把它们一起重置了。
+  - 写入沿用既有两条写入器（Host 端点优先、设置作用域兜底）：该命名空间的浏览器镜像在有问题的 0.1.7 部署上被文档标注为陈旧，只「看起来翻过去了」的开关正是「关闭不了」那一类报告。
+
+### Tests
+
+- 新增 [`tests/card-upstream-switches.spec.tsx`](tests/card-upstream-switches.spec.tsx)（9 条）：三个开关按**已提交值**渲染、缺省一律读成 OFF（不是「truthy 就算开」）、翻动只写**本字段**、`sessionTitle` 写入保留 `model`（它的字段是对象，退化成布尔就会把用户设的目标模型抹掉）、POST 到 Host 端点、以及重载提示必须在屏上。读取器另有 3 条单独测（volatile 的 `{get()}` 解包、`sessionTitle` 的缺省/畸形回退、前缀列表的去空去重与非数组防御）。
+- [`tests/web-status.spec.ts`](tests/web-status.spec.ts) 增 3 条端点用例：四个字段各自只写自己的路径、白名单外的字段被 400 拒绝且不触达设置服务、期望对象的字段收到标量时拒绝。
+- 变异验证：把 `sessionTitle` 的写入退化成裸布尔 → 1 条红；把「缺省读 OFF」改成「缺省读 ON」→ 4 条红；把新开关的 class 改回 `.dsm-workbuddy-pref-check` → `card-credits-switch` 5 条红（它按「卡片里只有一个」读那个类）。
+- 完整套件 **2268 通过 / 2 条按平台跳过**（此前 2256），`typecheck` 与 `build` 通过。
+
+### Docs
+
+- 卡片文案中英双语同步新增 8 条 key；`styles.ts` 补上两个新 class 的定义（`client-host-contract` 的「每个渲染出的 class 都必须有样式」守卫要求）。
+
+## 5.8.2 (2026-10-24)
+
+> 适配版本：跟随宿主 `0.2.1-rc.3`。rc.2 在 web-app 捆绑里新增了官方插件 `@deepseek-ai/dsh-client-ui-deepseek-model-label-1017`（给 DeepSeek 官方 Flash 行画「1017」发布徽章），它与本插件注册**同一个 `single` 槽**、**同一个默认优先级 0**——于是本插件的注册**抛错**，模型选择器里的负载徽章**静默消失**。本版修掉这一处，其余全部兼容。
+
+### Fixes
+
+- **模型选择器的标签槽位不再与宿主自带的 1017 徽章插件抢同一格（0.2.1-rc.2+）。**
+  - 该槽是 `kind: "single"`，`SlotCore.register()` 对同一优先级上的第二次注册**直接抛错**：`single slot "conversation.input.model.label" already has a registration at priority 0 … (lowest renders)`。两个插件都用默认 `0`，谁后注册谁抛。实测是本插件抛——应用自己的崩溃日志里逐字记着这句，以及本插件的 `model label slot failed to register`。因为 `catch` 只 `console.error`（刻意的：标签失注册不该让整页挂掉），页面上**只是徽章不见了**，没有任何可见报错，所以一直没被发现。
+  - 修法只做一件事：**换一个不碰撞的优先级**。`-0.5`（分数优先级合法）与宿主的默认 `0`、以及 `dsh-connect-qoder` 占用的 `-1` 都不碰撞，三个插件于是排成 `-1`（qoder）→ `-0.5`（本插件）→ `0`（宿主 1017）。取值只要求「不与别人碰撞」，不需要知道别人用了几。
+  - **刻意不引入插件之间的联动**（项目不变量，见 [`docs/DESIGN.md`](docs/DESIGN.md) §零）：不读 `slots.entries(...)` 枚举同槽的其它注册、不把别家的行「转交」给别的插件的组件渲染、不为对方合成 `t` 席位、不依赖别人的优先级。曾经的转交方案能算「更客气」，但它要代渲染器合成对方的 props（`t` 来自对方注册时声明的 `locale:` 命名空间），还得约定一条跨插件转交方向否则递归——实测两个插件都转交时同一行被来回传递，直接 `RangeError: Maximum call stack size exceeded`。这不是本插件该承担的责任，整体撤除。
+  - **代价（已接受并记录）**：该槽是 `single`，一格只有一个赢家。「最低优先级渲染」意味着 `-0.5` 实际上**赢过**宿主的 `0`，因此本插件赢下该格时，别的插件在**它自己的行**上的装饰不会被合成（宿主的「1017」徽章不会出现在本插件渲染的那一行）。不是自己的模型行，一律给宿主契约的下限 `model.name`。这是**放弃联动换来的确定性**，不是待修缺陷；要改成联动，先改 `DESIGN.md` §零。
+  - **取值 `-0.5` 的定夺依据（不需要用户来选）**：宿主一方早有书面立场——`dsh-client-ui-deepseek-model-label-1017` 的 README「Known Limitations and Deferred Work」逐字写着「the two presentations do not compose automatically」，并把处置办法写成**在 profile patch 里禁用它**（配置层，不是运行时协商）。所以「两个徽标不合成」是宿主的官方立场，本项目的 §零 不变量与之一致。其余三条：1017 的 package description 就是「**Temporary** 1017 release badge」，README 承诺结构化发布标签上线后移除该包；它只装饰**一个**模型（`DeepSeek-V4.1-Flash`，限 `deepseek-official`/`deepseek-account` 两条线路），而本插件装饰**自己全部 WorkBuddy 模型行**（负载等级、促销价、夜间折扣、新模型标记）；`single` 槽「最低优先级渲染」，`-0.5` 实际赢过宿主的 `0`——但选它是为了**不碰撞**而非谦让，且 1017 被移除后本插件自动成为该格唯一占用者。
+
+### Docs
+
+- 新增 [`docs/DSH-0.2.1-RC3-FOLLOWUP.md`](docs/DSH-0.2.1-RC3-FOLLOWUP.md)：rc.3 复核全文，含逐面包比对与本次回归的完整证据链。
+- [`docs/DSH-0.2.1-RC1-FOLLOWUP.md`](docs/DSH-0.2.1-RC1-FOLLOWUP.md) 补 §2.4 **订正**：原文把「rc 宿主上照常加载」归因为「闸门只校验 `@deepseek-ai/dsh*` + profile 用 `link:`」，**这是错的**——闸门确实校验，只是用 `semver.satisfies(rt, range, { includePrerelease: true })` 放行。范围本身无需改（裸 semver 判 false 的事实仍成立）。
+
+### Tests
+
+- 新增 [`tests/model-label-slot-coexistence.spec.tsx`](tests/model-label-slot-coexistence.spec.tsx)（6 条），跑**真实的 `SlotCore`**：宿主 1017 在场时注册不抛错、优先级与 `-1`/`0` 均不碰撞、自家行仍有徽章；外加「不做联动」一组——别家行只给纯目录名（**即使**另一个贡献者就在账本上）、源码不得出现 `slots.entries(...)` / 渲染别家组件 / `locale.bind`、注册只声明自家常量。
+- 变异验证：把 `MODEL_LABEL_PRIORITY` 改回 `0` → 多条红并**复现同一句崩溃原文**；把注册换成会读账本的写法 → 「不做联动」那组红。
+- `tests/dsh-line.spec.ts` 里「已知预发布悬崖」的注释按实测订正归因（断言本身不变，仍钉「裸 semver 判 false」）。
+- 完整套件 **2225 通过 / 2 条按平台跳过**（此前 2219），`typecheck` 与 `build` 通过。
+
+## 5.8.1 (2026-10-24)
+
+> 修复版本：解决 DSH 会话在国内区**每一步**都 `400 / 11128` 的死循环。根因不是账号、额度、网络，也不是「宿主提示词要你改」——是插件的救援梯子对网关的**精确子串门**有一个可证明的盲区：`You are a coding agent powered by <model> model.` 这条 agent 身份从句，稀疏零宽扰动打不到，于是每次请求都逐字节原样上线被拒。**凭据、计费、provider 注册均未改动**；请求路径新增的定向破坏只插不可见字符（实测真实提示 **+0.26% 字节**），不改模型读到的任何一个词。
+
+### Fixes
+
+- **DSH 提示词里的 agent 身份从句现在在请求路径就被破坏，不再等被拒（#125 / `workbuddy2api-hub` #533）。**
+  - 两条独立实测指向同一机制：网关对被扫的 `system` / `assistant` 消息做的是**大小写不敏感的精确子串匹配**（不只是开头前缀），活的 DSH 提示词里有**三处**这样的 span——`You are an AI agent powered by DeepSeek Harness.`、`You are a coding agent powered by the <model> model.`、`You are interacting with the user through the DeepSeek Harness Web GUI …`——且**三处全改才 200**（「只改任意一两处不够」）。
+  - 盲区在第二处：它**没有相邻大写词对**（`WORD_INTERNAL_BREAK` 打不到）、**没有逗号/分号**、句末那个 `.` 又落在被禁子串**之后**（句读规则也打不到）。所以 5.7.0 的稀疏扰动清掉了第一、三处，却把第二处原样发出——那条请求于是一直 400，而错误回显把它标成「不在插件已知名单里」，反而把人引去改一条根本没问题的宿主提示。
+  - 修法是在 `prepareChatBody()` 里新增定向破坏 `breakIdentityClauses()`：在身份从句的**每个内部词界**后插一个 U+200B。实测三处 span 全部失配、**模型读到的每个词都不变**（与 #533 那条把 `powered by` 改写成 `built on` 的做法不同——那个会动措辞），真实 10,818 字提示只 **+0.26% 字节**（~28 个字符），足够便宜到无条件跑。前缀名单（`UNAPPROVED_CHANNEL_OPENINGS`）与它各司其职：名单管 offset 0 的前缀门，从句破坏管任意位置的子串门；顺序是**先补中性头、再破坏从句**，否则从句里的 U+200B 会让前缀谓词匹配不上、连累中性头这级防线（有测试钉住这个顺序）。
+- **删掉 `perturbChannelFingerprints()` 的粗粒度幂等保护，改由各规则自身幂等（同上）。**
+  - 那句 `if (text.includes(U+200B)) return undefined` 原本是防重试叠加零宽。但请求路径现在**本来就会**先放几个 U+200B 进去，这句粗判会让整个梯子从第二级起**永久空转**——连 dense 兜底都被它挡掉，等于救援彻底失效。
+  - 幂等改由各规则自己保证：拉丁句读/逗号规则锚在尾随 `(\s+)` 上（U+200B 不是空白，已断的句子自然不再匹配）；CJK 句读规则没有尾随空白可锚，**补 `(?!\u200b)` lookahead**，否则每次重试都会在 `。！` 后叠一个零宽；`breakIdentityClauses()` 靠 `\s+` 不匹配 U+200B 而自然幂等。三条各有测试。
+- **`channelPerturbation: "always"` 从推荐手段降级为边缘手段。** 定向破坏已用 +0.26% 覆盖三处已知 span，密集扰动（+70.7%）只剩「出现定向破坏与稀疏都打不到的**未知** prose 指纹」这一种理由。默认仍是 `failure`，README 与 `docs/DESIGN.md` 的措辞同步改了，不再建议普通用户开 `always`。
+
+### Docs
+
+- [`docs/DESIGN.md`](docs/DESIGN.md) 渠道门一节新增两条要点（定向破坏的动机与实测成本、幂等保护的取舍），并订正「`always` 是唯一可靠手段」这句已过时的说法。
+- [`docs/CHANNEL-FINGERPRINT-RESEARCH.md`](docs/CHANNEL-FINGERPRINT-RESEARCH.md) 补 `§6.2`，记录本次落地如何比原建议 1/3（直接上密集扰动）更省，以及为何 `always` 降级。
+
+### Tests
+
+- 新增 [`tests/identity-clause-break.spec.ts`](tests/identity-clause-break.spec.ts)（13 条）：三处 span 全部失配、词不变、成本上界（<40 字符）、大小写/换行/任意空白、自然幂等、普通对话逐字节不变、assistant 历史也被破坏、`user`/`tool` 不动、以及移除粗判后三条扰动规则各自的幂等（含 CJK lookahead）。
+- 因身份从句现在在请求路径就被破坏，`issue98` / `issue98-shim` / `upstream` 里几条钉「旧字节形态」的断言改为钉**不变量**（去掉 U+200B 后与宿主原文一致、前缀门仍补中性头、扰动仍是纯附加），并逐条加注释说明旧断言为何不再成立——包括 `upstream.spec.ts` 那条曾断言「中段指纹逐字节不变」的测试，它编码的正是 #125 证伪的那个信念。
+- 完整套件 **2218 通过 / 2 条按平台跳过**（此前 2205），`typecheck` 与 `build` 通过。构建产物用「故意破坏源码、只留 `lib/`」的方式独立复验，确认定向破坏确实进了包（运行时对真实形状 prompt 报 0 处 span 存活）。
+
+## 5.8.0 (2026-10-24)
+
+> 特性版本：把 `11128` 渠道拒绝与 `11140` 内容/账号限制**真正分开**（此前整族被误判成同一件事），补上企业/教育账号在账号池里丢失的身份标记，修掉「设置已落盘、按钮却永远卡在保存中」，并按 #132 提供与官方客户端一致的请求标识。**凭据、计费、provider 注册与默认发出的字节均未改动**：#132 的两项（`usageIdentity`、`keepPromptLast`）都是**默认关闭的开关**——前者只改显示用的请求标识，后者会改变上游会数到的消息顺序，而它们的实测证据来自报告者的账号与 5.3.1 构建、本插件未在真机复现，因此不以任何形式静默上线。
+
+### Features
+
+- **`11128` 不再被当成内容政策拒绝（#127）。**
+  - 11128 家族（渠道未批准 / 会话 id 缺失 / 首条不是 system）与 11140 家族的 `msg` 都可能逐字为 `request illegal`，而 5.7.0 的分类器把这条**裸文本**当成 11140 的标记，于是渠道拒绝被分类成 `policy_reject`：账号池按「内容问题、换号无用」处理，用户看到的建议也是错的。现在分类以**业务码**为准，裸 `request illegal` 标记被删掉。
+  - 11140 的两种语义此前从未被区分：内容政策拒绝（请求级）与**账号被上游限制使用**（`账号存在异常行为…` / `restricted due to unusual activity`）。新增 `account_restricted` 错误类：它**值得换号**（实测 5.7.0 的 `isFailoverWorthy` 只排除 `client` / `model_busy` / `channel_reject` / `model_queue`，所以当时的 `policy_reject` **会**换号——「5.7.0 按换号无用处理」是错的），并把该账号**停权**（`account-restricted`，不进入冷却倒计时）。
+  - **停权的回池路径实测只有一条：手动「测试」该账号。** 账号 id 是 `uin`/`uid` 的 sha256，重新登录后仍是同一个 id，`readPoolProbes` 也不做过期清理，所以重登/导入**不会**清掉这条测量；「只有重新授权才回池」是不成立的表述（review #127 指出后已改正）。上游解除限制之后，在卡片上测一次拿到可用结果，这条测量被覆盖，账号才会重新成为候选。此外停权是**池内候选资格**层面的排除，不是请求级硬闸：全池没有可用候选时，`applyPoolSelection` 会清掉轮换覆盖、请求回到保存的选择，被停权的账号若正是它，仍会计费一次并被拒一次。
+  - 这一分界两处都做了反向测试钉住：`channel_rejected` 不换号、`account_restricted` 换号并写停权（新增 shim 级测试——此前删掉 `isFailoverWorthy` 里的这一类，全套 2196 条测试依然全绿，等于没有守卫）。
+- **对齐官方客户端的请求标识（#132，报告者实测；本插件未在真机复测）。**
+  - 新增 `usageIdentity`（**默认 `false`**）：开启后 chat 请求带上 `X-IDE-Type: CLI` / `X-IDE-Name: WorkBuddy` / `X-IDE-Version`，用量页的「使用端」由此从空白变成 `WorkBuddy`；版本号由 `PRODUCT_UA` 解析得出，不留第二个硬编码数字。**`User-Agent` 两种取值下都不变**——聊天始终以 CLI 通道发送，会话身份三元组绑在这条通道上。默认关的理由见下。
+  - 同一个开关下，**chat** 路径的会话身份三件套改为 **UUIDv7 的 32 位小写十六进制**形态并补 `X-Request-ID`（与 `X-Conversation-Message-ID` 同值，官方客户端也是同值）：网关把这个 id 回显成 SSE 的 `id` 并写进用量页，此前带连字符的 v4 让同一账号的记录看起来像两种客户端。三件套在任何形状下都是**每请求现生成**、互不相同。**生图路径不受这个开关影响**，保持它 2026-10-21 实测过的带连字符 v4：#132 只测了 chat，而生图的 id **格式**从来不是那道闸问的事，不为了用量页好看把它扫进没人测过的形状（这条分界经变异测试确认能失败）。
+  - 新增 `keepPromptLast`（默认 `false`）：用量页的「请求」列取自 body 里**最后一条** `user` 消息，而宿主把时间采样、`Current runtime context.`、`<system-reminder>` 追加在真实 prompt **之后**，于是那一列记的是注入块而不是用户输入。开启后把这些注入块**搬到真实 prompt 之前**——消息数、角色、正文都不变，只有顺序变。唯一的正文改动是剥掉**被记录那一条** prompt 的前导 `<acp …>mNNNNN</acp>` 标记（不剥的话那一列仍然以标记开头，也就没修好），而更早的消息**保留各自**的标记：模型靠它们引用历史，而「正在回答的这条」的编号是唯一不可能被引用的。默认关闭的理由：它改变上游会数到的消息顺序、并删掉真实 prompt 的几个前导字符，升级后不该静默变化；搬移只认实测过的注入前缀，普通对话在没有注入尾块时逐字节不变（含「不剥离标记」这条独立测试）。
+  - 报告者提议的第四项（把会话标题请求改写为隐藏模型 `wb-lite`）**未实现**：它不是格式对齐，而是给每个新会话增加一次真实计费请求，且依赖宿主标题模板的具体前缀。取舍写在 #132 的回复里。
+
+- **余额胶囊会标出新模型（#128，5.7.0 之后合入、随本版发布）。**
+  - 胶囊的模型列表现在会显示「· N 新模型」，并给本机**第一次**见到的模型单独加标记。判定基准是本机记录的目录快照（`roster-seen-store.ts`，doctor 的 `rosterSeen` 一节会打印它的状态与可安全清空的版本号），而不是「比上次请求多了什么」——所以重启、切区域或重新登录都不会把同一批模型反复标成新的。
+  - 只有**真的新增**才计数：目录里消失又出现的模型、以及只有 tier/促销信息变化的行都不算，避免徽标长期亮着变成噪音。
+- **CLI 桥接卡片补上模型/档位/区域顺序的快调选择器（5.7.0 之后合入、随本版发布）。**
+  - CLI 开关下方新增模型、档位与 `regionOrder` 三个快调项，改完即写回配置，不必进设置页翻。`regionOrder` 决定同一账号在 CN / global 两个 provider 之间的尝试顺序，此前只能在配置文件里改。
+
+### Fixes
+
+- **账号池轮换后，卡片上的「当前选用」标在保存的选择上，不是正在计费的账号（报告截图）。**
+  - `current()` 会**先看**池的运行时轮换标记（`rotatedAccountId`），再看用户保存的选择；而 `accounts()` 回答 `selected` 时只看保存的选择。池子把请求轮换到 B 号后，shim 记在 B 号账上，卡片却把 A 号标成「当前选用」——截图里那枚标记落在被限流的号上，而胶囊与行内数字都属于另一个号。
+  - 同一份用量文档还会因此**点名两个账号**：`credential` 取自 `current()`（真正计费的那个），而 `account.accountId` / `accountName` 取自 `accounts()`（保存的那个）。现在 `accounts()` 用与 `current()` **完全相同**的优先级解析标记：有活跃轮换且该账号仍在本地，就标它；轮换指向已消失的账号时与 `current()` 一样回落；其余情况仍按「显式选择 / 默认最新」判断。清除轮换后标记随 `current()` 回到用户自己的选择，轮换本身仍然从不写设置。
+  - 面板里还有第二处同源分裂：行的**底色**读 credits 端点的 `selected`（保存的选择），**「当前选用」文字**读池文档的 `current`（被计费的账号）。池子一轮换，两者就指向不同行——报告者看到的「底色在一个号、文字在另一个号」。现在整行（底色、文字、切换按钮的禁用态）都读同一个答案；`selected` 只在没有池文档时才作为兜底。
+- **新增 `sessionTitle` 开关：把每个新会话的标题请求改到隐藏轻量模型（#132/#133，报告者实测；本插件未复现）。**
+  - DSH 宿主每个新会话发一次标题生成请求，走与对话相同的 provider，按主付费模型费率计费。开启 `sessionTitle.enabled` 后，识别为标题请求的 body（宿主标题模板 `Generate the session title from this JSON array of human messages:` 打头、整条 body 只有这一条 user 消息、无 assistant/tool 消息）被改写到 `sessionTitle.model`（默认 `wb-lite`），并删除 `reasoning_effort` / `reasoning` 字段。报告者实测该模型对这类请求 **0 积分**，但仍是真实上游请求、计入请求数、仅新会话首条触发一次。
+  - 识别依据是**本机安装的 DSH 桌面端 0.2.1-rc.2 `app.asar` 的字节级取证**：请求构造与宿主自己的格式校验器都断言这一模板与单 user 消息形状；宿主 `GenerateOptions.purpose: 'session-title'` 不随 OpenAI 线上协议传输，body 形状是 shim 唯一可用的判据。识别 **fail-closed**：宿主改模板则改写静默停止、回到原计费，普通对话不可能命中（模板前缀须从文本开头匹配，正文引用模板的对话不会被改写——各有测试钉住）。
+  - **默认 `false`**，与 #132 两项同一理由：这笔请求无论改写与否都会发出，但改写改变的是上游把这笔记进哪个计费桶（0 积分 vs 主模型费率），升级后不该静默变化；且 wb-lite 是隐藏模型、能过渠道闸是报告者账号级的实测。目标模型可配置（`sessionTitle.model`），防 id 变化或区域差异；上游拒绝时仅该会话标题失败一次，不影响主对话。识别先用模板的纯 ASCII 头做预过滤（真实标题 body 必含、普通对话几乎不含），开关开启时普通请求不再为识别付一次全量 JSON 解析；预过滤只跳过工作，不改判定（含模板引用的对话仍由完整检测拒绝）。**生效时机**：`sessionTitle` 与 `usageIdentity` / `keepPromptLast` / `extraInjectedPrefixes` 都在插件挂载时采样进 shim，修改配置后需重载插件或重启 DSH（loader 的 volatile 更新不重建 shim）。
+- **`keepPromptLast` 认得 billion-context 注入的两类上下文块（#133）。**
+  - 5.8.0 的注入前缀清单只覆盖宿主自家的三类（时间采样、`Current runtime context.`、`<system-reminder>`），而 billion-context 压缩插件同样以 `role=user` 注入内容：压缩摘要块以 `[Compressed conversation section]` 标题行打头，效率提示以 `This is an efficiency` 打头。开了 `keepPromptLast` 后这两类漏网，被当成真实提问留在末尾，用量页「请求」列随之记错——报告者已在本地产物上逐字节验证此修法并实测恢复。
+  - 注入前缀同时做成**可配置**：新增 `extraInjectedPrefixes`（字符串数组，每项按**字面**前缀匹配、正则元字符会被转义，默认空），压缩插件或宿主将来改文案时不必等插件发版。它只在 `keepPromptLast` 开启时参与匹配，默认行为不变。
+- **企业/教育版账号在账号池里丢失 `enterprise` 标记（#129）。**
+  - 存储层早就算出了 `enterprise: true`，但三个转发点把它丢了：`otherAccounts`、`localPoolMembers`、`poolMembersOf`（`poolTargets` 在 5.6.0 就已带上）。结果企业账号在池卡片上显示一个**根本不存在的「领取」按钮**和一列「签到」，而企业成员点这两样都只会被 `10001` 拒绝。
+  - 现在这三个转发点都带上了标记，池行据此签到列显示「不适用（企业版）」、权益块整段隐藏；领取路由在**发起任何上游请求之前**就用 409 拒绝（`enterprise-account-unsupported`）。**Web 侧只到账号行这一层**：`toWebAccount` 与用量页的池账号行带标记，用量页顶部那个 `account` 对象没有——它这次修的是**名字**（改用 `preferredAccountName`，此前只取 `credential.nickname` 导致企业账号显示为空），不是标记；那里也不渲染签到/领取。输入框胶囊（`workBuddyAccountCredits`）同样不带标记，它不显示这两个按钮，因此没有对应缺陷。
+  - `10001` 这条实测的出处是 **5.6.0** 的企业账号签到记录，不是 5.7.x；**权益读接口照样返回活动（`active: false`）而写接口一律拒绝**这一点是 #129 报告者的观察，本插件没有在真机上复测过企业账号，所以读取结果不能作为「可以领」的依据这一结论仍成立，但它的证据等级是报告者账号级、不是插件实测。
+  - 用量页头部此前只取 `credential.nickname`，displayName 与 enterpriseUserName 都拿不到，企业账号显示为空；现在与池里共用同一个 `preferredAccountName` 顺序（displayName → enterpriseUserName → nickname），两处不再各写一份。
+- **保存账号池偏好后按钮永远卡在「保存中…」（#131）。**
+  - 设置其实**已经落盘并通过回读校验**，卡住的只是随后那次用量刷新：写入与刷新共用同一个 `saving` 状态，而刷新可能因为账号被限制、网络抖动或上游慢响应而迟迟不返回，用户于是看到「没保存成功」的假象，草稿也被锁死。
+  - 现在 `saving` 只覆盖「已校验的设置写入」这一件事：写成功立刻解除 busy 并丢弃草稿，然后 **`await`** 那次回读（不是「再异步刷新」——它是串行等到的，只是结果只影响显示）。这带来一个明确的取舍：回读完成前，卡片上的行还是旧值；`refreshUsage` 失败时不抛而是 resolve，所以「没抛异常」不等于「读到了新值」，旧契约里「保留草稿直到刷新成功」的写法会在这个窗口里拿陈旧的 `saved` 去比对——因此回读结果与保存判定彻底分开。
+  - 刷新失败不影响「已保存」的判定，只显示一条**独立**提示（`row.poolSavedStaleRefresh`：「已保存，但面板未能重新读取。设置已写入；下次刷新后会显示。」），它与「保存失败」是两个节点：前者 `role="status"`、后者 `role="alert"`，不再复用 `row.poolSaveFailed`，也就不会出现「保存失败：已保存，但……」这种自相矛盾的一行。只有写入失败才保留草稿。模型选择的保存路径（`WorkBuddyCard.saveModels`）同步修正。
+- **`/cd` 换过目录之后，CLI 与 `/codebuddy` 仍把 CodeBuddy 拉回创建时的那个目录。**
+  - **症状**：在一个会话里打开 `~/repos/api`，然后用 `working_directory` 工具 `/cd` 到 `~/repos/web`，接着调用 CodeBuddy 或 `/codebuddy`——CodeBuddy 仍然在 `~/repos/api` 里跑，模型在当前上下文里看到的却是 `~/repos/web`。两个入口还互相不一致：工具侧会退到配置里的 `cliBridge.workingDir` 或临时目录，命令侧只有一级、拿不到就直接报错「这个会话没有工作区路径」。
+  - **根因**：两个入口都读 `agent.session.header.cwd`，而 Host 自己的文档把 session header 写成 *detached, deep-frozen creation metadata (format version, cwd, lineage...)*——它是**创建时**的快照，之后再也不更新。活的目录根本不在 header 上：Host 用 `@deepseek-ai/dsh-working-directory` 把它维护成一条 session 投影（`key: "workingDirectory"`，`init: header => header.cwd ?? null`，每次 `working-directory/change` 事件 apply 一次），`/cd` 工具发的就是这种事件。Host 也把这条投影写进模型的系统提示（"Current working directory: ..."），官方插件（auto-review、dsh-tools、user-questions）读的都是投影，不是 header。
+  - **修法**：新增 `DirectoryOf` 依赖，`sessionDirOf()` 优先读 Host 的 `workingDirectory` 投影，读不到（未发布 / 非字符串 / 空白 / 非绝对路径）才回退 `header.cwd`。`resolveWorkingDir()` 的其余四级阶梯与三重校验（`existsSync` / `statSync.isDirectory` / `isInside` 用 realpath 比对）一行未动。
+  - **两个入口同一个裁决器**：`/codebuddy` 改成调用 `sessionDirOf()`，与工具共用同一段逻辑，两边从此不可能再各说各话；都拿不到时的报错文案改为说明「投影与回退都为空」。
+  - **降级是硬约束**：Host 没有发布 `sessionProjections` 时，`cliDirectoryOf` 保持 `undefined`，行为与改动前逐字节一致（`src/index.ts` 里 reactive `inject(['sessionProjections'])` 而非 apply 期采样一次，避免在 Desktop 上重演 tools/commands 被丢的历史）。**故意不回退到投影服务自己的 `defaultDirectory`**——Host 的 `get()` 是 `stateOf ?? defaultDirectory`，而那个值是 `process.cwd()`，照抄等于把「不知道」偷换成「用这个」，是本次唯一不许做的事，测试 `degrades to the configured default, not to the Host process directory` 钉死这条。
+  - **装配顺序缺陷（审核时发现，随本条一并修复）**：`createCliBridgeRuntime` 在 tools/commands 行触发，可能早于 `sessionProjections` 到位；而 `syncCliBridge` 的重建键是序列化后的设置——投影到位时设置没变，重建是 no-op，runtime 里带着 build 时的 `undefined`，投影**永远不生效且无报错**（症状原样保留）。修法：runtime 接的不是值而是**探针闭包** `cliDirectoryProbe`（每回合读当前格），顺序依赖从此消失；投影服务缺席或卸载时格子清零，探针返回 `null`，回退行为不变。测试 `honours a projection that appears AFTER the runtime was built` 钉死这条时序。
+- **行为变化（读投影的必然后果）**：目录阶梯 roots 白名单的第一项现在是**投影目录**（`/cd` 之后的当前目录），不再是创建时的 header 目录。因此显式传 `working_dir` 指向旧目录（header 目录的子树）在 `/cd` 之后会被三重校验拒绝，报错文案会列出当前 roots——这是「会话在哪、CLI 就在哪」的正确形态，不是回归。**凭据、计费、provider 注册与普通请求路径均未改动**；工作目录阶梯的顺序与校验规则不变，只是第一档从「会话创建时的目录」换成了「会话当前的目录」。
+
+### Docs
+
+- [`docs/DESIGN.md`](docs/DESIGN.md) 补充 `11128` / `11140` 的分类依据（**按业务码，不按 `displayTips`，也不按裸 `request illegal`**）、`account-restricted` 的停权语义与它唯一实测的回池路径（手动「测试」），以及「渠道拒绝不换号、账号限制要停权」的分界。
+- `src/cli-bridge/services.ts` 记下为什么读 Host 的 `workingDirectory` 投影而不是 `session.header.cwd`，以及 `stateOf` 同步、无文件系统 IO 这两个性质如何让目录阶梯仍然是 `execute` 的同步第一步。
+
+### Tests
+
+- 新增 11128/11140 分类与账号限制切分（含按信封读码、转义/断行措辞、混合体归属三组反向测试）、企业标记贯穿三个池内转发点与 Web 账号行、领取 409 拒绝、保存后草稿丢弃与陈旧刷新提示（两条 UI 测试原先钉住的正是缺陷本身，已改正）、以及「`selected` 必须跟随 `current()` 的轮换优先级」两条（轮换中只许一个标记、轮换指向已消失账号时回落）；会话身份三件套一节 9 条（默认形状不变 / 开启后的 v7+`X-IDE-*`+`X-Request-ID`+`User-Agent` 不变 / 生图不受开关影响）；`keepPromptLast` 一节 10 条（默认不动、搬移正确、`system-reminder` 与 `<acp>` 形状、**取自真实会话的组合注入形状**、**不重排普通对话**这条反向测试、system 仍居首、只剥离被记录那一条的前导标记、array content 两种形状、无注入块时不剥离）。
+- 完整套件 **2205 通过 / 2 条按平台跳过**，`typecheck` 与 `build` 通过。所有「守卫能失败」的说法都做过变异验证，逐条结果：X-IDE 或三件套改成「无视开关」→ 默认形状测试变红；开关改成永不生效 → 对齐测试变红；生图 `'image'` 改成 `'chat'`、或删掉 `shape === 'chat'` 判据 → 生图守卫变红（这条只有把 identity 真正传进 `imageHeaders` 之后才成立——`shape` 曾经是空转参数，那时改它不会变红，是真的假阳性，已修）；删掉 `isFailoverWorthy` 里的 `account_restricted` → 新增的 shim 换号测试变红（此前全绿）；把 11140 的码判定退回紧凑字面量或退回裸 `11140` 文本 → 新增的「按信封读码」测试变红（分别命中 `spaced: client` 与十六进制假阳性）；让 `accounts()` 重新忽略轮换标记 → 新增的「标记跟随被计费账号」测试变红；把面板的底色改回读 `selected` → 新增的「底色与文字指向同一行」测试变红。
+- `tests/cli-bridge.spec.ts` 增 7 条（该文件 82 条全过）：投影优先于 header、投影为空回退 header、非绝对路径的投影被忽略、不得退到 Host 进程目录（`defaultDirectory`）、`/codebuddy` 跑在投影目录里、投影与 header 都为空时拒绝，加一条时序回归（runtime 先建、投影后发布、不重挂也不改设置，下一回合仍须落在投影目录——把 runtime 接回 build 时的快照值，这条就落回 `header.cwd`，当场变红）。本条并入本版后在 Windows 上重跑：完整套件 **132 files / 2214 tests 全过、0 跳过**（上面两条记录的 2205 与 2 条按平台跳过都落在同一批：那 2 条在本平台不跳），`typecheck`（`tsconfig.json` + `tsconfig.client.json`）与 `tsdown` 构建通过。
+
 ## 5.7.0 (2026-10-23)
 
 > 特性版本：加强 WorkBuddy 渠道校验（`11128`）的三级自愈救援，并改善失败证据回显。**凭据、计费、provider 注册与普通请求路径均未改动**；默认策略仍只在渠道校验拒绝后启用，可选 `channelPerturbation: "always"` 让已确认普通请求必失败的环境跳过无效首轮。

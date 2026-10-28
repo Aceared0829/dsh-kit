@@ -395,6 +395,40 @@ function ensureProfileWorkspaceSettings(profileDir, dryRun) {
   console.log('已写入 profile 设置: ' + wrote.join(', ') + (current === '' ? '' : '（原文件备份为 pnpm-workspace.yaml.bak-dsh-kit）'))
 }
 
+/**
+ * Refuse to finish when a plugin link resolves through one route to the DSH home but
+ * not through another.
+ *
+ * WHY: a profile is reached two ways. The app boots through the configured home
+ * (`~/.dsh`, often a junction) while pnpm installs inside the junction target. When a
+ * `link:` target sits on the same drive as the profile, pnpm stores it RELATIVE
+ * (`..\\..\\..\\..\\deepseek-harness\\plugins\\harness-eval`). A relative link resolves
+ * against whichever path reaches it, so it works through one route and dangles through
+ * the other — the plugin list then shows 包不可用 / 包元信息错误 and the plugin silently
+ * stops loading, while everything still looks installed.
+ *
+ * Converting each dangling link to an absolute junction is the fix; it stays correct no
+ * matter which route the app uses.
+ */
+function auditPluginLinks(home, profile, dryRun) {
+  const script = join(kitRoot, 'scripts', 'check-plugin-links.mjs')
+  if (!existsSync(script)) return
+  const env = { ...process.env, DSH_HOME: home }
+  const result = spawnSync(process.execPath, [script], { encoding: 'utf8', env })
+  const out = (result.stdout ?? '').trim()
+  if (result.status === 0) {
+    console.log(out.split('\n').filter(line => line.trim()).pop() ?? '')
+    return
+  }
+  if (dryRun) {
+    console.log('（演练）检测到会悬空的插件链接：')
+    console.log(out)
+    return
+  }
+  fail('插件链接在一条访问路径上悬空，安装未完成：\n' + out
+    + '\n按上面给出的命令把该链接换成绝对路径，然后重跑安装器。', 3)
+}
+
 function main() {
   const args = parseArgs(process.argv.slice(2))
   if (args.help) {
@@ -467,6 +501,7 @@ function main() {
     const code = runDsh(dsh, ['plugin', '--profile', profile, 'add', ...localAdd], args.dryRun, home)
     if (code !== 0) fail('本地插件链接失败，退出码 ' + code)
   } else console.log('本库插件已链接')
+  auditPluginLinks(home, profile, args.dryRun)
   if (!args.skipShipped && Array.isArray(manifest.shippedOptional)) {
     console.log('启用当前 Harness 自带、默认关闭的可选包')
     enableShipped(dir, manifest.shippedOptional, dsh, args.dryRun)
