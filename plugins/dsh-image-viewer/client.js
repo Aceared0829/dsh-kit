@@ -161,6 +161,34 @@ window.__ModuleLoader__.load({
       return { url: state.url, error: state.error, retry };
     }
 
+    /**
+     * Height, in pixels, that the Windows caption owns at the window's top edge.
+     * Electron draws the native minimize/maximize/close there, above every web
+     * layer, so a full-window overlay that reaches y=0 puts its own controls
+     * underneath those buttons. Zero elsewhere, and zero while window fullscreen
+     * hides the caption. Mirrors the dockkit's reading of the same variable.
+     */
+    function captionInset() {
+      const root = document.documentElement;
+      if (root === null || !root.hasAttribute('data-windows-titlebar') || root.hasAttribute('data-fullscreen')) return 0;
+      const height = Number.parseFloat(root.style.getPropertyValue('--dsh-windows-titlebar-height'));
+      return Number.isFinite(height) && height > 0 ? height : 40;
+    }
+
+    /** Follow the caption's inset as the window enters and leaves fullscreen. */
+    function useCaptionInset() {
+      const [inset, setInset] = React.useState(captionInset);
+      React.useEffect(() => {
+        const root = document.documentElement;
+        const sync = () => { setInset(captionInset()); };
+        const observer = new MutationObserver(sync);
+        observer.observe(root, { attributes: true, attributeFilter: ['data-windows-titlebar', 'data-fullscreen', 'style'] });
+        sync();
+        return () => { observer.disconnect(); };
+      }, []);
+      return inset;
+    }
+
     /** Shared control surface for the viewer chrome. */
     function ToolButton({ label, onClick, disabled, children, active }) {
       return h('button', {
@@ -192,6 +220,7 @@ window.__ModuleLoader__.load({
     function Viewer({ images, index, setIndex, onClose, load, t }) {
       const image = images[index];
       const { url, error, retry } = useImageUrl(image, load);
+      const captionTop = useCaptionInset();
       const [scale, setScale] = React.useState(1);
       const [offset, setOffset] = React.useState({ x: 0, y: 0 });
       const [natural, setNatural] = React.useState(null);
@@ -460,7 +489,10 @@ window.__ModuleLoader__.load({
         onMouseDown: (event) => { if (event.target === event.currentTarget) onClose(); },
         style: {
           position: 'fixed',
-          inset: 0,
+          top: captionTop,
+          right: 0,
+          bottom: 0,
+          left: 0,
           zIndex: 2147483000,
           background: 'rgba(8,8,10,0.92)',
           animation: 'dsh-image-viewer-fade 120ms ease-out',

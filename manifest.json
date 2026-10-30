@@ -1,6 +1,6 @@
 {
   "name": "dsh-kit",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "npm": [
     {
       "name": "@changfenhuang/dsh-genui",
@@ -8,7 +8,7 @@
     },
     {
       "name": "@deepseek-ai/dsh-subagent-claude-code",
-      "version": "0.2.1-rc.3"
+      "version": "0.2.2-alpha.2"
     },
     {
       "name": "@goodandready/dsh-context-lens",
@@ -17,11 +17,6 @@
     {
       "name": "@goodandready/dsh-time-machine",
       "version": "0.1.31"
-    },
-    {
-      "name": "@leon___/dsh-client-liang-intensity-skin",
-      "version": "0.1.12",
-      "spec": "github:kingOfSoySauce/dsh-liang-skin#a598702bdcdd51cd201b96bdd60efc89a255c787"
     },
     {
       "name": "@linxin666/dsh-client-ui-model-capabilities",
@@ -33,7 +28,7 @@
     },
     {
       "name": "@linxin666/dsh-usage",
-      "version": "0.4.11"
+      "version": "0.4.12"
     },
     {
       "name": "@michengai/dsh-skills-manager",
@@ -53,7 +48,7 @@
     },
     {
       "name": "ds-bot",
-      "version": "0.2.3"
+      "version": "0.2.4"
     },
     {
       "name": "dsh-better-sidebar",
@@ -71,10 +66,6 @@
       "name": "dsh-github-connect",
       "version": "0.2.0",
       "spec": "github:Moon-shiyue/dsh-github-connect#89f8258fcca57fdd017bea64e2682f275302f813"
-    },
-    {
-      "name": "dsh-graph",
-      "version": "0.22.0"
     },
     {
       "name": "dsh-super-code",

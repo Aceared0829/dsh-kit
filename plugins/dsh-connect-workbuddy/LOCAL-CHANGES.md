@@ -3,7 +3,7 @@
 这个目录是 `dsh-connect-workbuddy` 的**本地定制版**，通过 `link:` 挂进 profile：
 
 ```
-dsh-connect-workbuddy: link:C:/Users/zzn19/Documents/deepseek-harness/default-workspace/bundles/dsh-connect-workbuddy
+dsh-connect-workbuddy: link:<你的检出>/default-workspace/bundles/dsh-connect-workbuddy
 ```
 
 上游升级时**不要**用 `plugin_manager install_bundle` 直接覆盖（那会把 source 从 `link:` 换成 registry 版本，
@@ -41,7 +41,7 @@ dsh-connect-workbuddy: link:C:/Users/zzn19/Documents/deepseek-harness/default-wo
 ## 升级流程
 
 ```powershell
-cd C:\Users\zzn19\Documents\deepseek-harness\default-workspace\probe\wb-diff
+cd <你的检出>\default-workspace\probe\wb-diff
 npm pack dsh-connect-workbuddy@<新版本>            # 下载 tarball
 mkdir upN; tar -xzf dsh-connect-workbuddy-<新版本>.tgz -C upN   # 解包到 upN\package
 # 1) 先看上游改了什么：chunk 名带 hash，每次都会变
@@ -152,7 +152,7 @@ retryPolicy:
 ## 升级流程（下次照此办）
 
 ```powershell
-cd C:\Users\zzn19\Documents\deepseek-harness\default-workspace\probe\wb-diff
+cd <你的检出>\default-workspace\probe\wb-diff
 npm pack dsh-connect-workbuddy@<新版>                    # 下 tarball
 mkdir upN; tar -xzf dsh-connect-workbuddy-<新版>.tgz -C upN
 # 1) 先比对锚点，确认 4 个锚点各命中一次；命中数 != 1 时 apply_local.py 会拒绝写盘
@@ -178,7 +178,7 @@ node <bundle>\local\verify_retry.cjs <bundle>\lib\index.js  # 10 条必须全绿
   **没有实测**的是「插件运行期真的把该策略交给 `dsh-llm-retry`」这一跳——需要一次真实的
   bad-JSON 采样才能端到端证明。
 - **profile 里的 `@earendil-works/pi-ai` 是悬空 junction**（指向
-  `D:\deepseek-harness\node_modules\.pnpm\@earendil-works+pi-ai@1.1.0_...`，该目录已不存在；
+  `<你的检出>\node_modules\.pnpm\@earendil-works+pi-ai@1.1.0_...`，该目录已不存在；
   现存为 1.3.0）。创建时间 2026-10-20，早于本次升级，**非本次改动造成**。
   实测：从 profile 与 bundle 两侧 `require.resolve` 均解析不到该包。
   影响未确认，建议另立一单排查。
