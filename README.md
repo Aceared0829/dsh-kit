@@ -36,6 +36,8 @@
 
 完整清单和版本在 [`manifest.json`](manifest.json)。
 
+**本机开着、但不归这个库管的两个**：`kaoyan-workbench`（自己的仓库 `Aceared0829/kaoyan-workbench`，用 `link:` 挂进 profile）、`@local/dsh-turn-autocontinue`（只在 `default-workspace/bundles/` 里的本地 bundle，没有单独仓库）。这两个不在清单里，安装器不会去动它们。
+
 **Harness 自带、默认关着的实验包**，我这套里也开了：agent team、语音输入、自动评审、inspector、worktree 工具、CoT 翻译、终端、会话搜索、会话标题、badge skill、ralph、插件市场、个性化推荐。装的时候会自动检查你那边有没有这些包，没有就跳过，不会为了装上而改你的 Harness。
 
 ## 装到你的机器上
@@ -145,6 +147,8 @@ I keep it as a repo you can install from with one command. Take the whole set, t
 `dsh-context`, `@modusensus/dsh-mneme` (long-term memory), `dsh-better-sidebar`, `@changfenhuang/dsh-genui` (UI components), two from `@goodandready/*` (`dsh-context-lens`, `dsh-time-machine`), three from `@linxin666/*` (`session-archive`, `usage`, `client-ui-model-capabilities`), plus `billion-context`, `dsh-claude-style`, `dsh-super-code`, `ds-bot`, `dsh-github-connect`, `@tt-a1i/archify-dsh`, `@deepseek-ai/dsh-subagent-claude-code`, and `@michengai/dsh-skills-manager`.
 
 The full list and versions are in [`manifest.json`](manifest.json).
+
+**Two that run on my machine but are not this kit's business:** `kaoyan-workbench` (its own repo, `Aceared0829/kaoyan-workbench`, linked into the profile) and `@local/dsh-turn-autocontinue` (a local bundle under `default-workspace/bundles/` with no repo of its own). Neither is in the manifest, so the installer leaves both alone.
 
 **Experimental bundles that Harness ships disabled** are switched on in my set: agent team, voice input, auto-review, inspector, the worktree tool, CoT translation, terminal, session search, session titles, the badge skill, ralph, the plugin market, and personalized recommendations. The installer checks whether your installation actually has each one and skips what is missing — it will not modify your Harness to force them in.
 
