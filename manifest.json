@@ -1,6 +1,6 @@
 {
   "name": "dsh-kit",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "npm": [
     {
       "name": "@changfenhuang/dsh-genui",
@@ -8,6 +8,10 @@
     },
     {
       "name": "@deepseek-ai/dsh-subagent-claude-code",
+      "version": "0.2.2-alpha.2"
+    },
+    {
+      "name": "@deepseek-ai/dsh-subagent-codex",
       "version": "0.2.2-alpha.2"
     },
     {
@@ -51,16 +55,20 @@
       "version": "0.2.4"
     },
     {
+      "name": "ds-harness-remote",
+      "version": "0.5.14"
+    },
+    {
       "name": "dsh-better-sidebar",
       "version": "0.28.2"
     },
     {
       "name": "dsh-claude-style",
-      "version": "0.19.5"
+      "version": "0.19.6"
     },
     {
       "name": "dsh-context",
-      "version": "0.78.0"
+      "version": "0.78.2"
     },
     {
       "name": "dsh-github-connect",
@@ -94,8 +102,8 @@
       "path": "plugins/harness-eval"
     },
     {
-      "name": "@dsh-pet/lifecycle",
-      "path": "plugins/dsh-pet-lifecycle"
+      "name": "@local/dsh-turn-autocontinue",
+      "path": "plugins/dsh-turn-autocontinue"
     }
   ],
   "shippedOptional": [
@@ -103,6 +111,7 @@
     "@deepseek-ai/dsh-experimental-auto-review",
     "@deepseek-ai/dsh-experimental-badge-skill-bundle",
     "@deepseek-ai/dsh-experimental-cot-translation-bundle",
+    "@deepseek-ai/dsh-experimental-forge-bundle",
     "@deepseek-ai/dsh-experimental-inspector-profile",
     "@deepseek-ai/dsh-experimental-plugin-market-bundle",
     "@deepseek-ai/dsh-experimental-ralph-bundle",

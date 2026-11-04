@@ -1,0 +1,5 @@
+# Turn-level auto-continuation bundle: inserts exactly one plugin entry.
+# Written as an insert list so this bundle adds nothing else.
+- insert:
+    - id: turn-autocontinue
+      name: '@local/dsh-turn-autocontinue'

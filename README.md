@@ -22,7 +22,7 @@
 | `desktop-extras` | 一次开三个 Desktop 能力：Git worktree、有头 Playwright 浏览器、桌面控制 |
 | `dsh-image-viewer` | 点开对话里的图片和工具截图，缩放、拖动查看 |
 | `harness-eval` | 会话证据面板：一轮活干坏在哪儿、花了多少、重试长什么样 |
-| `dsh-pet-lifecycle` | 让桌宠跟着 Harness 一起起停：启动时拉起，退出时关掉。装到别人机器上要自己配 `petDir`（见 `plugins/dsh-pet-lifecycle/LOCAL-CHANGES.md`） |
+| `dsh-turn-autocontinue` | 轮级自动续跑：只在当前轮因模型侧异常中止时续，最多 3 次，每次留痕，到上限就停下并说明原因 |
 
 **我改过的这些**（上游在 npm，我改的地方源码也放进来了，装的是我这份）：
 
@@ -32,13 +32,13 @@
 
 **别人做的这些**（从 npm 装，清单里锁了版本，我没把源码再拷一份）：
 
-`dsh-context`、`@modusensus/dsh-mneme`（长期记忆）、`dsh-better-sidebar`、`@changfenhuang/dsh-genui`（界面组件）、`@goodandready/*` 两个（`dsh-context-lens`、`dsh-time-machine`）、`@linxin666/*` 三个（`session-archive`、`usage`、`client-ui-model-capabilities`）、`billion-context`、`dsh-claude-style`、`dsh-super-code`、`ds-bot`、`dsh-github-connect`、`@tt-a1i/archify-dsh`、`@deepseek-ai/dsh-subagent-claude-code`、`@michengai/dsh-skills-manager`。
+`dsh-context`、`@modusensus/dsh-mneme`（长期记忆）、`dsh-better-sidebar`、`@changfenhuang/dsh-genui`（界面组件）、`@goodandready/*` 两个（`dsh-context-lens`、`dsh-time-machine`）、`@linxin666/*` 三个（`session-archive`、`usage`、`client-ui-model-capabilities`）、`billion-context`、`dsh-claude-style`、`dsh-super-code`、`ds-bot`、`dsh-github-connect`、`@tt-a1i/archify-dsh`、`@deepseek-ai/dsh-subagent-claude-code`、`@deepseek-ai/dsh-subagent-codex`、`ds-harness-remote`（加密远程访问）、`@michengai/dsh-skills-manager`。
 
 完整清单和版本在 [`manifest.json`](manifest.json)。
 
-**本机开着、但不归这个库管的两个**：`kaoyan-workbench`（自己的仓库 `Aceared0829/kaoyan-workbench`，用 `link:` 挂进 profile）、`@local/dsh-turn-autocontinue`（只在 `default-workspace/bundles/` 里的本地 bundle，没有单独仓库）。这两个不在清单里，安装器不会去动它们。
+**本机开着、但不归这个库管的**：`kaoyan-workbench`（自己的仓库 `Aceared0829/kaoyan-workbench`，用 `link:` 挂进 profile）。它不在清单里，安装器不会去动它。
 
-**Harness 自带、默认关着的实验包**，我这套里也开了：agent team、语音输入、自动评审、inspector、worktree 工具、CoT 翻译、终端、会话搜索、会话标题、badge skill、ralph、插件市场、个性化推荐。装的时候会自动检查你那边有没有这些包，没有就跳过，不会为了装上而改你的 Harness。
+**Harness 自带、默认关着的实验包**，我这套里也开了：agent team、语音输入、自动评审、inspector、worktree 工具、CoT 翻译、终端、会话搜索、会话标题、badge skill、ralph、插件市场、forge（Git 会话的变更请求面板）、个性化推荐。装的时候会自动检查你那边有没有这些包，没有就跳过，不会为了装上而改你的 Harness。
 
 ## 装到你的机器上
 
@@ -134,7 +134,7 @@ I keep it as a repo you can install from with one command. Take the whole set, t
 | `desktop-extras` | Three Desktop capabilities at once: Git worktrees, a headed Playwright browser, and native desktop control |
 | `dsh-image-viewer` | Open an image or tool screenshot from the transcript and zoom, pan around |
 | `harness-eval` | Session evidence tab: where a run broke down, what it cost, and what the retry looked like |
-| `dsh-pet-lifecycle` | Starts the desktop pet with Harness and shuts it down on exit. Set `petDir` yourself on another machine (see `plugins/dsh-pet-lifecycle/LOCAL-CHANGES.md`) |
+| `dsh-turn-autocontinue` | Continues a turn only after an abnormal model-side failure, at most 3 times, records each attempt, then stops and says why |
 
 **Plugins I modified** (upstream is on npm; my changed sources are here too, and my copy is what gets installed):
 
@@ -144,13 +144,13 @@ I keep it as a repo you can install from with one command. Take the whole set, t
 
 **Plugins by other people**, installed from npm at the versions I pinned — I do not re-host their sources:
 
-`dsh-context`, `@modusensus/dsh-mneme` (long-term memory), `dsh-better-sidebar`, `@changfenhuang/dsh-genui` (UI components), two from `@goodandready/*` (`dsh-context-lens`, `dsh-time-machine`), three from `@linxin666/*` (`session-archive`, `usage`, `client-ui-model-capabilities`), plus `billion-context`, `dsh-claude-style`, `dsh-super-code`, `ds-bot`, `dsh-github-connect`, `@tt-a1i/archify-dsh`, `@deepseek-ai/dsh-subagent-claude-code`, and `@michengai/dsh-skills-manager`.
+`dsh-context`, `@modusensus/dsh-mneme` (long-term memory), `dsh-better-sidebar`, `@changfenhuang/dsh-genui` (UI components), two from `@goodandready/*` (`dsh-context-lens`, `dsh-time-machine`), three from `@linxin666/*` (`session-archive`, `usage`, `client-ui-model-capabilities`), plus `billion-context`, `dsh-claude-style`, `dsh-super-code`, `ds-bot`, `ds-harness-remote`, `dsh-github-connect`, `@tt-a1i/archify-dsh`, `@deepseek-ai/dsh-subagent-claude-code`, `@deepseek-ai/dsh-subagent-codex`, and `@michengai/dsh-skills-manager`.
 
 The full list and versions are in [`manifest.json`](manifest.json).
 
-**Two that run on my machine but are not this kit's business:** `kaoyan-workbench` (its own repo, `Aceared0829/kaoyan-workbench`, linked into the profile) and `@local/dsh-turn-autocontinue` (a local bundle under `default-workspace/bundles/` with no repo of its own). Neither is in the manifest, so the installer leaves both alone.
+**One that runs on my machine but is not this kit's business:** `kaoyan-workbench` (its own repo, `Aceared0829/kaoyan-workbench`, linked into the profile). It is not in the manifest, so the installer leaves it alone.
 
-**Experimental bundles that Harness ships disabled** are switched on in my set: agent team, voice input, auto-review, inspector, the worktree tool, CoT translation, terminal, session search, session titles, the badge skill, ralph, the plugin market, and personalized recommendations. The installer checks whether your installation actually has each one and skips what is missing — it will not modify your Harness to force them in.
+**Experimental bundles that Harness ships disabled** are switched on in my set: agent team, voice input, auto-review, inspector, the worktree tool, CoT translation, terminal, session search, session titles, the badge skill, ralph, the plugin market, forge (change requests for Git sessions), and personalized recommendations. The installer checks whether your installation actually has each one and skips what is missing — it will not modify your Harness to force them in.
 
 ## Installing it
 

@@ -1,0 +1,29 @@
+{
+  "name": "@local/dsh-turn-autocontinue",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bounded turn-level auto-continuation for DSH: continues a turn only after an abnormal model-side failure, at most 3 times, always on the record.",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "test/verify.mjs"
+  ],
+  "scripts": {
+    "test": "node test/run-all.mjs",
+    "test:unit": "node test/verify.mjs",
+    "test:integration": "node test/integration.mjs",
+    "test:persistence": "node test/persistence.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
