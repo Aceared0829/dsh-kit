@@ -32,13 +32,13 @@
 
 **别人做的这些**（从 npm 装，清单里锁了版本，我没把源码再拷一份）：
 
-`dsh-context`、`@modusensus/dsh-mneme`（长期记忆）、`dsh-better-sidebar`、`@changfenhuang/dsh-genui`（界面组件）、`@goodandready/*` 两个（`dsh-context-lens`、`dsh-time-machine`）、`@linxin666/*` 三个（`session-archive`、`usage`、`client-ui-model-capabilities`）、`billion-context`、`dsh-claude-style`、`dsh-super-code`、`ds-bot`、`dsh-github-connect`、`@tt-a1i/archify-dsh`、`@deepseek-ai/dsh-subagent-claude-code`、`@deepseek-ai/dsh-subagent-codex`、`ds-harness-remote`（加密远程访问）、`@michengai/dsh-skills-manager`。
+`dsh-context`、`@modusensus/dsh-mneme`（长期记忆）、`dsh-better-sidebar`、`@changfenhuang/dsh-genui`（界面组件）、`@goodandready/dsh-context-lens`、`@linxin666/*` 三个（`session-archive`、`usage`、`client-ui-model-capabilities`）、`billion-context`、`dsh-claude-style`、`dsh-claude-design`/`slides`/`motion`/`dashboard`/`design-system` 五个（`2.11.1`，设计、幻灯片、动效、看板与设计系统）、`dsh-super-code`、`dsh-github-connect`、`@tt-a1i/archify-dsh`、`@deepseek-ai/dsh-subagent-claude-code`、`@deepseek-ai/dsh-subagent-codex`、`ds-harness-remote`（加密远程访问）、`@michengai/dsh-skills-manager`。
 
 完整清单和版本在 [`manifest.json`](manifest.json)。
 
 **本机开着、但不归这个库管的**：`kaoyan-workbench`（自己的仓库 `Aceared0829/kaoyan-workbench`，用 `link:` 挂进 profile）。它不在清单里，安装器不会去动它。
 
-**Harness 自带、默认关着的实验包**，我这套里也开了：agent team、语音输入、自动评审、inspector、worktree 工具、CoT 翻译、终端、会话搜索、会话标题、badge skill、ralph、插件市场、forge（Git 会话的变更请求面板）、个性化推荐。装的时候会自动检查你那边有没有这些包，没有就跳过，不会为了装上而改你的 Harness。
+**Harness 自带、默认关着的实验包**，我这套里也开了：语音输入、自动评审、inspector、worktree 工具、CoT 翻译、终端、会话搜索、会话标题、badge skill、ralph、插件市场、forge（Git 会话的变更请求面板）、个性化推荐。装的时候会自动检查你那边有没有这些包，没有就跳过，不会为了装上而改你的 Harness。
 
 ## 装到你的机器上
 
@@ -144,13 +144,13 @@ I keep it as a repo you can install from with one command. Take the whole set, t
 
 **Plugins by other people**, installed from npm at the versions I pinned — I do not re-host their sources:
 
-`dsh-context`, `@modusensus/dsh-mneme` (long-term memory), `dsh-better-sidebar`, `@changfenhuang/dsh-genui` (UI components), two from `@goodandready/*` (`dsh-context-lens`, `dsh-time-machine`), three from `@linxin666/*` (`session-archive`, `usage`, `client-ui-model-capabilities`), plus `billion-context`, `dsh-claude-style`, `dsh-super-code`, `ds-bot`, `ds-harness-remote`, `dsh-github-connect`, `@tt-a1i/archify-dsh`, `@deepseek-ai/dsh-subagent-claude-code`, `@deepseek-ai/dsh-subagent-codex`, and `@michengai/dsh-skills-manager`.
+`dsh-context`, `@modusensus/dsh-mneme` (long-term memory), `dsh-better-sidebar`, `@changfenhuang/dsh-genui` (UI components), `@goodandready/dsh-context-lens`, three from `@linxin666/*` (`session-archive`, `usage`, `client-ui-model-capabilities`), plus `billion-context`, `dsh-claude-style`, `dsh-claude-design`/`slides`/`motion`/`dashboard`/`design-system` (`2.11.1` — design, slides, motion, dashboards and design systems), `dsh-super-code`, `ds-harness-remote`, `dsh-github-connect`, `@tt-a1i/archify-dsh`, `@deepseek-ai/dsh-subagent-claude-code`, `@deepseek-ai/dsh-subagent-codex`, and `@michengai/dsh-skills-manager`.
 
 The full list and versions are in [`manifest.json`](manifest.json).
 
 **One that runs on my machine but is not this kit's business:** `kaoyan-workbench` (its own repo, `Aceared0829/kaoyan-workbench`, linked into the profile). It is not in the manifest, so the installer leaves it alone.
 
-**Experimental bundles that Harness ships disabled** are switched on in my set: agent team, voice input, auto-review, inspector, the worktree tool, CoT translation, terminal, session search, session titles, the badge skill, ralph, the plugin market, forge (change requests for Git sessions), and personalized recommendations. The installer checks whether your installation actually has each one and skips what is missing — it will not modify your Harness to force them in.
+**Experimental bundles that Harness ships disabled** are switched on in my set: voice input, auto-review, inspector, the worktree tool, CoT translation, terminal, session search, session titles, the badge skill, ralph, the plugin market, forge (change requests for Git sessions), and personalized recommendations. The installer checks whether your installation actually has each one and skips what is missing — it will not modify your Harness to force them in.
 
 ## Installing it
 

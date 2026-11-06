@@ -1,6 +1,6 @@
 {
   "name": "dsh-kit",
-  "version": "0.3.5",
+  "version": "0.4.0",
   "npm": [
     {
       "name": "@changfenhuang/dsh-genui",
@@ -8,19 +8,15 @@
     },
     {
       "name": "@deepseek-ai/dsh-subagent-claude-code",
-      "version": "0.2.2-alpha.2"
+      "version": "0.2.2-rc.1"
     },
     {
       "name": "@deepseek-ai/dsh-subagent-codex",
-      "version": "0.2.2-alpha.2"
+      "version": "0.2.2-rc.1"
     },
     {
       "name": "@goodandready/dsh-context-lens",
       "version": "0.1.35"
-    },
-    {
-      "name": "@goodandready/dsh-time-machine",
-      "version": "0.1.31"
     },
     {
       "name": "@linxin666/dsh-client-ui-model-capabilities",
@@ -32,15 +28,15 @@
     },
     {
       "name": "@linxin666/dsh-usage",
-      "version": "0.4.12"
+      "version": "0.4.14"
     },
     {
       "name": "@michengai/dsh-skills-manager",
-      "version": "1.2.20"
+      "version": "1.2.35"
     },
     {
       "name": "@modusensus/dsh-mneme",
-      "version": "0.9.4"
+      "version": "0.10.1"
     },
     {
       "name": "@tt-a1i/archify-dsh",
@@ -48,11 +44,7 @@
     },
     {
       "name": "billion-context",
-      "version": "0.1.208"
-    },
-    {
-      "name": "ds-bot",
-      "version": "0.2.4"
+      "version": "0.1.212"
     },
     {
       "name": "ds-harness-remote",
@@ -63,12 +55,32 @@
       "version": "0.28.2"
     },
     {
+      "name": "dsh-claude-dashboard",
+      "version": "2.11.1"
+    },
+    {
+      "name": "dsh-claude-design",
+      "version": "2.11.1"
+    },
+    {
+      "name": "dsh-claude-design-system",
+      "version": "2.11.1"
+    },
+    {
+      "name": "dsh-claude-motion",
+      "version": "2.11.1"
+    },
+    {
+      "name": "dsh-claude-slides",
+      "version": "2.11.1"
+    },
+    {
       "name": "dsh-claude-style",
-      "version": "0.19.6"
+      "version": "0.19.9"
     },
     {
       "name": "dsh-context",
-      "version": "0.78.2"
+      "version": "0.81.2"
     },
     {
       "name": "dsh-github-connect",
@@ -77,7 +89,7 @@
     },
     {
       "name": "dsh-super-code",
-      "version": "0.3.8"
+      "version": "0.3.9"
     }
   ],
   "local": [
@@ -107,7 +119,6 @@
     }
   ],
   "shippedOptional": [
-    "@deepseek-ai/dsh-experimental-agent-team-profile",
     "@deepseek-ai/dsh-experimental-auto-review",
     "@deepseek-ai/dsh-experimental-badge-skill-bundle",
     "@deepseek-ai/dsh-experimental-cot-translation-bundle",
