@@ -1,6 +1,6 @@
 {
   "name": "dsh-kit",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "npm": [
     {
       "name": "@changfenhuang/dsh-genui",
@@ -47,36 +47,40 @@
       "version": "0.1.212"
     },
     {
+      "name": "ds-bot",
+      "version": "0.3.1"
+    },
+    {
       "name": "ds-harness-remote",
       "version": "0.5.14"
     },
     {
       "name": "dsh-better-sidebar",
-      "version": "0.28.2"
+      "version": "0.30.1"
     },
     {
       "name": "dsh-claude-dashboard",
-      "version": "2.11.1"
+      "version": "2.12.1"
     },
     {
       "name": "dsh-claude-design",
-      "version": "2.11.1"
+      "version": "2.12.1"
     },
     {
       "name": "dsh-claude-design-system",
-      "version": "2.11.1"
+      "version": "2.12.1"
     },
     {
       "name": "dsh-claude-motion",
-      "version": "2.11.1"
+      "version": "2.12.1"
     },
     {
       "name": "dsh-claude-slides",
-      "version": "2.11.1"
+      "version": "2.12.1"
     },
     {
       "name": "dsh-claude-style",
-      "version": "0.19.9"
+      "version": "0.20.0"
     },
     {
       "name": "dsh-context",
@@ -93,6 +97,10 @@
     }
   ],
   "local": [
+    {
+      "name": "@local/dsh-claude-style-fix",
+      "path": "plugins/dsh-claude-style-fix"
+    },
     {
       "name": "@local/dsh-desktop-extras",
       "path": "plugins/desktop-extras"

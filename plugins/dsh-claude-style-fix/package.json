@@ -1,0 +1,22 @@
+{
+  "name": "@local/dsh-claude-style-fix",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Restores dsh-claude-style's 6px sidebar row rhythm by removing the host gap reserved above the panel list.",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}
