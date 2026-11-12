@@ -8,11 +8,11 @@
     },
     {
       "name": "@deepseek-ai/dsh-subagent-claude-code",
-      "version": "0.2.2-rc.1"
+      "version": "0.2.2-rc.2"
     },
     {
       "name": "@deepseek-ai/dsh-subagent-codex",
-      "version": "0.2.2-rc.1"
+      "version": "0.2.2-rc.2"
     },
     {
       "name": "@goodandready/dsh-context-lens",
