@@ -1,0 +1,22 @@
+[
+  {
+    "label": "IMPORT",
+    "old": "import { ReasoningEffortId, createUserMessage, resolveRetryPolicy } from \"@deepseek-ai/dsh-llm\";",
+    "new": "import { ReasoningEffortId, RetryPolicySchema, createUserMessage, resolveRetryPolicy } from \"@deepseek-ai/dsh-llm\";"
+  },
+  {
+    "label": "PROFILE",
+    "old": "\t\tretryPolicy: resolveRetryPolicy(void 0, \"dsh-connect-workbuddy retryPolicy\"),",
+    "new": "\t\tretryPolicy: options.retryPolicy?.() ?? resolveRetryPolicy(void 0, \"dsh-connect-workbuddy retryPolicy\"),"
+  },
+  {
+    "label": "SCHEMA",
+    "old": "\tsessionTitle: asVolatile(z.object({",
+    "new": "\tretryPolicy: asVolatile(RetryPolicySchema.description(\"How this plugin's provider routes retry a failed model request. Unset keeps the DSH default, whose retryable-code list omits MALFORMED_RESPONSE — so one sampling flake that breaks a tool-call argument JSON kills the whole turn unretried. Set retryableCodes to add it (a set value REPLACES the default list, so restate every code you still want).\")),\n\tsessionTitle: asVolatile(z.object({"
+  },
+  {
+    "label": "ADAPTER",
+    "old": "\t\t\t\tresolveContextRescue: () => contextRescue,\n\t\t\t\tdropForeignThinking: () => unwrapVolatile(current().dropForeignThinking) === true,",
+    "new": "\t\t\t\tresolveContextRescue: () => contextRescue,\n\t\t\t\tdropForeignThinking: () => unwrapVolatile(current().dropForeignThinking) === true,\n\t\t\t\tretryPolicy: () => unwrapVolatile(current().retryPolicy) === void 0 ? void 0 : resolveRetryPolicy(unwrapVolatile(current().retryPolicy), `dsh-connect-workbuddy retryPolicy`),"
+  }
+]

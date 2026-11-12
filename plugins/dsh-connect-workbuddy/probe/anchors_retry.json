@@ -16,7 +16,7 @@
   },
   {
     "label": "ADAPTER",
-    "old": "\t\t\t\tresolveContextRescue: () => contextRescue,\n\t\t\t\tdropForeignThinking: () => unwrapVolatile(current().dropForeignThinking) === true,",
-    "new": "\t\t\t\tresolveContextRescue: () => contextRescue,\n\t\t\t\tdropForeignThinking: () => unwrapVolatile(current().dropForeignThinking) === true,\n\t\t\t\tretryPolicy: () => unwrapVolatile(current().retryPolicy) === void 0 ? void 0 : resolveRetryPolicy(unwrapVolatile(current().retryPolicy), `dsh-connect-workbuddy retryPolicy`),"
+    "old": "\t\t\t\tdropAllThinking: () => unwrapVolatile(current().dropAllThinking) === true,",
+    "new": "\t\t\t\tdropAllThinking: () => unwrapVolatile(current().dropAllThinking) === true,\n\t\t\t\tretryPolicy: () => unwrapVolatile(current().retryPolicy) === void 0 ? void 0 : resolveRetryPolicy(unwrapVolatile(current().retryPolicy), `dsh-connect-workbuddy retryPolicy`),"
   }
 ]

@@ -110,8 +110,61 @@ window.__ModuleLoader__.load({
 		const WORKBUDDY_OAUTH_PATH = "/plugins/dsh-connect-workbuddy/oauth";
 		/** Query parameter selecting which pool batch action a request means. */
 		const WORKBUDDY_POOL_ACTION_PARAM = "action";
+		/**
+		* 设备头设置（「虚拟值 / 真实值」+ 每账号的覆盖参数）。
+		*
+		* 一条路由两种方法，因为读和写描述的是同一份文档：
+		*   - `GET`  → `{ mode, accounts }`，卡片渲染切换项与每行的齿轮状态；
+		*   - `POST` → 立即生效（不像账号池那样有草稿）：`{ kind: 'mode', mode }` 或
+		*     `{ kind: 'account', accountId, machineId?, sessionId? }`。
+		*
+		* POST + loopback-only：写的是"这台机器对外声称自己是谁"，和凭据写入同级。
+		* 之所以不挂在账号池的 `/pool` 下面：那份草稿是"点保存才生效"的偏好，而这里的
+		* 两个动作都是即时生效，混在一条路由里会让"保存"按钮的语义变得说不清。
+		*/
+		const WORKBUDDY_DEVICE_PROFILE_PATH = "/plugins/dsh-connect-workbuddy/device-profile";
+		/**
+		* 真实设备参数（本机安装的桌面端 Turing Shield SDK）的状态与取值。
+		*
+		* - `GET` → `{ tier, sdk, token }`，`token` 只有掩码与长度；另带 `sdkEnabled`
+		*   （总开关的当前值），供卡片画出那个勾选框。
+		* - `POST ?action=refresh` → 强制重取一次，再返回同一形状。
+		* - `POST ?action=reveal` → `{ token }`，完整值，**只在用户显式点击时**。
+		* - `POST ?action=enable|disable` → 写总开关。
+		*
+		* 为什么把"完整值"单独做成一个动作：这是一枚能代表这台机器的凭据，卡片是
+		* 一个会被截图、被贴进 issue 的界面。默认只给掩码，复制/查看各要一次显式动作。
+		*/
+		const WORKBUDDY_DEVICE_SDK_PATH = "/plugins/dsh-connect-workbuddy/device-sdk";
 		/** How long the card waits between polls while the user is scanning. */
 		const OAUTH_POLL_INTERVAL_MS = 2e3;
+		/**
+		* The refresh intervals the card offers, in milliseconds.
+		*
+		* SHARED between the Host (which validates the saved value) and the browser
+		* (which renders the dropdown), so the control and its validation cannot drift:
+		* a value the dropdown can produce is always a value the Host accepts, and the
+		* Host's fallback is always a value the dropdown can show.
+		*
+		* A CLOSED SET rather than a free number because this interval decides the
+		* plugin's upstream request volume — one credits read plus one check-in read per
+		* pooled account, per refresh.
+		*/
+		const WORKBUDDY_POLL_INTERVALS_MS = [
+			6e4,
+			3e5,
+			6e5,
+			18e5,
+			36e5
+		];
+		/**
+		* The default refresh interval: 5 minutes.
+		*
+		* Moved off the old hard-coded 60 s. A 4-account pool at 60 s costs ~11,520
+		* requests a day for figures that move slowly; 5 minutes is a fifth of that and
+		* still five times finer than the 30-minute auto check-in heartbeat.
+		*/
+		const WORKBUDDY_DEFAULT_POLL_INTERVAL_MS = 3e5;
 		/**
 		* Plugin-owned account transfer endpoint: the batch export / import of
 		* credentials between machines and between tools of the SAME format family.
@@ -278,6 +331,7 @@ window.__ModuleLoader__.load({
 			"imageToolEnabled",
 			"offModelIds",
 			"contextBudgets",
+			"defaultThinkingEfforts",
 			"pool"
 		]);
 		/** A non-null, non-array object: the only shape a slot or a level can have. */
@@ -452,6 +506,34 @@ window.__ModuleLoader__.load({
 			});
 		}
 		/**
+		* Build the next `regions` FIELD carrying one region's CN gateway override
+		* (issue #220).
+		*
+		* Same whole-slot merge as every other helper here: only `cnBase` changes, so
+		* setting a host cannot drop the model directory, the pool preferences or the
+		* switches that share this slot. An empty string is written as-is rather than
+		* deleting the key — it means "back to the built-in gateway", which must survive
+		* a read-back, and `resolveCnGateway('')` already reads both the same way.
+		*/
+		function nextRegionCnBase(value, region, cnBase) {
+			return nextRegionSlots(regionsMapOf(value), region, {
+				...regionSlotOf(value, region),
+				cnBase
+			});
+		}
+		/**
+		* Read one region's saved CN gateway override, or `''` when it has none.
+		*
+		* Deliberately tolerant of a non-string: the settings mirror can hold whatever a
+		* previous version wrote, and throwing here would take out the whole capabilities
+		* panel over one malformed field. A value that is not a string is treated as
+		* "not configured", which is exactly how `resolveCnGateway` treats it.
+		*/
+		function regionCnBaseOf(value, region) {
+			const raw = regionSlotOf(value, region)["cnBase"];
+			return typeof raw === "string" ? raw : "";
+		}
+		/**
 		* Whether one region's sidebar credit line is shown. Opt-out: only an explicit
 		* `false` hides it, so a config written before this switch existed keeps the
 		* line visible exactly as a fresh install does.
@@ -545,6 +627,29 @@ window.__ModuleLoader__.load({
 				...regionSlotOf(value, region),
 				showCreditsInMainUi: shown
 			});
+		}
+		/**
+		* Build the next `regions` settings value for the new-model-segment opt-in.
+		*
+		* Same merge rule as everything else here: ONLY the target region's flag
+		* changes, so the directory, the model selection, the credit switches and the
+		* sibling region all survive the write.
+		*/
+		function nextRegionNewModelsShown(value, region, shown) {
+			return nextRegionSlots(regionsMapOf(value), region, {
+				...regionSlotOf(value, region),
+				showNewModelsInMainUi: shown
+			});
+		}
+		/**
+		* Read the new-model-segment opt-in: ON only when explicitly `true`.
+		*
+		* The mirror image of {@link regionCreditsShownOf}, and deliberately so. That
+		* one is opt-OUT (`!== false`), this one is opt-IN (`=== true`), because
+		* announcing "N new models" on a fresh install announces the entire roster.
+		*/
+		function regionNewModelsShownOf(value, region) {
+			return regionSlotOf(value, region)["showNewModelsInMainUi"] === true;
 		}
 		/**
 		* Build the next `regions` settings value for the image-tool opt-in.
@@ -645,30 +750,35 @@ window.__ModuleLoader__.load({
 			WORKBUDDY_SETTINGS_NS
 		];
 		/**
-		* The `<package name>` keys under which the card registers itself in the
-		* Plugins panel.
+		* The `id` of this plugin's page in the Settings panel's left-hand navigation.
 		*
-		* `plugins.bundle.config` and `plugins.row.config` are KEYED slots: the page
-		* renders them with `entryKey: pkg.name`, and it decides whether to render the
-		* section at all from `ledger.bundles.has(pkg.name)` — a `Set` of exactly the
-		* `key` values registered on that slot, compared against the plugin-manager
-		* inventory's own package name. Both halves of that comparison are EXACT and
-		* neither side is the settings namespace: the inventory name comes from the
-		* profile's package list, while a deployment may mount the same code under a
-		* different Loader entry id.
+		* ## Why the configuration moved here (5.19.0)
 		*
-		* That is the whole of issue #55. A deployment whose inventory name is
-		* `dsh-connect-workbuddy` and whose card registered only under
-		* `include:dsh-connect-workbuddy` gets NO card and NO error: the keyed lookup
-		* finds nothing, the section is simply not rendered, and `apply()` finished
-		* happily. Since the keys live in separate cells (one entry per `key` per
-		* priority), registering under every spelling at once is a shadowing-free
-		* duplicate rather than a conflict, and is strictly safer than betting on one.
+		* It used to live ONLY in the Plugins page's `plugins.bundle.config` /
+		* `plugins.row.config` keyed slots, looked up by `<package name>`. That is a
+		* KEYED slot: the page renders it with `entryKey: pkg.name` and gates the whole
+		* section on `ledger.bundles.has(pkg.name)`, an EXACT string comparison against
+		* the plugin-manager inventory's package name while a deployment is free to
+		* mount the same code under a different Loader entry id. Two spellings had to
+		* be registered to cover it (issue #55), and a spelling nobody predicted
+		* rendered nothing at all — no section, no placeholder, no error.
 		*
-		* The bare package name is FIRST because it is the common case — a profile that
-		* installs the package by name mounts it under that name.
+		* `settings.section` is a LIST slot keyed by an id **this plugin owns**. There
+		* is no inventory name to match, so the whole class of mismatch disappears,
+		* and the user finds the configuration where every other preference lives.
+		*
+		* ## The id is also the icon's address
+		*
+		* The shell renders `settings.section.icon` with `{ only: row.id }`, so the
+		* glyph must register under this same string. Both registrations come from one
+		* `inject` callback so the pairing is structural rather than a convention.
+		*
+		* Deliberately the bare, unnamespaced plugin name and NOT one of
+		* {@link WORKBUDDY_SETTINGS_NAMESPACE_CANDIDATES}: those are Loader entry ids
+		* the Host happens to serve, while this id is ours and must be stable across
+		* deployments.
 		*/
-		const WORKBUDDY_CARD_KEYS = ["dsh-connect-workbuddy", "include:dsh-connect-workbuddy"];
+		const WORKBUDDY_SETTINGS_SECTION_ID = "dsh-connect-workbuddy";
 		//#endregion
 		//#region src/client/account-selection.ts
 		/**
@@ -844,6 +954,41 @@ window.__ModuleLoader__.load({
 			return [...seen];
 		}
 		/**
+		* The `channelRejectContinue` block's defaults, mirroring the Host schema.
+		*
+		* Duplicated here rather than imported from the Host entry on purpose: this
+		* module is the browser half's node-free boundary (`src/index.ts` pulls in the
+		* whole provider stack), and the two values must agree, which a test pins.
+		*/
+		const CHANNEL_CONTINUE_DEFAULTS = {
+			enabled: false,
+			maxConsecutive: 1,
+			text: "继续"
+		};
+		/**
+		* Read the `channelRejectContinue` block out of a settings snapshot.
+		*
+		* Same defensive shape as {@link sessionTitleOf}: anything missing or malformed
+		* resolves to the schema's own defaults, so the card shows what the plugin will
+		* actually do instead of an empty control — and an absent block reads as OFF,
+		* because enabling this spends real requests without the user typing anything.
+		*
+		* @param configured - the whole settings snapshot.
+		* @returns the three values the switch renders.
+		*/
+		function channelRejectContinueOf(configured) {
+			const raw = unwrapVolatileDeep(configured?.["channelRejectContinue"]);
+			const block = typeof raw === "object" && raw !== null && !Array.isArray(raw) ? raw : {};
+			const max = block["maxConsecutive"];
+			const capped = typeof max === "number" && Number.isFinite(max) ? Math.min(10, Math.max(1, Math.trunc(max))) : CHANNEL_CONTINUE_DEFAULTS.maxConsecutive;
+			const text = block["text"];
+			return {
+				enabled: block["enabled"] === true,
+				maxConsecutive: capped,
+				text: typeof text === "string" && text.trim() !== "" ? text.trim() : CHANNEL_CONTINUE_DEFAULTS.text
+			};
+		}
+		/**
 		* Write one upstream-identity switch, verifying it landed.
 		*
 		* Same two writers as {@link writeCliBridgeEnabled} and for the same measured
@@ -876,7 +1021,7 @@ window.__ModuleLoader__.load({
 			}
 			if (delivered) {
 				const after = scope.getSnapshot().value;
-				if (field === "usageIdentity" || field === "keepPromptLast" ? upstreamSwitchOf(after, field) === value : field === "sessionTitle" ? JSON.stringify(sessionTitleOf(after)) === JSON.stringify(value) : JSON.stringify(extraInjectedPrefixesOf(after)) === JSON.stringify([...value])) return;
+				if (field === "usageIdentity" || field === "keepPromptLast" || field === "dropAllThinking" ? upstreamSwitchOf(after, field) === value : field === "sessionTitle" ? JSON.stringify(sessionTitleOf(after)) === JSON.stringify(value) : field === "channelRejectContinue" ? JSON.stringify(channelRejectContinueOf(after)) === JSON.stringify(value) : JSON.stringify(extraInjectedPrefixesOf(after)) === JSON.stringify([...value])) return;
 			}
 			throw hostError instanceof Error ? hostError : new WorkBuddySettingsWriteError(field, "neither the Host save endpoint nor the settings scope persisted the value");
 		}
@@ -918,6 +1063,101 @@ window.__ModuleLoader__.load({
 			}
 			if (delivered && cliBridgeEnabledOf(scope.getSnapshot().value)) return;
 			throw hostError instanceof Error ? hostError : new WorkBuddySettingsWriteError("cliBridge", "neither the Host save endpoint nor the settings scope persisted the value");
+		}
+		/**
+		* Read the opt-in DSH sidebar panel switch out of a settings snapshot.
+		*
+		* Only an explicit `true` is ON, matching the schema's `default(false)` and
+		* every other switch in this file: the row claims a GLOBAL sidebar seat shared
+		* by every installed bundle, so an absent or malformed value must read as
+		* "did not ask for this", never as consent.
+		*
+		* @param configured - the whole settings snapshot.
+		* @returns whether the panel row should exist.
+		*/
+		function sidebarPanelEnabledOf(configured) {
+			const value = configured?.["sidebarPanel"];
+			return unwrapVolatileDeep(value) === true;
+		}
+		/**
+		* Write the opt-in DSH sidebar panel switch, verifying it landed.
+		*
+		* Same two writers and same reasoning as {@link writeCliBridgeEnabled}: the
+		* Host endpoint first (it is the authoritative merge and reports its own
+		* refusal), the settings scope second, because this namespace's browser mirror
+		* is documented as stale on the affected 0.1.7 deployments — and a sidebar row
+		* that merely *looks* present while the Host disagrees is worse than no row.
+		*
+		* A plain top-level boolean, so it is set on its own path; there is no sibling
+		* state inside the field to preserve.
+		*
+		* @param scope - the bound settings scope for this plugin's namespace.
+		* @param enabled - the desired state.
+		* @throws {WorkBuddySettingsWriteError} when neither writer persists the value.
+		*/
+		async function writeSidebarPanelEnabled(scope, enabled) {
+			let hostError;
+			try {
+				const authoritative = await saveViaHostEndpoint("sidebarPanel", void 0, enabled);
+				if (authoritative !== void 0) try {
+					await scope.set("sidebarPanel", authoritative["sidebarPanel"]);
+				} catch {}
+				return;
+			} catch (error) {
+				hostError = error;
+			}
+			let delivered = false;
+			try {
+				delivered = await scope.set("sidebarPanel", enabled) !== false;
+			} catch {
+				delivered = false;
+			}
+			if (delivered && sidebarPanelEnabledOf(scope.getSnapshot().value)) return;
+			throw hostError instanceof Error ? hostError : new WorkBuddySettingsWriteError("sidebarPanel", "neither the Host save endpoint nor the settings scope persisted the value");
+		}
+		/**
+		* Read the card's refresh interval out of a settings snapshot.
+		*
+		* Coerced against the offered set, and an unrecognized value reads as the
+		* default. The direction matters: this number drives `setInterval`, so a typo in
+		* the settings file must not become a sub-second poll. Coercing on READ as well
+		* as on the Host means a stale browser mirror cannot arm a cadence the Host
+		* would have refused.
+		*/
+		function pollIntervalMsOf(value) {
+			const raw = value?.pollIntervalMs;
+			return typeof raw === "number" && WORKBUDDY_POLL_INTERVALS_MS.includes(raw) ? raw : WORKBUDDY_DEFAULT_POLL_INTERVAL_MS;
+		}
+		/**
+		* Persist the card's refresh interval.
+		*
+		* Same two-writer shape as {@link writeSidebarPanelEnabled}: the Host endpoint is
+		* authoritative, the settings scope is the fallback for an older Host. A plain
+		* top-level number, so there is no sibling state to preserve.
+		*
+		* @param scope - the bound settings scope for this plugin's namespace.
+		* @param intervalMs - one of {@link WORKBUDDY_POLL_INTERVALS_MS}.
+		* @throws {WorkBuddySettingsWriteError} when neither writer persists the value.
+		*/
+		async function writePollIntervalMs(scope, intervalMs) {
+			let hostError;
+			try {
+				const authoritative = await saveViaHostEndpoint("pollIntervalMs", void 0, intervalMs);
+				if (authoritative !== void 0) try {
+					await scope.set("pollIntervalMs", authoritative["pollIntervalMs"]);
+				} catch {}
+				return;
+			} catch (error) {
+				hostError = error;
+			}
+			let delivered = false;
+			try {
+				delivered = await scope.set("pollIntervalMs", intervalMs) !== false;
+			} catch {
+				delivered = false;
+			}
+			if (delivered && pollIntervalMsOf(scope.getSnapshot().value) === intervalMs) return;
+			throw hostError instanceof Error ? hostError : new WorkBuddySettingsWriteError("pollIntervalMs", "neither the Host save endpoint nor the settings scope persisted the value");
 		}
 		/**
 		* Read the CodeBuddy-CLI route's PINNED model out of a settings snapshot.
@@ -1180,6 +1420,32 @@ window.__ModuleLoader__.load({
 			});
 		}
 		/**
+		* Write the CN gateway override (issue #220), with the same landed-check as
+		* every other settings write.
+		*
+		* Carries the region's whole slot through untouched — only `cnBase` changes —
+		* so writing a host cannot drop the model directory, the pool preferences or
+		* the switches that live beside it in the same slot.
+		*
+		* Validation is deliberately NOT here: the caller runs `resolveCnGateway` before
+		* calling, because the rejection reason has to be worded for the user ("not a
+		* known CN brand" vs "must be https"), and a bare `WorkBuddySettingsWriteError`
+		* cannot say that. This function's only job is landing the value.
+		*
+		* @param scope - the bound settings scope for this plugin's namespace.
+		* @param region - the region being written (always `cn` today: the international
+		*   gateways follow the credential's brand domain and have no counterpart).
+		* @param cnBase - the validated base URL, or `''` to restore the built-in gateway.
+		* @param slot - the region's COMPLETE next slot (caller owns the merge).
+		* @throws {WorkBuddySettingsWriteError} when neither writer persists the value.
+		*/
+		async function writeRegionCnBase(scope, region, cnBase, slot) {
+			await writeField(scope, "regions", region, slot, (readBack) => {
+				const stored = readBack;
+				return stored !== null && stored !== void 0 && stored["cnBase"] === cnBase;
+			});
+		}
+		/**
 		* Show or hide one region's sidebar credit line, with the same landed-check as
 		* every other settings write.
 		*
@@ -1240,6 +1506,19 @@ window.__ModuleLoader__.load({
 			});
 		}
 		/**
+		* Write one region's new-model-segment opt-in, verifying it landed.
+		*
+		* Sibling of {@link writeRegionCreditsShown}: same whole-slot merge, same
+		* landed check. The landed check reads `=== shown`, so an explicit `false`
+		* (the default) verifies just as strictly as a `true`.
+		*/
+		async function writeRegionNewModelsShown(scope, region, shown, slot) {
+			await writeField(scope, "regions", region, slot, (readBack) => {
+				const stored = readBack;
+				return stored !== null && stored !== void 0 && stored["showNewModelsInMainUi"] === shown;
+			});
+		}
+		/**
 		* Write one region's credit SEAT (issue #62), verifying it landed.
 		*
 		* Sibling of {@link writeRegionCreditsShown}: same whole-slot merge, same
@@ -1285,6 +1564,7 @@ window.__ModuleLoader__.load({
 				orderAccountIds: preferences.orderAccountIds
 			};
 			if (preferences.probeInputTokens !== void 0) slot["probeInputTokens"] = preferences.probeInputTokens;
+			if (preferences.autoCheckin !== void 0) slot["autoCheckin"] = preferences.autoCheckin;
 			const next = nextRegionPool(scope.getSnapshot().value, region, slot)[region];
 			await writeField(scope, "regions", region, next, (readBack) => {
 				const pool = readBack?.pool;
@@ -1301,6 +1581,205 @@ window.__ModuleLoader__.load({
 				if (!storedOrder.every((id, index) => id === preferences.orderAccountIds[index])) return false;
 				return true;
 			});
+		}
+		//#endregion
+		//#region src/cn-gateway.ts
+		/**
+		* The CN region's gateway host, and the ONE place an override is validated.
+		*
+		* ## Why this exists (issue #220)
+		*
+		* The CN chat gateway was the single hard-coded constant
+		* `https://copilot.tencent.com`. In a corporate network that filters on the TLS
+		* ClientHello's SNI, that name is reset before the handshake completes — while
+		* the SAME network lets the WorkBuddy desktop app work, because the app reads a
+		* failover list from its own config and uses `wb.tencentbuddy.com` as well.
+		*
+		* The reporter measured (2026-11-06): `copilot.tencent.com` answers
+		* `ECONNRESET` in <100ms while `wb.tencentbuddy.com` answers a normal
+		* `401 Authorization Required`. This module is what lets such a user point the
+		* plugin at a host their network actually permits.
+		*
+		* ## Why an allowlist, and not "any URL you like"
+		*
+		* The value feeds `Authorization: Bearer <token>` on every CN request, plus the
+		* refresh-token exchange. A free-form base is therefore a **credential
+		* exfiltration primitive**: whoever can edit the settings (a synced profile, a
+		* shared dotfile, a pasted "fix" from a forum post) could redirect a live
+		* WorkBuddy token to a host they run. That is a strictly worse failure than the
+		* timeout it fixes, and it is invisible — the requests would keep succeeding.
+		*
+		* So the override names a HOST from a closed set, never a URL from the open
+		* internet. The set is the CN product's own brand registrable domains, measured
+		* 2026-11-06 to answer the chat, billing, catalog and busy routes identically
+		* (see `docs/CN_GATEWAY_FALLBACK.md`):
+		*
+		*   copilot.tencent.com     the shipping default
+		*   wb.tencentbuddy.com     what the desktop app's failover.json lists
+		*   www.workbuddy.cn        the brand host
+		*   www.codebuddy.cn        the sibling brand host, also the billing base
+		*
+		* Each is admitted by REGISTRABLE domain, so any subdomain of those brands
+		* qualifies and a lookalike (`wb.tencentbuddy.com.evil.example`) cannot —
+		* the same rule `knownRegionOf` already applies to credential domains.
+		*
+		* ## What an override does NOT change
+		*
+		* `Origin` / `Referer` stay on the billing base (see `originReferer`): they
+		* describe which web app the request comes from, not which socket it reaches.
+		* Rewriting them from the override would make the identity claim disagree with
+		* itself for no benefit — the gateway reads them as "this is the CN web app".
+		*
+		* @module dsh-connect-workbuddy/cn-gateway
+		*/
+		/** The CN chat gateway the plugin has always used. */
+		const CN_GATEWAY_DEFAULT = "https://copilot.tencent.com";
+		/**
+		* Hosts an override may name, as registrable domains.
+		*
+		* A closed set is the security boundary described in this module's header. Adding
+		* a host here is a deliberate act that must come with a measurement showing it
+		* answers the CN routes, not with a guess about the brand.
+		*/
+		const ALLOWED_CN_DOMAINS = [
+			"copilot.tencent.com",
+			"tencentbuddy.com",
+			"workbuddy.cn",
+			"codebuddy.cn"
+		];
+		/**
+		* Whether `hostname` belongs to one of the CN brands above.
+		*
+		* Matched on the registrable domain (`host === domain` or `host.endsWith('.' +
+		* domain)`), so `wb.tencentbuddy.com` and `copilot.internal.tencentbuddy.com`
+		* both qualify while `tencentbuddy.com.evil.example` does not.
+		*/
+		function isKnownCnHost(hostname) {
+			const lowered = hostname.trim().toLowerCase();
+			if (lowered === "") return false;
+			return ALLOWED_CN_DOMAINS.some((domain) => lowered === domain || lowered.endsWith(`.${domain}`));
+		}
+		/**
+		* Resolve the CN gateway base from an optional user-supplied value.
+		*
+		* An ABSENT or blank value is the normal case and yields the default with
+		* `overridden: false`. A non-blank value must pass every check or the caller
+		* gets `ok: false` and is expected to say so rather than silently falling back:
+		* a user who typed a host and got the default anyway has no way to tell the
+		* setting was ignored, and would keep debugging a network they already fixed.
+		*/
+		function resolveCnGateway(value) {
+			const raw = typeof value === "string" ? value.trim() : "";
+			if (raw === "") return {
+				ok: true,
+				base: CN_GATEWAY_DEFAULT,
+				host: "copilot.tencent.com",
+				overridden: false
+			};
+			let parsed;
+			try {
+				parsed = new URL(raw);
+			} catch {
+				return {
+					ok: false,
+					reason: "malformed",
+					value: raw
+				};
+			}
+			if (parsed.protocol !== "https:") return {
+				ok: false,
+				reason: "insecure",
+				value: raw
+			};
+			if (!isKnownCnHost(parsed.hostname)) return {
+				ok: false,
+				reason: "unknown-host",
+				value: raw
+			};
+			return {
+				ok: true,
+				base: `https://${parsed.hostname.toLowerCase()}`,
+				host: parsed.hostname.toLowerCase(),
+				overridden: true
+			};
+		}
+		//#endregion
+		//#region src/client/panel-switch.ts
+		/**
+		* Whether the OPTIONAL sidebar panel is switched on, as the browser half sees
+		* it, plus the tiny subscription the registration controller needs.
+		*
+		* ## Why this is a module-level store and not component state
+		*
+		* The `sidebar.panellist` row is built from ENTRY METADATA, not from the
+		* component: `ui-sidebar`'s `SidebarRoot` maps `usePanels(...)` (the slot's
+		* entries) into a `PanelRow` button whose label comes from `options.label` and
+		* whose glyph is `renderSlot(...)`. A component that returns `null` therefore
+		* does not hide the row — it renders a BLANK, still-clickable nav button. That
+		* is why the panel cannot use the `ComposerCreditsGate` trick the composer
+		* readout uses (that seat renders a list of components, so `null` means
+		* absent). The row has to be registered only while the switch is on, and
+		* unregistered when it goes off.
+		*
+		* Registering conditionally in turn means something must OWN the re-register on
+		* a settings change, and that something lives in the entry (`apply`), not in a
+		* component. This module is the seam between the two: the card writes a value
+		* here after it has verified a write landed, and the entry subscribes to
+		* register or dispose.
+		*
+		* ## Why the Host is the seed
+		*
+		* The value is DELIVERED by the Host on the status document
+		* (`sidebarPanelEnabled`), for the reason every other switch in this plugin is
+		* Host-carried: this namespace's browser mirror is documented as stale on the
+		* affected 0.1.7 deployments. Reading only the settings scope at startup would
+		* let a stale `false` hide a row the Host believes it is serving — with nothing
+		* to re-evaluate it afterwards, the panel would then be gone for the session.
+		*
+		* Turning the panel OFF while the page is open needs no special handling here:
+		* `ui-layout`'s `retainMainPanels` drops an `activePanelId` whose `main` key no
+		* longer exists, so the centre column returns to the conversation by itself.
+		*/
+		/** Listeners waiting for a change to the opt-in state. */
+		const listeners = /* @__PURE__ */ new Set();
+		/**
+		* The current answer, defaulting to OFF.
+		*
+		* OFF is the whole point of this switch: an absent or unreadable value must
+		* never turn the row on. See `Config.sidebarPanel` in `src/index.ts`.
+		*/
+		let wanted = false;
+		/** Whether the sidebar panel should currently be registered. */
+		function sidebarPanelWanted() {
+			return wanted;
+		}
+		/**
+		* Set the opt-in state and notify the registration controller.
+		*
+		* Idempotent: the controller re-registers on every call, and a settings
+		* subscription can legitimately report the same value twice. Callers that
+		* cannot tell whether the value changed need not check first.
+		*
+		* @param next - the desired state.
+		*/
+		function setSidebarPanelWanted(next) {
+			if (wanted === next) return;
+			wanted = next;
+			for (const listener of [...listeners]) try {
+				listener();
+			} catch {}
+		}
+		/**
+		* Observe changes to the opt-in state.
+		*
+		* @param listener - invoked after each change.
+		* @returns the disposer removing this listener.
+		*/
+		function subscribeSidebarPanelWanted(listener) {
+			listeners.add(listener);
+			return () => {
+				listeners.delete(listener);
+			};
 		}
 		//#endregion
 		//#region src/client/manual-order.ts
@@ -1654,13 +2133,18 @@ window.__ModuleLoader__.load({
 		* measurement and no exclusion is simply unknown, and inventing "可用" for it
 		* would be a claim nobody made.
 		*
-		* The retry wording has three states, matching the card's three:
-		*  - a stated instant        → "被限流 · 10/19 01:32 之后可再用"
-		*  - no instant but a timed   → "被限流 · 未提供恢复时间"
+		* The retry wording has four states, matching the card's four:
+		*  - a stated instant still ahead → "被限流 · 10/19 01:32 之后可再用 · 约 6 小时后"
+		*  - a stated instant ALREADY past, on a WAIT-AND-SEE cooldown (rate-limited,
+		*    model-busy) → NOTHING at all: no verdict (it has expired), no instant (it is
+		*    behind us), and no chore for the reader. The dot already answers the
+		*    question, and the card re-tests that one account by itself. Other outcomes
+		*    that happen to carry a past instant keep their verdict and drop the instant
+		*  - no instant but a timed       → "被限流 · 未提供恢复时间"
 		*    exclusion
-		*  - any other outcome        → the bare outcome ("连不上上游")
+		*  - any other outcome            → the bare outcome ("连不上上游")
 		*
-		* That third case is deliberate: "未提供恢复时间" beside a credential rejection
+		* That last case is deliberate: "未提供恢复时间" beside a credential rejection
 		* would imply waiting helps, when the only fix is signing in again.
 		*/
 		function availabilityLine(t, account, nowMs = Date.now()) {
@@ -1669,8 +2153,9 @@ window.__ModuleLoader__.load({
 				if (probe.outcome === "ok") return outcomeText(t, probe.outcome);
 				if (probe.retryAtMs !== void 0) {
 					const left = remainingText(t, probe.retryAtMs, nowMs);
+					if (left === "") return probe.outcome === "rate-limited" || probe.outcome === "model-busy" ? void 0 : outcomeText(t, probe.outcome);
 					const at = t("row.poolRetryAt", { at: formatShortClock(probe.retryAtMs) });
-					return `${outcomeText(t, probe.outcome)} · ${at}${left === "" ? "" : ` · ${left}`}`;
+					return `${outcomeText(t, probe.outcome)} · ${at} · ${left}`;
 				}
 				if (probe.outcome === "rate-limited" || probe.outcome === "model-busy" || probe.outcome === "out-of-credit") return `${outcomeText(t, probe.outcome)} · ${t("row.poolRetryUnknown")}`;
 				return outcomeText(t, probe.outcome);
@@ -1698,7 +2183,8 @@ window.__ModuleLoader__.load({
 				if (probe.outcome === "ok") return outcomeMarkText(t, probe.outcome);
 				if (probe.retryAtMs !== void 0) {
 					const left = recoversInText(t, probe.retryAtMs, nowMs);
-					return left === "" ? outcomeMarkText(t, probe.outcome) : `${outcomeMarkText(t, probe.outcome)} · ${left}`;
+					if (left !== "") return `${outcomeMarkText(t, probe.outcome)} · ${left}`;
+					return probe.outcome === "rate-limited" || probe.outcome === "model-busy" ? void 0 : outcomeMarkText(t, probe.outcome);
 				}
 				if (probe.outcome === "rate-limited" || probe.outcome === "model-busy" || probe.outcome === "out-of-credit") return `${outcomeMarkText(t, probe.outcome)} · ${t("row.poolRetryUnknown")}`;
 				return outcomeMarkText(t, probe.outcome);
@@ -1732,7 +2218,9 @@ window.__ModuleLoader__.load({
 		* `error` is separate from `warn` because the advice differs: one means "wait",
 		* the other means "do something".
 		*/
-		function stateTone(account) {
+		function stateTone(account, nowMs = Date.now()) {
+			const probe = account.probe;
+			if (probe !== void 0 && probe.retryAtMs !== void 0 && probe.retryAtMs <= nowMs && (probe.outcome === "rate-limited" || probe.outcome === "model-busy")) return account.excludedBy === void 0 ? "unknown" : "warn";
 			if (account.excludedBy !== void 0) return account.excludedBy === "rate-limited" || account.excludedBy === "model-busy" || account.excludedBy === "unavailable" ? "warn" : "error";
 			if (account.probe === void 0) return "unknown";
 			return outcomeOk(account.probe.outcome) ? "ok" : "warn";
@@ -1745,8 +2233,8 @@ window.__ModuleLoader__.load({
 		* edited. The pool table draws a dot from a computed colour, so it needs a value
 		* rather than a class name.
 		*/
-		function stateColor(account) {
-			switch (stateTone(account)) {
+		function stateColor(account, nowMs = Date.now()) {
+			switch (stateTone(account, nowMs)) {
 				case "ok": return "var(--dsw-alias-state-success-primary, #22a06b)";
 				case "warn": return "var(--dsw-alias-state-warn-primary, #f59e0b)";
 				case "error": return "var(--dsw-alias-state-error-primary, #ef4444)";
@@ -1990,6 +2478,329 @@ window.__ModuleLoader__.load({
 			});
 		}
 		//#endregion
+		//#region src/client/device-profile.ts
+		/** 与 Host 侧同一条规则：36 个小写十六进制字符。 */
+		const DEVICE_ID_PATTERN = /^[0-9a-f]{36}$/u;
+		/** Whether `value` is a well-formed device id (as the Host will accept it). */
+		function isDeviceId(value) {
+			return DEVICE_ID_PATTERN.test(value);
+		}
+		/**
+		* 造一个 36 字符的小写十六进制 id（「一键随机」用的就是它）。
+		*
+		* 用 `crypto.getRandomValues` 而不是 `Math.random`：随机值会被当成设备身份发出去，
+		* 一个可预测的序列不是"随机"，而是"两台机器撞在一起"。18 字节与派生值的熵一致。
+		*/
+		function randomDeviceId() {
+			const bytes = /* @__PURE__ */ new Uint8Array(18);
+			crypto.getRandomValues(bytes);
+			return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+		}
+		/**
+		* Normalize one Host answer. Shared by the GET and the POST: two copies of this
+		* coercion is how the two answers start disagreeing.
+		*
+		* 派生值逐条校验形状：它是画在输入框正下方的 36 位串，混进一个 undefined 会
+		* 直接渲染成 "undefined"，比不显示更糟。Host 与本页面同源，这里不做安全意义上的
+		* 校验，只是不让半截数据变成可见的胡说。
+		*/
+		function normalizeSettings(body) {
+			const accounts = typeof body.accounts === "object" && body.accounts !== null ? body.accounts : {};
+			const derived = {};
+			if (typeof body.derived === "object" && body.derived !== null) for (const [accountId, entry] of Object.entries(body.derived)) {
+				const machineId = entry?.machineId;
+				const sessionId = entry?.sessionId;
+				if (typeof machineId !== "string" || typeof sessionId !== "string") continue;
+				if (!isDeviceId(machineId) || !isDeviceId(sessionId)) continue;
+				derived[accountId] = {
+					machineId,
+					sessionId
+				};
+			}
+			const realTier = normalizeRealTier(body.realTier);
+			return {
+				mode: body.mode === "real" ? "real" : "virtual",
+				accounts,
+				...body.derived === void 0 ? {} : { derived },
+				sdkDir: typeof body.sdkDir === "string" ? body.sdkDir : "",
+				sdkFallbackToVirtual: body.sdkFallbackToVirtual !== false,
+				...realTier === void 0 ? {} : { realTier }
+			};
+		}
+		/** 只接受三种已知状态；其它一律当"没这一项"，不去猜。 */
+		function normalizeRealTier(value) {
+			if (typeof value !== "object" || value === null) return void 0;
+			const record = value;
+			const state = record["state"];
+			if (state !== "available" && state !== "broken" && state !== "unavailable") return void 0;
+			return {
+				state,
+				platform: typeof record["platform"] === "string" ? record["platform"] : ""
+			};
+		}
+		/**
+		* GET the current settings.
+		*
+		* `undefined` means "this Host has no such route" (404/503) — a different answer
+		* from "the Host has one and it says virtual/empty". The card uses that to HIDE
+		* the toggle and the row gears instead of rendering controls that cannot work;
+		* `EMPTY_DEVICE_SETTINGS` is only the initial value before the first read.
+		*/
+		async function fetchDeviceSettings(path) {
+			const response = await fetch(path, {
+				headers: { accept: "application/json" },
+				credentials: "same-origin"
+			});
+			if (response.status === 404 || response.status === 503) return void 0;
+			if (!response.ok) throw new Error(`HTTP ${response.status}`);
+			return normalizeSettings(await response.json());
+		}
+		/** POST one mutation and return the settings the Host now holds. */
+		async function post$1(path, body) {
+			const response = await fetch(path, {
+				method: "POST",
+				headers: {
+					"content-type": "application/json",
+					accept: "application/json"
+				},
+				credentials: "same-origin",
+				body: JSON.stringify(body)
+			});
+			if (!response.ok) throw new Error(`HTTP ${response.status}`);
+			return normalizeSettings(await response.json());
+		}
+		/** Switch the tier. 「真实值」is remembered but changes no outbound byte until P3. */
+		function putDeviceMode(path, mode) {
+			return post$1(path, {
+				kind: "mode",
+				mode
+			});
+		}
+		/**
+		* Save one account's overrides.
+		*
+		* `''` clears a field (back to the derived value) and `undefined` leaves it alone —
+		* that distinction is why the dialog sends only the fields the user touched.
+		*/
+		function putDeviceProfile(path, accountId, values) {
+			return post$1(path, {
+				kind: "account",
+				accountId,
+				...values
+			});
+		}
+		/**
+		* Save the SDK directory and/or the fallback switch (作者意见 #1 / #2).
+		*
+		* `undefined` leaves a field alone, exactly like {@link putDeviceProfile}: the
+		* panel has two independent controls, and saving one must not write the other
+		* back to a stale value. `sdkDir: ''` clears the override and returns to
+		* automatic discovery — a different intent from "leave it alone".
+		*/
+		function putDeviceSdk(path, values) {
+			return post$1(path, {
+				kind: "sdk",
+				...values
+			});
+		}
+		//#endregion
+		//#region src/client/DeviceProfileDialog.tsx
+		/**
+		* 一个账号的"虚拟设备参数"弹窗（设置里齿轮点开的那个）。
+		*
+		* ## 为什么是弹窗，而不是行内展开
+		*
+		* 每行已经有「测试 / 移除」两个按钮和一段探针文本，再展开两块输入框会把表格
+		* 挤成表单。这里改的是"这台机器对外声称自己是谁"，属于低频但高影响的编辑，
+		* 适合一个能一眼看完、且必须显式确认的面板。
+		*
+		* ## 为什么字段是"可清空"的
+		*
+		* 留空 = 按本机盐自动派生。清空某一项就恢复自动，而不是要求用户先记住原来的
+		* 派生值——派生值本来就是不可逆推的 36 位十六进制，让人"填回去"是不可能的。
+		*
+		* ## P3 的那一行为什么现在就出现
+		*
+		* 真实设备 Token 的取值链（Turing Shield SDK / 文件）与档位互斥规则都还没实现，
+		* 但入口要预留：用户在看到「真实值（P3）」这个选项时，需要在这个弹窗里看到
+		* "它将来的位置在哪"。禁用 + 一句说明，比一个将来突然冒出来的输入框诚实。
+		*
+		* @module dsh-connect-workbuddy/client/DeviceProfileDialog
+		*/
+		function DeviceProfileDialog(props) {
+			const { t, accountName, saved, derived, derivedNote, saving, error, onCancel, onSave } = props;
+			const [machineId, setMachineId] = (0, react.useState)(saved.machineId);
+			const [sessionId, setSessionId] = (0, react.useState)(saved.sessionId);
+			const firstField = (0, react.useRef)(null);
+			(0, react.useEffect)(() => {
+				const onKeyDown = (event) => {
+					if (event.key === "Escape") onCancel();
+				};
+				window.addEventListener("keydown", onKeyDown);
+				return () => window.removeEventListener("keydown", onKeyDown);
+			}, [onCancel]);
+			(0, react.useEffect)(() => {
+				firstField.current?.focus();
+			}, []);
+			const machineInvalid = machineId !== "" && !isDeviceId(machineId);
+			const sessionInvalid = sessionId !== "" && !isDeviceId(sessionId);
+			const canSave = !saving && !machineInvalid && !sessionInvalid;
+			const field = (labelKey, value, onChange, invalid, derivedValue, ref) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+				className: "dsm-workbuddy-device-field",
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: "dsm-workbuddy-device-field-label",
+						children: t(labelKey)
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+						ref,
+						type: "text",
+						className: `dsm-workbuddy-device-input${invalid ? " dsm-workbuddy-device-input-bad" : ""}`,
+						value,
+						spellCheck: false,
+						autoComplete: "off",
+						placeholder: t("row.deviceFieldPlaceholder"),
+						"aria-invalid": invalid ? true : void 0,
+						onChange: (event) => onChange(event.target.value.trim().toLowerCase())
+					}),
+					value !== "" || derivedValue === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+						className: "dsm-workbuddy-device-derived",
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("row.deviceDerivedNow") }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("code", { children: derivedValue })]
+					}),
+					invalid ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: "dsm-workbuddy-device-error",
+						children: t("row.deviceInvalid")
+					}) : null
+				]
+			});
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+				className: "dsm-workbuddy-device-backdrop",
+				role: "presentation",
+				onClick: (event) => {
+					if (event.target === event.currentTarget) onCancel();
+				},
+				children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "dsm-workbuddy-device-dialog",
+					role: "dialog",
+					"aria-modal": "true",
+					"aria-label": t("row.deviceDialogTitle", { accountName }),
+					children: [
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h4", {
+							className: "dsm-workbuddy-device-title",
+							children: t("row.deviceDialogTitle", { accountName })
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+							className: "dsm-workbuddy-hint",
+							children: t("row.deviceDialogIntro")
+						}),
+						field("row.deviceMachineLabel", machineId, setMachineId, machineInvalid, derived?.machineId, firstField),
+						field("row.deviceSessionLabel", sessionId, setSessionId, sessionInvalid, derived?.sessionId),
+						derived !== void 0 || derivedNote === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+							className: "dsm-workbuddy-device-derived-missing",
+							children: t(derivedNote)
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "dsm-workbuddy-device-random-row",
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: "dsm-btn dsm-btn-outline",
+								onClick: () => {
+									setMachineId(randomDeviceId());
+									setSessionId(randomDeviceId());
+								},
+								children: t("row.deviceRandom")
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "dsm-workbuddy-hint",
+								children: t("row.deviceRandomHint")
+							})]
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "dsm-workbuddy-device-p3",
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "dsm-workbuddy-device-p3-label",
+								children: t("row.deviceDialogP3")
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "dsm-workbuddy-hint",
+								children: t("row.deviceDialogP3Hint")
+							})]
+						}),
+						error === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+							className: "dsm-workbuddy-device-error",
+							children: error
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "dsm-workbuddy-device-dialog-actions",
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: "dsm-btn dsm-btn-outline",
+								onClick: onCancel,
+								disabled: saving,
+								children: t("row.deviceDialogCancel")
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: "dsm-btn dsm-btn-outline",
+								disabled: !canSave,
+								onClick: () => onSave({
+									machineId,
+									sessionId
+								}),
+								children: saving ? t("row.deviceDialogSaving") : t("row.deviceDialogSave")
+							})]
+						})
+					]
+				})
+			});
+		}
+		/**
+		* 「真实值」档下点齿轮时看到的那一句话。
+		*
+		* 为什么齿轮仍然可点：一个真正 `disabled` 的按钮点不动，用户只会以为是界面坏了；
+		* 这里要回答的是"为什么不让我改"——那必须有一次点击才能说出口。视觉上置灰
+		* （`dsm-workbuddy-device-gear-off`）表达"现在用不了"，点击表达"原因是什么"。
+		*/
+		function DeviceModeBlockedDialog(props) {
+			const { t, onClose } = props;
+			(0, react.useEffect)(() => {
+				const onKeyDown = (event) => {
+					if (event.key === "Escape") onClose();
+				};
+				window.addEventListener("keydown", onKeyDown);
+				return () => window.removeEventListener("keydown", onKeyDown);
+			}, [onClose]);
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+				className: "dsm-workbuddy-device-backdrop",
+				role: "presentation",
+				onClick: (event) => {
+					if (event.target === event.currentTarget) onClose();
+				},
+				children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "dsm-workbuddy-device-dialog",
+					role: "dialog",
+					"aria-modal": "true",
+					"aria-label": t("row.deviceModeRealBlockedTitle"),
+					children: [
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("h4", {
+							className: "dsm-workbuddy-device-title",
+							children: t("row.deviceModeRealBlockedTitle")
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+							className: "dsm-workbuddy-hint",
+							children: t("row.deviceModeRealBlocked")
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+							className: "dsm-workbuddy-device-dialog-actions",
+							children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: "dsm-btn dsm-btn-outline",
+								onClick: onClose,
+								children: t("row.deviceDialogCancel")
+							})
+						})
+					]
+				})
+			});
+		}
+		//#endregion
 		//#region src/client/ndjson.ts
 		/**
 		* Read a newline-delimited JSON body, one object at a time.
@@ -2139,7 +2950,9 @@ window.__ModuleLoader__.load({
 			"kimi-k2.6": "multimodal",
 			"kimi-k2.7": "multimodal",
 			"kimi-k3-1": "multimodal",
-			"minimax-m3": "multimodal"
+			"minimax-m3": "multimodal",
+			"minimax-m3.1-flash": "multimodal",
+			"space-bunny": "multimodal"
 		};
 		/**
 		* Ids the upstream lists in the model roster that are ROUTERS, not models.
@@ -2409,6 +3222,19 @@ window.__ModuleLoader__.load({
 			const running = sorted.find((promo) => hasSchedule(promo) && promoActiveAt(promo, nowMs));
 			if (running !== void 0) return running;
 			return sorted.find((promo) => promo.badge.display !== "activeOnly" && promoWithinAbsoluteWindow(promo, nowMs) && promo.schedule?.dailyUnusable !== true);
+		}
+		/**
+		* The chip's colour, when the upstream published a usable one.
+		*
+		* Only a hex colour is accepted: the value reaches an inline style, and the
+		* upstream's feed publishes hex (`#009273`, `#FF0000`). Anything else is
+		* refused rather than passed through, and the card falls back to its own
+		* brand colour.
+		*/
+		function promoBadgeColor(promo) {
+			const color = promo.badge.color;
+			if (color === void 0) return void 0;
+			return /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(color) ? color : void 0;
 		}
 		"WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0".match(/WorkBuddy\/([^\s]+)/u)?.[1];
 		new RegExp(`^(?:<acp\\b[^>]*>m\\d{1,8}<\\/acp>[ \\t]*\\r?\\n?)*(?:Time sampled while preparing turn \\d+, step \\d+:|Current runtime context\\.|<system-reminder>|\\[Compressed conversation section\\]|This is an efficiency nudge)`, "u");
@@ -2722,6 +3548,14 @@ window.__ModuleLoader__.load({
 		*/
 		function AccountPool(props) {
 			const { t, region, pool, settingsScope, siblingBusy, onBusyChange, onSaved, onRefresh, onRescan, rescanning, onSelectAccount, selectingAccount, accountTools } = props;
+			const { deviceMode, deviceProfiles, deviceDerived, onDeviceModeChange, onSaveDeviceProfile, realTier } = props;
+			/**
+			* 「真实值」能不能用。`undefined`（老 Host 没这一项）必须落到 `true`——读不到就
+			* 禁用等于替用户取消一个可能可用的功能。
+			*/
+			const realTierUsable = realTier === void 0 ? true : realTier.state === "available";
+			/** 当前正停在「真实值」但它已经不可用：把说明换成"用不了"，而不是宣传语。 */
+			const modeHintBlocked = realTierUsable === false && deviceMode === "real";
 			const [draft, setDraft] = (0, react.useState)(null);
 			const [saving, setSaving] = (0, react.useState)(false);
 			const [saveError, setSaveError] = (0, react.useState)(void 0);
@@ -2734,6 +3568,18 @@ window.__ModuleLoader__.load({
 			}, [region]);
 			const [draftRegion, setDraftRegion] = (0, react.useState)(void 0);
 			const [orderRulesOpen, setOrderRulesOpen] = (0, react.useState)(false);
+			/**
+			* 设备头编辑器：哪个账号、是否在保存、上一次失败的原因。
+			*
+			* `undefined` = 弹窗关着。分开存 `saving`/`error` 而不是塞进同一个对象，是因为
+			* 保存失败时弹窗必须**保持打开**并保留用户填的值——关掉再重开一次，填写内容
+			* 就全没了。
+			*/
+			const [deviceEditing, setDeviceEditing] = (0, react.useState)(void 0);
+			const [deviceSaving, setDeviceSaving] = (0, react.useState)(false);
+			const [deviceError, setDeviceError] = (0, react.useState)(void 0);
+			const [deviceBlockedOpen, setDeviceBlockedOpen] = (0, react.useState)(false);
+			const [deviceModeBusy, setDeviceModeBusy] = (0, react.useState)(false);
 			const mounted = (0, react.useRef)(true);
 			(0, react.useEffect)(() => {
 				mounted.current = true;
@@ -2746,7 +3592,8 @@ window.__ModuleLoader__.load({
 				targetModelId: pool?.targetModelId || pool?.staleTargetModelId || "",
 				probeInputTokens: pool?.probeInputTokens ?? 0,
 				memberAccountIds: pool?.memberAccountIds ?? [],
-				orderAccountIds: pool?.orderAccountIds ?? []
+				orderAccountIds: pool?.orderAccountIds ?? [],
+				autoCheckin: pool?.autoCheckin === true
 			};
 			const active = draftRegion === region && draft !== null ? draft : saved;
 			/**
@@ -2767,7 +3614,24 @@ window.__ModuleLoader__.load({
 			* the pending edit.
 			*/
 			const poolRunning = saved.enabled;
-			const dirty = draftRegion === region && draft !== null && (draft.enabled !== saved.enabled || draft.targetModelId !== saved.targetModelId || draft.probeInputTokens !== saved.probeInputTokens || !sameIds(draft.memberAccountIds, saved.memberAccountIds) || !sameOrder(draft.orderAccountIds, saved.orderAccountIds));
+			const dirty = draftRegion === region && draft !== null && (draft.enabled !== saved.enabled || draft.targetModelId !== saved.targetModelId || draft.probeInputTokens !== saved.probeInputTokens || !sameIds(draft.memberAccountIds, saved.memberAccountIds) || !sameOrder(draft.orderAccountIds, saved.orderAccountIds) || draft.autoCheckin !== saved.autoCheckin);
+			/**
+			* The automatic check-in's progress line, or nothing.
+			*
+			* Read from the SAVED switch, not the draft: this describes what the runner is
+			* doing, and a draft that says "on" has not started anything yet. Showing
+			* progress for a switch that is not saved would claim a job was running.
+			*/
+			const autoCheckinStatus = (() => {
+				if (!saved.autoCheckin) return null;
+				const today = pool?.autoCheckinToday;
+				if (today === void 0) return null;
+				const headline = today.pending === 0 && today.done === today.total ? t("row.poolAutoCheckinDone", { total: String(today.total) }) : t("row.poolAutoCheckinToday", {
+					done: String(today.done),
+					total: String(today.total)
+				});
+				return (0, react.createElement)("div", { className: "dsm-workbuddy-pool-auto-checkin-status" }, (0, react.createElement)("span", { className: "dsm-workbuddy-pool-auto-checkin-line" }, headline), today.pending === 0 ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-auto-checkin-pending" }, t("row.poolAutoCheckinPending", { count: String(today.pending) })), today.lastError === void 0 ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-auto-checkin-error" }, t("row.poolAutoCheckinFailed", { message: today.lastError })));
+			})();
 			/**
 			* Membership that actually resolves to a local sign-in — what a batch runs on.
 			*
@@ -3144,6 +4008,56 @@ window.__ModuleLoader__.load({
 				t
 			]);
 			/**
+			* RE-TEST THE ONE ACCOUNT WHOSE STATED COOLDOWN HAS RUN OUT — by itself, once.
+			*
+			* The row used to print 「被限流 · 限流时段已过 · 重新测试以确认」: a verdict, a
+			* note that the verdict had expired, and a chore for the reader, in one line
+			* that contradicted itself. The owner's answer was that the plugin should
+			* simply measure that single account rather than write such a sentence, so
+			* this does exactly that: one account, one request, no click.
+			*
+			* WHY AN EFFECT rather than a decision taken while rendering: `runRowTest` is
+			* async and writes state, and a render must never start requests. Running after
+			* the snapshot has been painted means the row first shows the honest
+			* 「恢复时间已到 · 待复核」, which the new measurement then replaces.
+			*
+			* ONCE PER ACCOUNT PER MOUNT. The old record keeps being rendered until the new
+			* one lands, so without `autoRetested` every re-render in that window would
+			* fire another test, and a pool of limited accounts would hammer the upstream.
+			* A FAILED re-test is final too: the row keeps its stale record instead of
+			* looping on a route that is refusing.
+			*
+			* ONE AT A TIME. Any write in flight — a batch, a removal, another row's test —
+			* returns early; the next candidate is picked on the render after the previous
+			* one has flipped its own probe. Firing them together would race the refresh
+			* each of them triggers (the same reason the batch is serialized).
+			*/
+			const autoRetested = (0, react.useRef)(/* @__PURE__ */ new Set());
+			(0, react.useEffect)(() => {
+				if (!mounted.current || pool === void 0 || !active.enabled) return;
+				if (rowBusyAccountId !== void 0 || busy !== void 0) return;
+				if (pool.targetModelSource === "none" || pool.targetModelSource === "stale") return;
+				const now = Date.now();
+				for (const account of pool.accounts) {
+					if (!active.memberAccountIds.includes(account.accountId)) continue;
+					const probe = account.probe;
+					if (probe === void 0 || probe.retryAtMs === void 0) continue;
+					if (probe.outcome !== "rate-limited" && probe.outcome !== "model-busy") continue;
+					if (probe.retryAtMs > now) continue;
+					if (autoRetested.current.has(account.accountId)) continue;
+					autoRetested.current.add(account.accountId);
+					runRowTest(account.accountId);
+					return;
+				}
+			}, [
+				active.enabled,
+				active.memberAccountIds,
+				busy,
+				pool,
+				rowBusyAccountId,
+				runRowTest
+			]);
+			/**
 			* Claim ONE benefit on ONE account, from its row (issue #79).
 			*
 			* Always a single account and a single campaign: there is no batch entry
@@ -3318,6 +4232,50 @@ window.__ModuleLoader__.load({
 				open: orderRulesOpen,
 				onToggle: (event) => setOrderRulesOpen(event.currentTarget.open)
 			}, (0, react.createElement)("summary", { className: "dsm-workbuddy-pool-order-rules-summary" }, t("row.poolOrderRulesTitle")), (0, react.createElement)("div", { className: "dsm-workbuddy-pool-order-rules-body" }, (0, react.createElement)("p", { className: "dsm-workbuddy-pool-note" }, t("row.poolOrderRulesIntro")), (0, react.createElement)("ol", { className: "dsm-workbuddy-pool-order-rules-list" }, ...ORDER_RULE_KEYS.map((key) => (0, react.createElement)("li", { key }, t(key)))), (0, react.createElement)("p", { className: "dsm-workbuddy-pool-order-rules-why" }, t("row.poolOrderWhy")), (0, react.createElement)("p", { className: "dsm-workbuddy-pool-note" }, t("row.poolOrderBadgeNote"))));
+			/**
+			* 切换设备头档位。**即时生效**，不走草稿：这个开关决定每一行那个齿轮是否可用，
+			* 如果它要等一次「保存」才生效，用户会先看到齿轮没反应、再去找保存按钮。
+			*/
+			const changeDeviceMode = async (mode) => {
+				if (onDeviceModeChange === void 0 || deviceModeBusy || mode === deviceMode) return;
+				setDeviceModeBusy(true);
+				setActionError(void 0);
+				try {
+					await onDeviceModeChange(mode);
+				} catch (error) {
+					if (mounted.current) setActionError(error instanceof Error ? error.message : t("row.requestFailed"));
+				} finally {
+					if (mounted.current) setDeviceModeBusy(false);
+				}
+			};
+			/** 保存一个账号的覆盖值；失败时让弹窗留着、把原因放在里面。 */
+			const saveDeviceProfileFor = async (accountId, values) => {
+				if (onSaveDeviceProfile === void 0) return;
+				setDeviceSaving(true);
+				setDeviceError(void 0);
+				try {
+					await onSaveDeviceProfile(accountId, values);
+					if (mounted.current) setDeviceEditing(void 0);
+				} catch (error) {
+					if (mounted.current) setDeviceError(error instanceof Error ? error.message : t("row.requestFailed"));
+				} finally {
+					if (mounted.current) setDeviceSaving(false);
+				}
+			};
+			/**
+			* 弹窗的派生值那一块。
+			*
+			* 三种情况必须分开，因为它们对用户的含义完全不同：
+			* - 有值 → 直接显示"留空会发这个"；
+			* - 整块缺席 → Host 没算（旧版本、或本机没有设备盐），这时一个头都不发；
+			* - 有这块但这行没有 → 这个账号没有 uid，算不出来，同样不发设备头。
+			* 合成一句"暂无"会把"本机不可用"和"这个账号不可用"混成同一件事。
+			*/
+			const derivedPropsFor = (accountId) => {
+				if (deviceDerived === void 0) return { derivedNote: "row.deviceDerivedUnavailable" };
+				const entry = deviceDerived[accountId];
+				return entry === void 0 ? { derivedNote: "row.deviceDerivedNoUid" } : { derived: entry };
+			};
 			return (0, react.createElement)("section", { className: "dsm-workbuddy-pool" }, rowBusyAction === "remove" ? (0, react.createElement)(BusyOverlay, {
 				visible: true,
 				message: t("row.poolRowRemoving"),
@@ -3326,7 +4284,7 @@ window.__ModuleLoader__.load({
 				visible: true,
 				message: t("row.poolSaving"),
 				hint: t("row.veilHintList")
-			}) : null, (0, react.createElement)("div", { className: "dsm-workbuddy-pool-head" }, (0, react.createElement)("h3", { className: "dsm-workbuddy-pool-title" }, t("row.poolTitle")), manualPicker !== null ? manualPicker : currentName === void 0 ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-current-badge" }, t("row.poolCurrentHeader", { account: currentName }))), (0, react.createElement)("div", { className: "dsm-workbuddy-pool-settings dsm-workbuddy-pool-modebar" }, (0, react.createElement)("div", { className: "dsm-workbuddy-pool-modebar-row" }, (0, react.createElement)("label", { className: "sw" }, (0, react.createElement)("input", {
+			}) : null, (0, react.createElement)("div", { className: "dsm-workbuddy-pool-head" }, (0, react.createElement)("h3", { className: "dsm-workbuddy-pool-title" }, t("row.poolTitle")), (0, react.createElement)("p", { className: "dsm-workbuddy-free-quota-warn" }, t("row.tabFreeQuotaWarn")), manualPicker !== null ? manualPicker : currentName === void 0 ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-current-badge" }, t("row.poolCurrentHeader", { account: currentName }))), (0, react.createElement)("div", { className: "dsm-workbuddy-pool-settings dsm-workbuddy-pool-modebar" }, (0, react.createElement)("div", { className: "dsm-workbuddy-pool-modebar-row" }, (0, react.createElement)("label", { className: "sw" }, (0, react.createElement)("input", {
 				type: "checkbox",
 				checked: active.enabled,
 				disabled: !canEditPool,
@@ -3337,7 +4295,18 @@ window.__ModuleLoader__.load({
 						enabled: next
 					}));
 				}
-			}), (0, react.createElement)("span", { className: "sw-track" })), (0, react.createElement)("b", { className: "dsm-workbuddy-pool-modebar-label" }, t("row.poolEnabled")), (0, react.createElement)("span", { className: "dsm-workbuddy-pool-modebar-state" }, poolRunning ? t("row.poolModeAuto") : t("row.poolModeManual")), dirty ? (0, react.createElement)("span", { className: "dsm-workbuddy-pool-dirty" }, t("row.poolDirty")) : null), (0, react.createElement)("p", { className: "dsm-workbuddy-pool-note" }, t("row.poolEnabledHint"))), poolRunning && currentAccount !== void 0 && !effectiveMembers.includes(currentAccount.accountId) ? (0, react.createElement)("p", { className: "dsm-workbuddy-pool-note dsm-workbuddy-pool-serving-note" }, t("row.poolServingOutside", { account: currentName ?? "" })) : null, poolRunning && effectiveMembers.length > 0 && usable.length === 0 ? allMembersBlockedByModel(pool?.accounts ?? [], effectiveMembers, active.memberAccountIds) ? (0, react.createElement)("p", {
+			}), (0, react.createElement)("span", { className: "sw-track" })), (0, react.createElement)("b", { className: "dsm-workbuddy-pool-modebar-label" }, t("row.poolEnabled")), (0, react.createElement)("span", { className: "dsm-workbuddy-pool-modebar-state" }, poolRunning ? t("row.poolModeAuto") : t("row.poolModeManual")), dirty ? (0, react.createElement)("span", { className: "dsm-workbuddy-pool-dirty" }, t("row.poolDirty")) : null), (0, react.createElement)("p", { className: "dsm-workbuddy-pool-note" }, t("row.poolEnabledHint")), pool.checkinSupported ? (0, react.createElement)("div", { className: "dsm-workbuddy-pool-auto-checkin" }, (0, react.createElement)("div", { className: "dsm-workbuddy-pool-switchrow" }, (0, react.createElement)("label", { className: "sw" }, (0, react.createElement)("input", {
+				type: "checkbox",
+				checked: active.autoCheckin,
+				disabled: !canEditPool,
+				onChange: (event) => {
+					const next = event.currentTarget.checked;
+					editDraft((current) => ({
+						...current,
+						autoCheckin: next
+					}));
+				}
+			}), (0, react.createElement)("span", { className: "sw-track" })), (0, react.createElement)("b", { className: "dsm-workbuddy-pool-modebar-label" }, t("row.poolAutoCheckin"))), (0, react.createElement)("p", { className: "dsm-workbuddy-pool-note" }, t("row.poolAutoCheckinHint")), autoCheckinStatus) : null), poolRunning && currentAccount !== void 0 && !effectiveMembers.includes(currentAccount.accountId) ? (0, react.createElement)("p", { className: "dsm-workbuddy-pool-note dsm-workbuddy-pool-serving-note" }, t("row.poolServingOutside", { account: currentName ?? "" })) : null, poolRunning && effectiveMembers.length > 0 && usable.length === 0 ? allMembersBlockedByModel(pool?.accounts ?? [], effectiveMembers, active.memberAccountIds) ? (0, react.createElement)("p", {
 				className: "dsm-workbuddy-pool-warn",
 				role: "status"
 			}, `${t("row.poolModelWideBusy")} ${t("row.poolModelWideBusyHint")}`) : (0, react.createElement)("p", {
@@ -3376,7 +4345,24 @@ window.__ModuleLoader__.load({
 				className: "dsm-btn dsm-btn-outline",
 				disabled: rescanning === true,
 				onClick: onRescan
-			}, rescanning === true ? t("row.accountsScanning") : t("row.accountsRescan")))), (0, react.createElement)("div", { className: `dsm-workbuddy-pool-table${pool.checkinSupported ? " dsm-workbuddy-pool-table-checkin" : ""}` }, (0, react.createElement)("div", { className: "dsm-workbuddy-pool-row dsm-workbuddy-pool-row-head" }, (0, react.createElement)("span", null, t("row.poolColumnAccount")), (0, react.createElement)("span", null, t("row.poolColumnCredits")), (0, react.createElement)("span", null, t("row.poolColumnProbe")), pool.checkinSupported ? (0, react.createElement)("span", null, t("row.poolColumnCheckin")) : null, (0, react.createElement)("span", null)), ...(() => {
+			}, rescanning === true ? t("row.accountsScanning") : t("row.accountsRescan")))), deviceMode === void 0 || onDeviceModeChange === void 0 ? null : (0, react.createElement)("div", { className: "dsm-workbuddy-device-mode" }, (0, react.createElement)("span", { className: "dsm-workbuddy-device-mode-title" }, t("row.deviceModeTitle")), (0, react.createElement)("span", {
+				className: "dsm-workbuddy-device-mode-seg",
+				role: "group",
+				"aria-label": t("row.deviceModeTitle")
+			}, ...["virtual", "real"].map((mode) => {
+				const blocked = mode === "real" && realTierUsable === false;
+				return (0, react.createElement)("button", {
+					key: mode,
+					type: "button",
+					className: `dsm-workbuddy-device-seg-btn${deviceMode === mode ? " dsm-workbuddy-device-seg-on" : ""}`,
+					"aria-pressed": deviceMode === mode,
+					disabled: deviceModeBusy || blocked,
+					title: blocked ? t("row.deviceModeRealUnsupported") : void 0,
+					onClick: () => {
+						changeDeviceMode(mode);
+					}
+				}, t(mode === "virtual" ? "row.deviceModeVirtual" : "row.deviceModeReal"));
+			})), (0, react.createElement)("span", { className: "dsm-workbuddy-hint" }, modeHintBlocked ? t("row.deviceModeRealUnsupported") : deviceMode === "real" ? t("row.deviceModeHintReal") : t("row.deviceModeHintVirtual"))), (0, react.createElement)("div", { className: `dsm-workbuddy-pool-table${pool.checkinSupported ? " dsm-workbuddy-pool-table-checkin" : ""}` }, (0, react.createElement)("div", { className: "dsm-workbuddy-pool-row dsm-workbuddy-pool-row-head" }, (0, react.createElement)("span", { className: "dsm-workbuddy-pool-col-account" }, t("row.poolColumnAccount")), (0, react.createElement)("span", { className: "dsm-workbuddy-pool-col-credits" }, t("row.poolColumnCredits")), (0, react.createElement)("span", { className: "dsm-workbuddy-pool-col-probe" }, t("row.poolColumnProbe")), pool.checkinSupported ? (0, react.createElement)("span", { className: "dsm-workbuddy-pool-col-checkin" }, t("row.poolColumnCheckin")) : null, (0, react.createElement)("span", { className: "dsm-workbuddy-pool-col-actions" })), ...(() => {
 				const ordered = sortAccountsByOrder(pool.accounts, orderIds);
 				let memberSeen = 0;
 				let memberTotal = 0;
@@ -3407,6 +4393,18 @@ window.__ModuleLoader__.load({
 						onRemove: () => {
 							runRowRemove(account.accountId, account.accountName);
 						},
+						...onSaveDeviceProfile === void 0 ? {} : { onEditDevice: () => {
+							if (deviceMode === "real") {
+								setDeviceBlockedOpen(true);
+								return;
+							}
+							setDeviceError(void 0);
+							setDeviceEditing({
+								accountId: account.accountId,
+								name: account.accountName
+							});
+						} },
+						deviceGearBlocked: deviceMode === "real",
 						onClaim: (kind, title, creditNum) => {
 							runRowClaim(account.accountId, account.accountName, kind, title, creditNum);
 						},
@@ -3484,15 +4482,52 @@ window.__ModuleLoader__.load({
 					logStore.set(region, []);
 					setLog([]);
 				}
-			}));
+			}), deviceEditing === void 0 ? null : (0, react.createElement)(DeviceProfileDialog, {
+				t,
+				accountName: deviceEditing.name,
+				saved: {
+					machineId: deviceProfiles?.[deviceEditing.accountId]?.machineId ?? "",
+					sessionId: deviceProfiles?.[deviceEditing.accountId]?.sessionId ?? ""
+				},
+				...derivedPropsFor(deviceEditing.accountId),
+				saving: deviceSaving,
+				...deviceError === void 0 ? {} : { error: deviceError },
+				onCancel: () => {
+					setDeviceEditing(void 0);
+					setDeviceError(void 0);
+				},
+				onSave: (values) => {
+					saveDeviceProfileFor(deviceEditing.accountId, values);
+				}
+			}), deviceBlockedOpen ? (0, react.createElement)(DeviceModeBlockedDialog, {
+				t,
+				onClose: () => setDeviceBlockedOpen(false)
+			}) : null);
 		}
 		/** One account's row. */
 		function renderAccountRow(input) {
-			const { t, account, checked, canEdit, checkinSupported, onToggle, busy, rowBusy, testDisabled, targetHint, onTest, onRemove, onClaim, rowBusyAction, claimBusy, orderIndex, orderIsManual, moveEnabled, onMoveUp, onMoveDown, moveUpDisabled, moveDownDisabled, poolModelId } = input;
+			const { t, account, checked, canEdit, checkinSupported, onToggle, busy, rowBusy, testDisabled, targetHint, onTest, onRemove, onClaim, rowBusyAction, claimBusy, orderIndex, orderIsManual, moveEnabled, onMoveUp, onMoveDown, moveUpDisabled, moveDownDisabled, poolModelId, onEditDevice, deviceGearBlocked } = input;
 			const name = account.accountName === "" ? t("row.accountUnnamed") : account.accountName;
 			const excluded = exclusionText(t, account.excludedBy);
 			const probe = account.probe;
-			const outcomeLine = availabilityLine(t, account) ?? t("row.poolNeverTested");
+			/**
+			* Would the exclusion label say what line two already says?
+			*
+			* Both facts come from the SAME measurement: `excludedBy` is derived from the
+			* probe, so for every outcome that doubles as an exclusion reason (rate-limited,
+			* model-busy, out-of-credit, credential-rejected, account-restricted,
+			* unavailable, not-found, failed) the label is a second copy of the verdict a
+			* few pixels away. Comparing the REASON CODE, not the translated string: the
+			* string comparison this replaces covered only `rate-limited`, so 「模型繁忙 ·
+			* … · 模型繁忙」 and 「积分用尽 · … · 积分用尽」 still printed the verdict twice —
+			* and it would have silently un-fixed itself on the next wording change.
+			*
+			* With no probe at all the label is not duplicated but REUSED: `availabilityLine`
+			* falls back to exactly this text.
+			*/
+			const excludedRepeatsVerdict = excluded === void 0 || probe === void 0 || probe.outcome === account.excludedBy;
+			const measuredButSilent = probe !== void 0 && availabilityLine(t, account) === void 0;
+			const outcomeLine = availabilityLine(t, account) ?? (probe === void 0 ? t("row.poolNeverTested") : void 0);
 			const reason = probe === void 0 ? void 0 : inlineProbeReason(probe.outcome, probe.message);
 			const age = probe === void 0 ? void 0 : probeAgeText(t, probe.atMs, Date.now());
 			const probeLabel = probe === void 0 ? void 0 : probe.source === void 0 ? {
@@ -3538,7 +4573,7 @@ window.__ModuleLoader__.load({
 				"aria-label": t("row.poolMoveDownAria", { accountName: name }),
 				disabled: moveDownDisabled,
 				onClick: onMoveDown
-			}, "↓")) : null) : null, account.current ? (0, react.createElement)("span", { className: "dsm-workbuddy-pool-current-tag" }, t("row.poolCurrentBadge")) : null, checked ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-not-member" }, t("row.poolNotMember")), excluded === void 0 ? probe === void 0 ? null : (0, react.createElement)("span", null, t("row.poolTestedAt", { at: formatShortClock(probe.atMs) })) : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-excluded" }, excluded))), (0, react.createElement)("span", { className: "dsm-workbuddy-pool-credits" }, account.credits === void 0 ? (0, react.createElement)("span", null, "—") : (0, react.createElement)("b", null, formatNumber$1(account.credits)), account.expiringSoon !== void 0 && account.expiringSoon > 0 ? (0, react.createElement)("span", { className: "dsm-workbuddy-pool-soon" }, t("row.poolCreditSoon", { count: formatNumber$1(account.expiringSoon) })) : account.nearestExpiryMs === void 0 ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-soon-plain" }, t("row.poolCreditNearest", { at: formatShortClock(account.nearestExpiryMs) })), account.enterprise === true || account.benefits === void 0 || account.benefits.length === 0 ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-benefits" }, account.benefits.map((benefit, index) => (0, react.createElement)("span", {
+			}, "↓")) : null) : null, account.current ? (0, react.createElement)("span", { className: "dsm-workbuddy-pool-current-tag" }, t("row.poolCurrentBadge")) : null, checked ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-not-member" }, t("row.poolNotMember")))), (0, react.createElement)("span", { className: "dsm-workbuddy-pool-credits" }, account.credits === void 0 ? (0, react.createElement)("span", null, "—") : (0, react.createElement)("b", null, formatNumber$1(account.credits)), account.expiringSoon !== void 0 && account.expiringSoon > 0 ? (0, react.createElement)("span", { className: "dsm-workbuddy-pool-soon" }, t("row.poolCreditSoon", { count: formatNumber$1(account.expiringSoon) })) : null, account.enterprise === true || account.benefits === void 0 || account.benefits.length === 0 ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-benefits" }, account.benefits.map((benefit, index) => (0, react.createElement)("span", {
 				key: benefit.kind,
 				className: benefit.urgent ? "dsm-workbuddy-pool-benefit dsm-workbuddy-pool-benefit-urgent" : "dsm-workbuddy-pool-benefit"
 			}, index === 0 ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-prov-sep" }, "·"), (0, react.createElement)("span", { className: "dsm-workbuddy-pool-benefit-tag" }, benefit.urgent ? benefit.daysLeft === void 0 || benefit.daysLeft === 0 ? t("row.poolBenefitDueToday", {
@@ -3564,10 +4599,23 @@ window.__ModuleLoader__.load({
 			}, (0, react.createElement)("span", null, claimBusy && rowBusyAction === "claim" ? t("row.poolBenefitClaiming") : t("row.poolBenefitClaim"))))))), (0, react.createElement)("span", {
 				className: "dsm-workbuddy-pool-probe",
 				...probe?.message === void 0 ? {} : { title: probe.message }
-			}, (0, react.createElement)("span", { className: "dsm-workbuddy-pool-probe-main" }, probeLine), probeLabel === void 0 && age === void 0 ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-probe-prov" }, probeLabel === void 0 ? null : (0, react.createElement)("span", { className: probeLabel.className }, probeLabel.text), probeLabel === void 0 || age === void 0 ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-prov-sep" }, "·"), age === void 0 ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-prov-age" }, age), probe !== void 0 && probe.modelId !== poolModelId ? (0, react.createElement)("span", { className: "dsm-workbuddy-pool-prov-model" }, probe.modelId === void 0 ? t("row.poolProbeModelUnknown") : t("row.poolProbeModel", { model: probe.modelId })) : null)), checkinSupported ? (0, react.createElement)("span", { className: "dsm-workbuddy-pool-checkin" }, account.enterprise === true ? (0, react.createElement)("span", { className: "dsm-workbuddy-pool-unknown" }, t("row.poolCheckinEnterprise")) : account.checkedInToday === void 0 ? (0, react.createElement)("span", {
+			}, (0, react.createElement)("span", { className: "dsm-workbuddy-pool-probe-line" }, measuredButSilent ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-probe-main" }, probeLine), excludedRepeatsVerdict || excluded === void 0 ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-probe-sep" }, "·"), excludedRepeatsVerdict ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-excluded" }, excluded), probe === void 0 || measuredButSilent && excludedRepeatsVerdict ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-probe-sep" }, "·"), probe === void 0 ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-tested-at" }, t("row.poolTestedAt", { at: formatShortClock(probe.atMs) }))), probeLabel === void 0 && age === void 0 ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-probe-prov" }, probeLabel === void 0 ? null : (0, react.createElement)("span", { className: probeLabel.className }, probeLabel.text), probeLabel === void 0 || age === void 0 ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-prov-sep" }, "·"), age === void 0 ? null : (0, react.createElement)("span", { className: "dsm-workbuddy-pool-prov-age" }, age), probe !== void 0 && probe.modelId !== poolModelId ? [(0, react.createElement)("span", {
+				key: "sep",
+				className: "dsm-workbuddy-pool-prov-sep"
+			}, "·"), (0, react.createElement)("span", {
+				key: "model",
+				className: "dsm-workbuddy-pool-prov-model"
+			}, probe.modelId === void 0 ? t("row.poolProbeModelUnknown") : t("row.poolProbeModel", { model: probe.modelId }))] : null)), checkinSupported ? (0, react.createElement)("span", { className: "dsm-workbuddy-pool-checkin" }, account.enterprise === true ? (0, react.createElement)("span", { className: "dsm-workbuddy-pool-unknown" }, t("row.poolCheckinEnterprise")) : account.checkedInToday === void 0 ? (0, react.createElement)("span", {
 				className: "dsm-workbuddy-pool-unknown",
 				title: t("row.poolNeverTested")
-			}, t("row.poolCheckinUnknown")) : account.checkedInToday ? (0, react.createElement)("span", { className: "dsm-workbuddy-pool-checked" }, t("row.poolCheckedIn")) : t("row.poolNotCheckedIn")) : null, (0, react.createElement)("span", { className: "dsm-workbuddy-pool-row-actions" }, (0, react.createElement)("button", {
+			}, t("row.poolCheckinUnknown")) : account.checkedInToday ? (0, react.createElement)("span", { className: "dsm-workbuddy-pool-checked" }, t("row.poolCheckedIn")) : t("row.poolNotCheckedIn")) : null, (0, react.createElement)("span", { className: "dsm-workbuddy-pool-row-actions" }, onEditDevice === void 0 ? null : (0, react.createElement)("button", {
+				type: "button",
+				className: `dsm-btn dsm-btn-outline dsm-workbuddy-pool-small-btn dsm-workbuddy-device-gear${deviceGearBlocked ? " dsm-workbuddy-device-gear-off" : ""}`,
+				"aria-disabled": deviceGearBlocked ? true : void 0,
+				title: deviceGearBlocked ? t("row.deviceGearBlockedHint") : t("row.deviceGearHint"),
+				"aria-label": t("row.deviceGearAria", { accountName: name }),
+				onClick: onEditDevice
+			}, "⚙"), (0, react.createElement)("button", {
 				type: "button",
 				className: "dsm-btn dsm-btn-outline dsm-workbuddy-pool-small-btn",
 				disabled: rowBusy || testDisabled,
@@ -3711,6 +4759,498 @@ window.__ModuleLoader__.load({
 				id: account.accountId,
 				account
 			})), orderIds).map((entry) => entry.account);
+		}
+		//#endregion
+		//#region src/client/device-sdk.ts
+		/** 校验并折成 Host 的类型；形状不认识时返回 `undefined`，面板据此显示"不可用"。 */
+		function normalize(body) {
+			if (typeof body !== "object" || body === null) return void 0;
+			const record = body;
+			const sdk = record["sdk"];
+			const token = record["token"];
+			if (typeof sdk !== "object" || sdk === null || typeof token !== "object" || token === null) return void 0;
+			const sdkRecord = sdk;
+			const tokenRecord = token;
+			const sdkState = sdkRecord["state"];
+			const tokenState = tokenRecord["state"];
+			const info = {
+				state: sdkState === "ready" || sdkState === "unsupported" || sdkState === "missing" || sdkState === "error" || sdkState === "disabled" ? sdkState : "error",
+				bundle: typeof sdkRecord["bundle"] === "string" ? sdkRecord["bundle"] : "",
+				path: typeof sdkRecord["path"] === "string" ? sdkRecord["path"] : "",
+				platform: typeof sdkRecord["platform"] === "string" ? sdkRecord["platform"] : "",
+				arch: typeof sdkRecord["arch"] === "string" ? sdkRecord["arch"] : "",
+				runtime: typeof sdkRecord["runtime"] === "string" ? sdkRecord["runtime"] : "",
+				...typeof sdkRecord["reason"] === "string" ? { reason: sdkRecord["reason"] } : {}
+			};
+			const readout = {
+				state: tokenState === "ok" || tokenState === "stale" || tokenState === "unavailable" || tokenState === "idle" ? tokenState : "unavailable",
+				masked: typeof tokenRecord["masked"] === "string" ? tokenRecord["masked"] : "",
+				length: typeof tokenRecord["length"] === "number" ? tokenRecord["length"] : 0,
+				...typeof tokenRecord["fetchedAtMs"] === "number" ? { fetchedAtMs: tokenRecord["fetchedAtMs"] } : {},
+				...typeof tokenRecord["lastAttemptMs"] === "number" ? { lastAttemptMs: tokenRecord["lastAttemptMs"] } : {},
+				...typeof tokenRecord["reason"] === "string" ? { reason: tokenRecord["reason"] } : {}
+			};
+			return {
+				tier: record["tier"] === "real" ? "real" : "virtual",
+				sdk: info,
+				token: readout,
+				...typeof record["sdkEnabled"] === "boolean" ? { sdkEnabled: record["sdkEnabled"] } : {}
+			};
+		}
+		/** 读状态。`undefined` = 这个 Host 没有这条路由（404/503），面板该整块隐藏。 */
+		async function fetchDeviceSdk(path) {
+			const response = await fetch(path, {
+				headers: { accept: "application/json" },
+				credentials: "same-origin"
+			});
+			if (response.status === 404 || response.status === 503) return void 0;
+			if (!response.ok) throw new Error(`HTTP ${response.status}`);
+			return normalize(await response.json());
+		}
+		async function post(path, action) {
+			const response = await fetch(`${path}?action=${action}`, {
+				method: "POST",
+				headers: { accept: "application/json" },
+				credentials: "same-origin"
+			});
+			if (response.status === 409) return void 0;
+			if (!response.ok) throw new Error(`HTTP ${response.status}`);
+			return response.json();
+		}
+		/** 强制重取一次（会真的跑一次 SDK）。 */
+		async function refreshDeviceSdk(path) {
+			return normalize(await post(path, "refresh"));
+		}
+		/**
+		* 写 SDK 总开关（`Config.deviceSdkEnabled`）。
+		*
+		* 501 = 这个宿主没有 settings 写入路径。抛出去而不是静默吞掉：卡片要把开关置灰，
+		* 而那需要知道"做不到"，不是"做失败了"。
+		*/
+		async function setDeviceSdkEnabled(path, enabled) {
+			const response = await fetch(`${path}?action=${enabled ? "enable" : "disable"}`, {
+				method: "POST",
+				headers: { accept: "application/json" },
+				credentials: "same-origin"
+			});
+			if (response.status === 501) throw new Error("this host has no settings write path");
+			if (!response.ok) throw new Error(`HTTP ${response.status}`);
+		}
+		/** 取完整值。只在用户点「显示」或「复制」时调用。 */
+		async function revealDeviceSdk(path) {
+			const body = await post(path, "reveal");
+			if (typeof body !== "object" || body === null) return void 0;
+			const token = body["token"];
+			return typeof token === "string" && token !== "" ? token : void 0;
+		}
+		//#endregion
+		//#region src/client/DeviceSdkPanel.tsx
+		/**
+		* 卡片「SDK」分区：这台机器能不能取到真实设备参数，以及取到的是什么。
+		*
+		* ## 为什么它单独一页，而不是塞进「诊断」
+		*
+		* 诊断页是"出问题时贴给开发看的一屏事实"，只读、不含操作。这一页有操作（重取、
+		* 显示、复制），而且用户会在**没出问题**的时候来看它——切到「真实值」之后第一件
+		* 事就是确认"真的连上了吗、值是什么"。把这两种意图混在一页，诊断页就再也没法
+		* 保持"只读"这条约定。
+		*
+		* ## 为什么默认是星号
+		*
+		* 完整 token 能代表这台机器。这一页会被截图、会被贴进 issue，所以默认只给掩码；
+		* 「显示」与「复制」各要一次点击，Host 也只为这两次点击返回完整值
+		* （`POST ?action=reveal`，见 `src/status-paths.ts`）。
+		*
+		* @module dsh-connect-workbuddy/client/DeviceSdkPanel
+		*/
+		/** How one row reads: the label on the left, the value on the right. */
+		function Row(props) {
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "dsm-workbuddy-diag-row",
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					className: "dsm-workbuddy-diag-label",
+					children: props.label
+				}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					className: `dsm-workbuddy-diag-value${props.mono === true ? " dsm-workbuddy-diag-mono" : ""}`,
+					children: props.children
+				})]
+			});
+		}
+		/** `12m ago` / `just now`, in the card's existing style. */
+		function describeAge(t, ageMs) {
+			if (ageMs < 6e4) return t("sdk.ageJustNow");
+			const minutes = Math.floor(ageMs / 6e4);
+			if (minutes < 60) return t("sdk.ageMinutes", { count: minutes });
+			return t("sdk.ageHours", {
+				count: Math.floor(minutes / 60),
+				rest: minutes % 60
+			});
+		}
+		function DeviceSdkPanel(props) {
+			const { t, path, settingsPath } = props;
+			const [report, setReport] = (0, react.useState)(void 0);
+			const [loading, setLoading] = (0, react.useState)(true);
+			const [busy, setBusy] = (0, react.useState)(false);
+			const [error, setError] = (0, react.useState)(void 0);
+			/** 完整值：只在用户点过「显示」或「复制」之后才在内存里存在。 */
+			const [value, setValue] = (0, react.useState)(void 0);
+			const [copied, setCopied] = (0, react.useState)(false);
+			/**
+			* 设置里的 SDK 目录与回退开关（作者意见 #1 / #2）。
+			*
+			* `undefined` = 还没读回来（或这个 Host 没有设置路由）。两种情况都按"不渲染编辑
+			* 控件"处理：一个初值为空串的输入框看起来像"用户清空过目录"，而那与实际状态
+			* （走自动发现）相反。
+			*/
+			const [sdkDir, setSdkDir] = (0, react.useState)(void 0);
+			const [fallback, setFallback] = (0, react.useState)(void 0);
+			const [draftDir, setDraftDir] = (0, react.useState)("");
+			const [savingDir, setSavingDir] = (0, react.useState)(false);
+			const [savingFallback, setSavingFallback] = (0, react.useState)(false);
+			const [savedNote, setSavedNote] = (0, react.useState)(false);
+			/**
+			* SDK 总开关（`Config.deviceSdkEnabled`）。
+			*
+			* 与上面那几项**不是同一份文档**：这个落在插件配置（`cordis.patch.yml`），
+			* 而目录/回退落在设备设置文件。分两次读的理由与 `settingsPath` 分开一样——
+			* 两者可以各自缺席。`undefined` = 这个 Host 还不认识这一项（或没有 settings
+			* 服务），此时开关置灰并显示「不可用」，而不是假装它是关的。
+			*/
+			const [sdkMasterEnabled, setSdkMasterEnabled] = (0, react.useState)(void 0);
+			const [savingMaster, setSavingMaster] = (0, react.useState)(false);
+			/** 七处 `catch` 原本各写一遍同样的展平；收成一个。 */
+			const fail = (cause) => setError(cause instanceof Error ? cause.message : String(cause));
+			const load = (0, react.useCallback)(async (refresh) => {
+				if (path === "") return;
+				setBusy(true);
+				setError(void 0);
+				try {
+					const next = refresh ? await refreshDeviceSdk(path) : await fetchDeviceSdk(path);
+					setReport(next);
+					if (next?.sdkEnabled !== void 0) setSdkMasterEnabled(next.sdkEnabled);
+					if (refresh) {
+						setValue(void 0);
+						setCopied(false);
+					}
+				} catch (cause) {
+					fail(cause);
+				} finally {
+					setBusy(false);
+					setLoading(false);
+				}
+			}, [path]);
+			/**
+			* 读设置。与 SDK 状态**分两次**取，理由与 `settingsPath` 分开一样：两者可以
+			* 各自缺席，而合成一次请求会让"设置路由没有"顺带把 SDK 状态也变成错误。
+			*/
+			const loadSettings = (0, react.useCallback)(async () => {
+				if (settingsPath === "") return;
+				try {
+					const settings = await fetchDeviceSettings(settingsPath);
+					if (settings === void 0) return;
+					setSdkDir(settings.sdkDir);
+					setFallback(settings.sdkFallbackToVirtual);
+					setDraftDir(settings.sdkDir);
+				} catch {}
+			}, [settingsPath]);
+			(0, react.useEffect)(() => {
+				load(false);
+			}, [load]);
+			(0, react.useEffect)(() => {
+				loadSettings();
+			}, [loadSettings]);
+			/**
+			* 「已加载、没取过」不该停在屏幕上。
+			*
+			* 启动时的后台预热要起一个子进程再等一次网络（约几百毫秒），而这一页是在用户
+			* 点开标签时挂载的——两者偶尔会撞在一起，那一瞬间读到的就是 idle。这里做有限次
+			* 复查（最多 5 次、每次 1.2 秒）：预热一落地，这一行自己变成"可用"，而不是要用户
+			* 手动点一次「重新获取」。上限是必须的——预热真的失败时，无限轮询只是一台一直
+			* 发 GET 的机器。
+			*/
+			const idlePolls = (0, react.useRef)(0);
+			(0, react.useEffect)(() => {
+				if (path === "") return;
+				if (report?.sdk.state !== "ready" || report.token.state !== "idle") return;
+				if (idlePolls.current >= 5) return;
+				idlePolls.current += 1;
+				const timer = window.setTimeout(() => {
+					fetchDeviceSdk(path).then((next) => {
+						if (next !== void 0) setReport(next);
+					}).catch(() => {});
+				}, 1200);
+				return () => window.clearTimeout(timer);
+			}, [path, report]);
+			if (path === "") return null;
+			if (loading) return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+				className: "dsm-workbuddy-panel-note",
+				children: t("sdk.loading")
+			});
+			if (report === void 0 && error === void 0) return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+				className: "dsm-workbuddy-panel-note",
+				children: t("sdk.unavailable")
+			});
+			const toggle = async () => {
+				if (value !== void 0) {
+					setValue(void 0);
+					return;
+				}
+				setError(void 0);
+				try {
+					const full = await revealDeviceSdk(path);
+					if (full === void 0) setError(t("sdk.noValue"));
+					else setValue(full);
+				} catch (cause) {
+					fail(cause);
+				}
+			};
+			const copy = async () => {
+				setError(void 0);
+				try {
+					const full = value ?? await revealDeviceSdk(path);
+					if (full === void 0) {
+						setError(t("sdk.noValue"));
+						return;
+					}
+					await navigator.clipboard.writeText(full);
+					setCopied(true);
+					window.setTimeout(() => {
+						setCopied(false);
+					}, 2e3);
+				} catch (cause) {
+					fail(cause);
+				}
+			};
+			/**
+			* 保存目录：写盘之后**立刻重探一次**。清空按钮复用同一条路径（原来内联重写了
+			* 整个 try/catch/finally，是这份面板里最明显的一处复制粘贴）。
+			*/
+			const saveDir = async (dir = draftDir.trim()) => {
+				if (settingsPath === "") return;
+				setSavingDir(true);
+				setError(void 0);
+				setSavedNote(false);
+				try {
+					const next = await putDeviceSdk(settingsPath, { sdkDir: dir });
+					setSdkDir(next.sdkDir);
+					setDraftDir(next.sdkDir);
+					setSavedNote(true);
+					await load(true);
+				} catch (cause) {
+					fail(cause);
+				} finally {
+					setSavingDir(false);
+				}
+			};
+			const saveFallback = async (nextValue) => {
+				if (settingsPath === "") return;
+				setSavingFallback(true);
+				setError(void 0);
+				try {
+					const next = await putDeviceSdk(settingsPath, { sdkFallbackToVirtual: nextValue });
+					setFallback(next.sdkFallbackToVirtual);
+				} catch (cause) {
+					fail(cause);
+				} finally {
+					setSavingFallback(false);
+				}
+			};
+			/**
+			* 切换 SDK 总开关。写完重读一次快照：状态行是从 `GET /device-sdk` 算的，
+			* 只改本地 state 会让"已关"与下面那行"正常"并存。
+			*/
+			const saveMaster = async (nextValue) => {
+				if (path === "") return;
+				setSavingMaster(true);
+				setError(void 0);
+				try {
+					await setDeviceSdkEnabled(path, nextValue);
+					setSdkMasterEnabled(nextValue);
+					await load(false);
+				} catch (cause) {
+					fail(cause);
+				} finally {
+					setSavingMaster(false);
+				}
+			};
+			const sdk = report?.sdk;
+			const token = report?.token;
+			const stateKey = sdk?.state === "disabled" ? "sdk.statusDisabled" : sdk?.state === "ready" ? token?.state === "ok" ? "sdk.statusReady" : token?.state === "stale" ? "sdk.statusStale" : "sdk.statusNoToken" : sdk?.state === "missing" ? "sdk.statusMissing" : sdk?.state === "unsupported" ? "sdk.statusUnsupported" : "sdk.statusError";
+			const stateOk = sdk?.state === "ready" && token?.state === "ok";
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+				/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "dsm-workbuddy-sdk-master",
+					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+						className: "dsm-workbuddy-sdk-switch",
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+							type: "checkbox",
+							checked: sdkMasterEnabled ?? true,
+							disabled: savingMaster || sdkMasterEnabled === void 0,
+							onChange: (event) => {
+								saveMaster(event.target.checked);
+							}
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("sdk.masterLabel") })]
+					}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: "dsm-workbuddy-hint",
+						children: t("sdk.masterHint")
+					})]
+				}),
+				/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+					className: "dsm-workbuddy-panel-note",
+					children: t("sdk.hint")
+				}),
+				/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "dsm-workbuddy-diag",
+					children: [
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)(Row, {
+							label: t("sdk.state"),
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: `dsm-workbuddy-sdk-dot${stateOk ? " dsm-workbuddy-sdk-dot-ok" : ""}`,
+								"aria-hidden": "true"
+							}), t(stateKey)]
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)(Row, {
+							label: t("sdk.bundle"),
+							mono: true,
+							children: sdk === void 0 || sdk.bundle === "" ? t("sdk.unknown") : `${sdk.bundle} · ${sdk.path}`
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)(Row, {
+							label: t("sdk.runtime"),
+							mono: true,
+							children: sdk === void 0 || sdk.runtime === "" ? t("sdk.unknown") : sdk.runtime
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)(Row, {
+							label: t("sdk.fetched"),
+							children: token?.fetchedAtMs === void 0 ? t("sdk.never") : `${new Date(token.fetchedAtMs).toLocaleTimeString()} (${describeAge(t, Date.now() - token.fetchedAtMs)})`
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)(Row, {
+							label: t("sdk.tier"),
+							children: report?.tier === "real" ? t("sdk.tierReal") : t("sdk.tierVirtual")
+						})
+					]
+				}),
+				sdk !== void 0 && sdk.reason !== void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+					className: "dsm-workbuddy-device-error",
+					children: sdk.reason
+				}) : null,
+				token !== void 0 && token.reason !== void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+					className: "dsm-workbuddy-device-error",
+					children: token.reason
+				}) : null,
+				/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "dsm-workbuddy-device-field",
+					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: "dsm-workbuddy-device-field-label",
+						children: t("sdk.valueLabel")
+					}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("code", {
+						className: "dsm-workbuddy-sdk-value",
+						"aria-label": t("sdk.valueLabel"),
+						children: token === void 0 || token.length === 0 ? t("sdk.noValue") : value ?? `${token.masked}${token.length === 0 ? "" : ` (${t("sdk.length", { count: token.length })})`}`
+					})]
+				}),
+				/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "dsm-workbuddy-device-random-row",
+					children: [
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+							type: "button",
+							className: "dsm-btn dsm-btn-outline",
+							disabled: busy || token === void 0 || token.length === 0,
+							onClick: () => {
+								toggle();
+							},
+							children: value === void 0 ? t("sdk.reveal") : t("sdk.hide")
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+							type: "button",
+							className: "dsm-btn dsm-btn-outline",
+							disabled: busy || token === void 0 || token.length === 0,
+							onClick: () => {
+								copy();
+							},
+							children: copied ? t("sdk.copied") : t("sdk.copy")
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+							type: "button",
+							className: "dsm-btn dsm-btn-outline",
+							disabled: busy,
+							onClick: () => {
+								load(true);
+							},
+							children: busy ? t("sdk.refreshing") : t("sdk.refresh")
+						})
+					]
+				}),
+				settingsPath === "" || sdkDir === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "dsm-workbuddy-device-field",
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "dsm-workbuddy-device-field-label",
+							children: t("sdk.dirLabel")
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "dsm-workbuddy-sdk-dir-row",
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+									type: "text",
+									className: "dsm-workbuddy-device-input dsm-workbuddy-sdk-dir-input",
+									value: draftDir,
+									placeholder: t("sdk.dirPlaceholder"),
+									spellCheck: false,
+									autoComplete: "off",
+									"aria-label": t("sdk.dirLabel"),
+									onChange: (event) => {
+										setDraftDir(event.target.value);
+										setSavedNote(false);
+									}
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: "dsm-btn dsm-btn-outline",
+									disabled: savingDir || draftDir.trim() === sdkDir,
+									onClick: () => {
+										saveDir();
+									},
+									children: savingDir ? t("sdk.dirSaving") : t("sdk.dirSave")
+								}),
+								sdkDir === "" ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: "dsm-btn dsm-btn-outline",
+									disabled: savingDir,
+									onClick: () => {
+										saveDir("");
+									},
+									children: t("sdk.dirClear")
+								})
+							]
+						})]
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("p", {
+						className: "dsm-workbuddy-hint",
+						children: [savedNote ? `${t("sdk.dirSaved")} ` : "", t("sdk.dirHint")]
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+						className: "dsm-workbuddy-device-random-row",
+						children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+							className: "dsm-workbuddy-sdk-switch",
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+								type: "checkbox",
+								checked: fallback ?? true,
+								disabled: savingFallback || fallback === void 0,
+								onChange: (event) => {
+									saveFallback(event.target.checked);
+								}
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("sdk.fallbackLabel") })]
+						})
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: "dsm-workbuddy-hint",
+						children: t("sdk.fallbackHint")
+					})
+				] }),
+				error === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+					className: "dsm-workbuddy-device-error",
+					children: error
+				})
+			] });
 		}
 		//#endregion
 		//#region src/client/OAuthSignIn.tsx
@@ -4283,6 +5823,27 @@ window.__ModuleLoader__.load({
 					});
 				}
 			};
+			/**
+			* Turn a transport-level failure into something a person can act on.
+			*
+			* `fetch()` rejects with a bare `TypeError: Failed to fetch` whenever no HTTP
+			* response arrives at all — the connection was reset, or the text could not be
+			* posted. Rendered verbatim that reads like a bug in the plugin (issue #229:
+			* the user saw "传输失败：Failed to fetch" and had nothing to go on). The two
+			* causes worth naming are a file too large to upload and a local service that
+			* is not answering; anything else keeps its own message, which is more
+			* informative than a generic one.
+			*
+			* Note this is the CLIENT's guess: the server now answers 413 for an oversized
+			* body, so a size problem usually arrives as a normal error response and never
+			* reaches here. This path is what is left when the request dies before an
+			* answer — which is also what a half-open local port looks like.
+			*/
+			const transportMessage = (error, text) => {
+				if (!(error instanceof TypeError)) return error instanceof Error ? error.message : String(error);
+				const kilobytes = Math.round(new Blob([text]).size / 1024);
+				return t("row.transferNoService", { size: String(kilobytes) });
+			};
 			const readImportFile = async (file) => {
 				setPhase({ kind: "importing" });
 				try {
@@ -4312,7 +5873,7 @@ window.__ModuleLoader__.load({
 				} catch (error) {
 					if (mounted.current) setPhase({
 						kind: "error",
-						message: error instanceof Error ? error.message : String(error)
+						message: transportMessage(error, importText.current)
 					});
 				}
 			};
@@ -4512,6 +6073,84 @@ window.__ModuleLoader__.load({
 					}) : null
 				]
 			});
+		}
+		//#endregion
+		//#region src/catalog.ts
+		/**
+		* The tier one model currently RESOLVES TO, given the saved budgets.
+		*
+		* This is the rule the card's radio group has to agree with, so it lives next
+		* to {@link applyContextBudgets} rather than being re-derived in the browser —
+		* ONE definition, so the UI cannot drift from the backend again (issue #215).
+		*
+		* `undefined` means "no explicit budget" and answers the NATIVE window, which
+		* is exactly what {@link applyContextBudgets} does with an absent entry. The
+		* card used to default the 200K radio with `?? 200_000` instead, so a model
+		* with no stored budget showed "200K" selected while DSH was told 1,000,000 —
+		* the reporter's case. The radio was right there in the UI and wrong in the
+		* only place that matters.
+		*
+		* A budget ABOVE the native window answers the native window, because
+		* {@link applyContextBudgets} clamps with `Math.min`: a stored 1048576 for a 1M
+		* model genuinely resolves to the native tier, and that radio is the one that
+		* should be lit.
+		*/
+		function effectiveContextBudget(nativeContextWindow, savedBudget) {
+			return savedBudget === void 0 ? nativeContextWindow : Math.min(nativeContextWindow, savedBudget);
+		}
+		//#endregion
+		//#region src/default-effort.ts
+		/** The tiers DSH/pi-ai speak. Mirrors `THINKING_LEVELS` in `./adapter.ts`. */
+		const THINKING_LEVELS = [
+			"minimal",
+			"low",
+			"medium",
+			"high",
+			"xhigh",
+			"max"
+		];
+		/**
+		* The tiers a model actually declares, in DSH's order, without `off`.
+		*
+		* `off` is excluded deliberately: it is a DIFFERENT question with its own owner
+		* (`offModelIds` / `src/off-thinking.ts`, issue #34), and a "default thinking
+		* effort" of `off` would silently re-open the #83 defect for every caller that
+		* names no tier.
+		*/
+		function declaredEfforts(reasoning) {
+			const supported = reasoning?.supportedEfforts ?? [];
+			return THINKING_LEVELS.filter((level) => supported.includes(level));
+		}
+		/**
+		* The one tier a model should dispatch at when a caller names none.
+		*
+		* @param model - the catalog entry, carrying the upstream's own declaration.
+		* @param saved - the user's per-model choice, keyed by model id; an absent (or
+		*   unsupported, or stale) entry falls through to the upstream default, then to
+		*   this model's own MIDDLE tier (never its weakest one).
+		* @returns a tier the model declares, or `undefined` when it declares none — in
+		*   which case the adapter's existing `off` normalization (issue #90) is still
+		*   the right answer and this module must not invent one.
+		*/
+		function defaultEffortFor(model, saved = {}) {
+			const declared = declaredEfforts(model.reasoning);
+			if (declared.length === 0) return void 0;
+			const asked = saved[model.id];
+			if (typeof asked === "string" && declared.includes(asked)) return asked;
+			const upstreamDefault = model.reasoning?.defaultEffort;
+			if (typeof upstreamDefault === "string" && declared.includes(upstreamDefault)) return upstreamDefault;
+			return declared[Math.floor(declared.length / 2)];
+		}
+		/**
+		* The tier list the card offers for one model.
+		*
+		* Exactly the model's own declared tiers — no localising, no cross-model
+		* unification. The vocabularies genuinely differ (`low/high/max` on deepseek,
+		* `high/xhigh` on glm-5.2), so a synthesized ladder would offer rows that fail,
+		* and the upstream's names are what the user sees in every other client.
+		*/
+		function selectableEfforts(reasoning) {
+			return declaredEfforts(reasoning);
 		}
 		//#endregion
 		//#region src/client/busy-icon.tsx
@@ -4742,7 +6381,8 @@ window.__ModuleLoader__.load({
 		* that run in a plain Node environment, where it does not exist.
 		*/
 		function uiLanguage() {
-			return typeof navigator === "undefined" ? "" : navigator.language;
+			if (typeof navigator === "undefined") return "";
+			return navigator.language ?? "";
 		}
 		/** Whether the given language is an English one. */
 		function isEnglish(language) {
@@ -4783,11 +6423,6 @@ window.__ModuleLoader__.load({
 		* refused rather than passed through, and the card falls back to its own
 		* brand colour.
 		*/
-		function promoBadgeColor(promo) {
-			const color = promo.badge.color;
-			if (color === void 0) return void 0;
-			return /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(color) ? color : void 0;
-		}
 		/**
 		* A calendar day, in the user's own locale — read in the ZONE the upstream
 		* wrote the instant in.
@@ -4888,6 +6523,318 @@ window.__ModuleLoader__.load({
 		*/
 		const WORKBUDDY_PLUGIN_ICON = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAAXGUlEQVR4nH1bC7BdVXn+1tr7nHPvzb3JvUloSAQp0JHWoAMttKOCFrWU8irQSbCTQYG21IahnTJUUTsM0FJhZCzCSIcKImOpDkhrhQ5YC7ROB3lUBU3EyCuBFBIIedzcx3ntvTr/a621TwIns3PO3mfvddf/+v7v/9c6DvYKoYBz1cZNYfJpVBcNBm7dcIhj3TBM15VzqAE6XAWEGggVADroOl0byDW+PtRr9E732rl9r2PxOMNsrCogVE7PA0Kge4Lcz5/TGI6v00UaK+h98u4QUA9quIDg4Pe2i2LTsknc++mzZu9cv37VHNaFAveSJICj/9aFUNzrXHXSTwdnznl/Y+X9MaEP1D0A/ToKaUdDASoAK0YVYcLad/G88S6C1aQcOkI2Nj9HylBFBRMYqPUeFp6EDXQfKcIUoud6LQQP59rwrsBEOdhy9KGDK/7j9mUPmBKcCf++Z4YbF6eKLw+6QFioKl/DoYILlXMsHE2KPCCzwlsqoNb3oUw4Kq+2a0k4G4MtXOX3J4HNyulzUkC0eqYI8ZAaQZQSAh9080Qx1m7jHStnL/3B3ctvXbcuFOwBH/p5OG12DA/29leV6wcHeI8hadE1rBldl/6ACs7WMEuz0PIcKawe0Gdzeyf36eTzcOHxVAEpTEQB0QtY0PRZPMYsX+t3tSqBxkteYeHh6qqu6yIsmVhaHHtE7/fu/8fJhzzF/OywunXQR+DJOO9pkLp2NJ64pIXhaOxb/IfmJM29PemSJ+NSzJP1s2dhwmucJ6uaoIYFzVjnkFDhLRTkb2XC03gQTKDrZNjSV1icXwzPv9y99Z5Hw6R/psQnqoniyLBQ1d65IoGiDqZuHwWwzyFzx8xl5RDBZR4uCZc9E8fS+8TdSfHZ2KxAel6VwEIYZiflxC9NKToeKcKrAcjV2d2DK3xYqOcXJ478ytf2fcL3htWGegAaSZGeBnKixWgVPXRiZpEomLq4Kcri2RCc7zN3NWuq5XlOJLwqjq9liqlHlEfzSveIdVk0Fjh5kVjdjKLneniCtcEg7N492FBWAWvrHpwLzgmYUfySi+VorcJFBE6I7jIAjFnC3DybePKE5ClxLLsPI0q3kNAsYJ4g1wjkzDuju4nQJrx6RxRe/7YHfFX3MOyHtaUHloaKcqa4rcQTDWxubHnZ0lESNoaGXad7+RmLc7GMxbS4s8Y82S3mdhMshR+Po4pk181jkx22afHc8hL3plNTjOGDjEfu7pxfWkpcyA02Ofo6xpylPsMCi3eNTROShVawM0H4+4bXaGqzcTKQzc8j6VGPkb9tFtU56bwlBdK9ZMQMKNgolMtVKepFcq6hBMAzQJAQ6srG9iwNJRfN0LtWd64z1qZjRPDieBYQkyNTqFpCsoYoKQFoFt8xhA5icZ2fXWOwY4GScsT95Tv7XoSnd0ehgLJBSPSdkdhYWbSeAk2eCSzuScDs/qQo9dpRZarVWWm5ZRuxn8YRRabYtiwhn5PVRXD9js8FzM2rowKII7MnOJSR2GSZJMVUckfzjIjKMe2p5fOsENGfPESR38AwB8AsZTUBUV025TwWVEAsubSl6gYA8rU6eUMmvE2ErjMrQEDZQGkewGI6TcqPAhlT1hHBBV0xZC/R3B09JFmdXDESrIz5GRPMlWQA6kNAoVbjf7FAyq1vsW8xrt+rImI4aEiwIuqAMjI9y/8Z5RSAS+f04P4uTcihozDLaO6kZup2gSWFIXjm3plb75sHxkugMKzAgWmQcYmsTvqrgPkuMOgHFAhY0gnolDJfOgTM0t/xMcYTJeZz9QZRgHiUd5AQIHe2fNqIY3o4xiEw3wc++A6HvzweWNbWtKmsrF853PFEwDd/LEqoVOiYQQLQ7QGXn+Zw3okOhc9i1tw8umpS7mBQ4PW9Ab/YVuHxTTV+8EyF7TsqTHQCxtsBlVWSUVBViGYHcnMDQvaUyAv03wmPDcP8ECiy2lwOKl4CFz2+AoYDx1b73rkOayaVfUXziRMu9oGTbg54cz9pNlV9FEJzi8CJv+zwwOWWoZvZfXSst3rteDPgXx4e4LZv9fDS9grLlzotkclDakmXJCCFTswAdC5eZQqphwErZgr40QInAh4XHMbsHGt6ugSmWuLZwyqwlclFhwqOrSJgZky+izydc7bj+1ZPy7P9AT2nz/MR+PuK/g6/50fg8QdDGffQFQ4b13fwyFcmccl5HczOUgVYoXTcAGEBSWBzdRY4hoLUBvGeQGFgrM84gMWglq/mwszXqcSlAahgdi57l8/Mr9gaxiqbnZwheZMU23Lw88zN0zWff5ZzCpeyAApqTNWkjBorljnceMUEbvnMEqK0qIc1A6UAnYQS5/6Md4jTNxlhGUkKRYYBHmHCiEewJxQjzmmenFdphiXsZ0aKstogvmwkEiqwYml6MmS6kQkQKcUlICsIY6hyDAEbzupgZgr448/OouyI5Y3t8YgGfq5OIaHfeiZDWXclFizWw1OmF0lRQ4A8UWevnPTEsTNFjoQ7fV0UDq3SoSyBVgmU/FmOVsuz9VmfrCUBMPIMut4f1Dj9tzv4wqcmORzIvW1qwgOcYIC5vB0gzAClQW1EGuJXkgql2MlyuTHFhg4OAlrm8vRxtHrMFUhRV4trv/hawK3fqbF/QSwoYwSUPuCwlcDJ7y3wgeMKFHAYDgN7gOmwLBwGgxobzhnH/z7Txz9/exErpz2HK1teUZ+tTSGXZYZCFGAc3eqBZsESmZs1L0e92HK5TikSKA2N2CMY8QATfuvOgLOvqrBlW0CnyOioeWVF1/v4rXd7/M2fjeGEtQWGFO+FpkzFFPKOv/7zKXz/sR5m99foUJ2rRRNhhwCfAqBOxQkbVObHKSv14UZb2KnFdBAl5CdxvMwDcnotrTsW/vW9wPnXVdi2M+DwQ4DVK4CZSWDFVDp+aRkwNR7wxE8GOOuyWdz3vT7K0jMGyN8ToKTzFTMel2yYwPxcAJe56voR/eO7tOscY0Ls2GSFkJW+Nue8QTn6agJD6gta5mhwf7mHhCdesOGGCpu3AmMthzv+qsTHf6fArj0SP5YGKXNQZpleArRcjU9ePYdHnxgwPrAStK1EXkBhvO7scRx+aIleL2SWTzFP1qdQYkCs6dx66COob/28mB61GjzACwhmc9Q2rxnt/9GfUGwY1g4XfbHG488GjLWAmzYWOOU4zwAoKG6KteYG8YSAdunQKQM+dcMc9uwLbHnRv9Baumf5dIGPnNTB4jx5gQjNgisNLuH0Gr07ygKpjpdKsFnWGiuMXtLwfaPDpoRk/dFqjcYht6Q7P3lzhQefqvn87y4usOEjkgpjYlHhyT2psjMLErOcHANe3DbAXfd1xfUZVzRH6qMf/VA7E15JkfECdX9TiB+11ughDcisQGr4+wEfDqzrtegRxAau+aca3/gvEejK8z0uOcNhsUfWtAJGviOhrWKLXRwujgImx4Fvf3cR3V7gLGBRyDnfBbxnbQurVlImqJlEmdtLSpS/I9dACpD0l+I+sTjLCNbLe3sekHlEJry5/tJxh/98usZtDwo1vfTsAp/+mMeA0hrnPssalgl0PtoEEUYn18fbDltfHmLzlgEcs0MtiZ0oY+UKjyPWlBj0lRVGy3s+J2VQreKZIGUWq7MFDMEBaW01yMyoC7iRwmikG0zaZo5BcTwE9s0FXPS7Hp+/2DO356rQquKsvy9NDWV2yuXlM4Eb0O8FbN4ieTnCheIAKWLNao9qKPm/gJdD6bfhQkHlMLE9QmouF7Mlq1geM/hpO2xU/oNciT2K2B0Wik1/cHYu4Jz3O9y80bNXCOAJfnCzRAeguUhxbF0e7eLwMyIUKeW1HRkoWS9QXzPTnmWQvoOkQMED5Q8UDnDUE0ytLVv6jtbTyae6IP8T2qczNhKbAymLWP4nwXp94IhVDv9wWcGWoBRHHD/Fr8NPn6/Q8lpFpqCKwEgCGLsjF+4umOs3nZJeS8Y8ilrSHV0kazPqq6J5BRQylsgR4z2rALXhmWWkt8CAZvES49/aYDTZXsDxRzksnaDcTqAnz5DLtkqPux8c4LuPDTjfE9rnq0ziFUpotJfH4WFdjthUSbOjMdjFSXCtWg0EyyC9DU+fWcNq6UaDMq7tExJn6fFt3J+vKmPkZog9p4wqhoc6Dwvf8vjOfw9w+RcXucNj7e+0kpPa4wZmHDg1sHK5FAVCBXRgndb8XB2boj4TmBkgW9+AsLIOr/X6m/TX1uxjiyz3AOvjNQODMcVqb1GKrtrQ83qRQoCEf+SpITbeQJsSrLcnbhOR2zVZnBU0pXc46ghRAI+phMzGf3NnjRYBLOEPK8DzOxMheqcqFF5DIF+dyRZIYkhEgpJiNmn7wGIokhlLXWzNlEeHKvyTm4f4o+sWsdgNWHuUx2RHlG2KYDfniSaGyIUMMb4Zz/k+F5pGpyKp263x6v9VaBOztNyv40RmqGsG3o30+SMQZvXBAQsdb/UaJVTRdaVHZ2sPY22HzS9WuPDaLnbuqnHWySUe+vIU/uCjbcxRIUPpylKfeQMjuLTHF+drHH9sC2tWlxxGRKJiFADY/nKFXTsqjLUpE2jsx3Qq6C8A6CQEuP2V1wCNNfpmamvG/wg6amzLOmESPh+D0P7FVwMuuHoRW7dXOP19JW79zDjaLWBqQsLGipXo9jpZa2tTuG742EQmtKZSpcU/+VEf3fmANhVDbHnJGpEa8zUnxVK+o8N4fFx/H2F/MSXl3VvrBzhqUUmIJHdNedyAcfvrARdc08WzL9U4+bgSt181jjEFP1tljiVsrOHFAzothz27a5xx6jhOfn8HVUVU12YkvUR6/c/DPXQKEi4VPkyIuDrMiqNA3pbz/tGV29j3N68QetLweWuKKEOjdjMpsMX8Sb6nt2VLgCd/VuHMK4Z44ZUK7z26wJ1Xj2N6ynGKHOvYjhR6XumrKpFkbBfAnjcrrD2mhc9dORXpb5wJhULh8dzPB9j0wwEmlxDZMM9JyC9VoGQmz7wgU0Bc089dfqRCPKApqqsutCRGrarTf8PhjT0Bu2cDdu8L2LOvxu69AbP7A3a8UeEXWyu86zCPr187jjWHNFtclvqoFUZkiRRKf6/fDdj1eoXf/PUObrtlBstnpIVH1aB5IydBB3zr6wvodym/Sy9AKG8qi1NPgOixk7XBfJ0ub2o2lJBVdY2YsK6MFiWfO9/jnSuBHz1HHuGFSmuKC5XH6uUOHz+jhdUrndQChSiBXtTEoLRHQFj1a47bibbDrxxR4twzx7Bh/QTKlvCHKLzyf+oSbX66j0f/vYtlU1K/MAFSdyceEIVXAxdxeVy5fwPtRxHd9vw0GqBqIn4zWhpw4akeF5769gmDeADFr1mOXq/urHkN8Nyzx3DGKR20yoBDVhQ4+siSFUVWr014fZCUTue9bsCXrtsfOQIxWxNamiAKiOwZojxPHmBr75a/Y2hpP988pMEHYsfT1u0TEaFTyvMCS9m9htTWpIwlMMWuw8JizV3do99Z4PNXTnHLK9UXQemz4/rBhmW84naYw99fuw/PbR5g5XTBniwIT9bWuHcS+8YraAAfGyIZBlgGyHd45fv4UsTZW+rGmB7KghoVQkqK/J1XeEiIlLRJWRQ+DzzSx8+2DHHqB9osfK9Xs9DkKZRdpAucApDcXsb2uOX6WTz0r4tYQcIPc0HT59QBSpmgsBCILa98BSfb0jKa7jMAOEhTJOmGU2C85BCoINEvyT9IwHbL49WdFW68bZ6Xu9afPcZ3m+KUPFiASQiQkkuP/ftr3PS3s3j4/i73Aql+sc4vC6+rQIL2Qs+NY6QQqG0zZEZYLC2mYowfokVN1n6dGg/NV8YPzF1iBORlFK36BLS956XuP/3sPjy7ZYDL/2QJjv3VEr2+FDK8yKrZIa0byvS//0gPt39pDttfqHiVF4NEm2PDU0tgvpZ7AdMXMUZpW1Kb+4GaqY8+twpgx96A+x4PuPjDsmB54GukX3DQl1yfXwDuf7SHm766gJdfGeIPf38c11wxxd91aO/BQV673qjw1BMDPPhvi3j6yT7GSoeZZbKIa2UyNb3yJqitBebub6tPnosj22010rsf3exEgDNRAld9o8aPX3B412rdB2xgl1Hf0CiEMseoA3r9gG3bK/xw0wAvbB1iqkMkyeOw1QW+9s0FDAeCFeIwAYNewK5dNV7ZWmHb80O8uaNmUrR0Uqo6WgITmptITlRAg1LnZMiIEODec8MwkDV4707+A4isCHJD2cNr3GDfHLi/Z3v4448Xsj38EiepEOLqTru8RaDdHeDtLrZldn6/LnHbhLlNpwQmAB3vMNFxGOPtNZrmaqvzpbYXzm/ARyWvl4YIdYbU/Rn4CFMqYGq5ly0yVqUdUMnZ6q4Bl94zM2E9xGztTxc045aavK1Of1wxxQWiqDULYJuj6G/QEje7byAl6IT1YAF0H7HsKpUmjVV4eakcra6rwlIP6DJYtkbA6Ri8P0CB1jYv5u2lvBoULsfnnJpG9vCyIEqWZHeJrjJn48adGrzzSyZgGxek2ySeZqFjz3FjNd/vo0JKw8QEVgVqt0iKH1sDlBTKy+r6TLBx6nwFuPGefpMTc79Z3RRkPXw+H21njVSPcQ9fanXbWLymb/1/29RgkKmNTRuLBVXrxx0m+lkENmVY7S/zEWtrb9BWiRxlgZGCJ+a9PLHlfEDBTP2hsTFRdpVJNWdPx21qWVPDWtP5ik+j4Zn176wFzoWN9fcyoDNhI+dXppkA0XoCTQLEPCAIdhxk5Tur+nWPsChKYzxH97h/37aqm+z2Sw7ZvGRa5x5c3IuUlBBbVBYWBlymuEx4Gyuv74X4pDTXYILWD8ja4zRKYVR49Fcdxg3invt8yUsVJCRPHshrBWNZ+R49UYLt5tYfRcR6Xy0c3Ta5dJ6/Zd/vCNjlxCcueCa2l1pgGQDGzpIVSEPMyq6w5q+wzOoNUIzu0uz0SFhkHlHTiq4InO4zr9ENSjHO841N2e5ui3PrBTZQPFlagC0Jb54Vd4pZqNiOttgPoI4AZn1ZYLPzLoQatS2CNmod3T3W7Asc+Puc5D1JKRbpRJnFYgZAI9iQub7EvY9gxc9yW1vW+HgME3KkwSkNDs0EVnXqWqARIG3X1y3XDq0xbPbTS4q7vVcCN7qwGWM73/HV3P0t7iwImoOhlMZpe0rc8q7tblaE9vxzJaTCJa3nC/iZp6QFTgNGi/0mC9TvOTukUNLUG8Y6hZte7e/2l52Iu8ar6qXalR6hrhq5P0+LI7/DaYBgrHnMve1HEhYu6RkWgq2bvKDJ3cVGOfhZLOdYkaq8xPIYX2zVV72uyPBEN01XnTDuy2WLL33w+rG7/PpT3NyvrQ4bx9tww8qT1ejHNHFPQEJ6Ke0E1LJd2FmhR90g04xpP+tfKCjmYKaWIU/ImhcpTpXi2q7UfLeH9fXVqSVsTNiMD+Rh4uraDT2mlpXu8BNaG1etcnN+3T2huPcvWg8dubS6dHJJUfD6bFVXrq5rrw3+tCaXOuGmBENzAzHpu0tvL63uNj8bykdeoCkt8QHL+SqAkRxz60wJcQ9BFh6p7CX8CYEQLtShKocTfmbpRLHs3d1LT7u+9dA99tNZ+yHxBTcNztz0mr9x74I/hnZXhD7F/PCAn6bJz+U0vrPr7K5VJUJZf5/v040NDcG02LGGJVmfOsuxdifg03U9vUZHrPz0fl7p5caGjNkiEmTFUXBooUDbjWGs5TE+Pdyy6vjqijO+MPYACb+efjwdiYsqIewMk+d8tbro1b1uXXehPrYahmn+hZmGgtefqsalNFvU1BpAhM8QXhUlCmgCmihAUnBUQixk6J2eSYqwvM9Iz5sfrApM7LDF7W651oILbef3Tky0Nk2vcfeed0dxp3Nu7h6EYr2sgOL/Aa5OuMdnE5sWAAAAAElFTkSuQmCC";
 		//#endregion
+		//#region src/client/plugin-icon.tsx
+		const storageKey = "dsh-connect-workbuddy.icon-style";
+		const changeEvent = storageKey + ".changed";
+		/**
+		* OUR OWN ICON IS THE DEFAULT.
+		*
+		* The visitor who opens the card never asked for a different glyph: the LD mark is
+		* what the sidebar, the page header and the panel drew before this preference
+		* existed, and it is the shape this plugin is recognised by. An alternate skin is
+		* a CHOICE, so it has to be chosen — shipping the alternate as the default would
+		* repaint an identity the user never asked to change, which is the same mistake as
+		* a plugin rewriting another plugin's label.
+		*
+		* `'original'` is therefore also the fallback for a browser that stores nothing
+		* (`getItem` throws behind a blocked-storage policy) and the value the server
+		* snapshot reports, so the first paint and the hydrated paint agree.
+		*/
+		const DEFAULT_ICON_STYLE = "original";
+		/** The other one, derived so the default is stated exactly ONCE. */
+		const ALTERNATE_ICON_STYLE = "claude";
+		/**
+		* Appearance is local to this browser; account and provider settings are untouched.
+		*
+		* Everything is derived from {@link DEFAULT_ICON_STYLE} rather than repeating the
+		* literal, and that is not tidiness: an earlier draft compared against the stored
+		* 'claude' and returned 'claude' when storage was empty, so flipping the exported
+		* default changed nothing at all — the constant looked like the decision while the
+		* two literals beside it were. The test that pins the default could not catch it,
+		* which is how the duplicate survived.
+		*/
+		function iconStyleSnapshot() {
+			try {
+				return window.localStorage.getItem(storageKey) === ALTERNATE_ICON_STYLE ? ALTERNATE_ICON_STYLE : DEFAULT_ICON_STYLE;
+			} catch {
+				return DEFAULT_ICON_STYLE;
+			}
+		}
+		function subscribe(listener) {
+			const onStorage = (event) => {
+				if (event.key === storageKey || event.key === null) listener();
+			};
+			window.addEventListener(changeEvent, listener);
+			window.addEventListener("storage", onStorage);
+			return () => {
+				window.removeEventListener(changeEvent, listener);
+				window.removeEventListener("storage", onStorage);
+			};
+		}
+		function setIconStyle(value) {
+			window.localStorage.setItem(storageKey, value);
+			window.dispatchEvent(new Event(changeEvent));
+		}
+		function PluginIcon(props) {
+			const saved = (0, react.useSyncExternalStore)(subscribe, iconStyleSnapshot, () => DEFAULT_ICON_STYLE);
+			const variant = props.variant ?? saved;
+			const shared = {
+				className: props.className,
+				width: props.size ?? 16,
+				height: props.size ?? 16,
+				style: {
+					...props.style,
+					flexShrink: 0
+				},
+				"aria-hidden": true
+			};
+			if (variant === "original") return (0, react.createElement)("img", {
+				...shared,
+				src: WORKBUDDY_PLUGIN_ICON,
+				alt: ""
+			});
+			return (0, react.createElement)("svg", {
+				...shared,
+				viewBox: "0 0 24 24",
+				fill: "currentColor",
+				"data-icon-style": "claude",
+				"data-plugin-icon": "workbuddy"
+			}, (0, react.createElement)("path", { d: "M4.5 5.5h3v11h3l3-3v4l-2 2h-7z" }), (0, react.createElement)("path", { d: "M10.5 5.5H15a7 7 0 0 1 0 14h-2v-3h2a4 4 0 0 0 0-8h-1.5v2l-3 3z" }));
+		}
+		/** Each choice previews the real icon and immediately persists its selection. */
+		function IconStylePreference({ t }) {
+			const selected = (0, react.useSyncExternalStore)(subscribe, iconStyleSnapshot, () => DEFAULT_ICON_STYLE);
+			const [error, setError] = (0, react.useState)(false);
+			return (0, react.createElement)("div", { className: "dsm-icon-preference" }, (0, react.createElement)("div", { className: "dsm-icon-preference-copy" }, (0, react.createElement)("b", null, t("row.iconStyleLabel")), (0, react.createElement)("span", null, t("row.iconStyleHint"))), (0, react.createElement)("div", {
+				className: "dsm-icon-choices",
+				role: "radiogroup",
+				"aria-label": t("row.iconStyleLabel")
+			}, ...["original", "claude"].map((variant) => (0, react.createElement)("button", {
+				key: variant,
+				type: "button",
+				role: "radio",
+				"aria-checked": selected === variant,
+				tabIndex: selected === variant ? 0 : -1,
+				onKeyDown: (event) => {
+					if (![
+						"ArrowLeft",
+						"ArrowRight",
+						"ArrowUp",
+						"ArrowDown",
+						"Home",
+						"End"
+					].includes(event.key)) return;
+					event.preventDefault();
+					const next = event.key === "Home" ? "original" : event.key === "End" ? "claude" : variant === "original" ? "claude" : "original";
+					try {
+						setIconStyle(next);
+						setError(false);
+						(event.currentTarget.parentElement?.querySelectorAll("[role=radio]")[next === "original" ? 0 : 1])?.focus();
+					} catch {
+						setError(true);
+					}
+				},
+				onClick: () => {
+					try {
+						setIconStyle(variant);
+						setError(false);
+					} catch {
+						setError(true);
+					}
+				}
+			}, (0, react.createElement)(PluginIcon, {
+				variant,
+				size: 20
+			}), t(variant === "claude" ? "row.iconStyleClaude" : "row.iconStyleOriginal")))), error ? (0, react.createElement)("p", {
+				role: "alert",
+				className: "dsm-icon-save-error"
+			}, t("row.iconStyleSaveFailed")) : null);
+		}
+		//#endregion
+		//#region src/client/series-layout.ts
+		/** 同系列的公共布局规则。两个桥接插件同步维护此文件，功能专属样式留在 styles.ts。 */
+		function seriesLayoutCss(plugin) {
+			const p = `.dsm-${plugin}`;
+			const u = `${p}-usage`;
+			const members = plugin === "trae" ? `${p}-pool-card` : `${p}-pool-members`;
+			const memberHead = plugin === "trae" ? `${p}-pool-card-head` : `${p}-pool-members-head`;
+			const memberTitle = plugin === "trae" ? `${p}-pool-card-title` : `${p}-pool-members-title`;
+			const memberActions = plugin === "trae" ? `${p}-pool-card-tools` : `${p}-pool-members-actions`;
+			const saveBar = plugin === "trae" ? `${p}-pool-save-row` : `${p}-pool-save-bar`;
+			return `
+${p}-page{font-family:inherit;--dsm-series-sticky-top:-28px}
+/* Doubled selector so this beats the host's own page rule — but NOT at the cost
+ * of the settings surface, which shares the class and overrides its padding to 0
+ * (see styles.ts: the Settings panel column is already padded and already
+ * scrolls, so this page must not add padding of its own).
+ *
+ * The doubled class is (0,2,0) and a bare .dsm-workbuddy-settings is (0,1,0), so
+ * the padding came back and ate 36px off EACH side of the settings column:
+ * measured, the content column went 612px -> 540px, i.e. every card and the
+ * account table were 72px narrower than they should be. The owner saw it before
+ * any test could ("整体宽度变小了"). The :not() keeps the reach of the rule and
+ * gives the settings surface its padding back. */
+${p}-page${p}-page:not(${p}-settings){height:calc(100% - 16px);margin-bottom:16px;padding:28px clamp(24px,4vw,48px) 48px;gap:20px}
+${u} ${p}-pool-auto-checkin-status{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary,#777)}
+${p}-page-desc{font-size:13px;line-height:20px;color:var(--dsw-alias-label-tertiary,#999)}
+${u} ${p}-pool-auto-checkin{display:flex;flex-direction:column;gap:6px;margin-top:8px}
+/* 1120px, NOT the 860px the shared series layout shipped with.
+ *
+ * The page's own rule (styles.ts) has always been 1120px, and that is what the
+ * cards, the account table and the settings block were laid out and measured
+ * against. The series file narrowed the container to 860 as part of "unifying
+ * spacing", which does not unify anything for this plugin: it simply made every
+ * block on the page ~23% narrower, took the account table's columns with it, and
+ * the owner saw it immediately ("整体宽度变小了，不行，要用原来的宽度").
+ *
+ * Kept as a SECOND declaration next to the page's own one ON PURPOSE: this file is
+ * loaded after styles.ts (it is concatenated onto the same bundle), so it would
+ * win the cascade. Stating the same 1120 here is what keeps the shared file from
+ * silently re-narrowing the page the next time it is synced from trae. */
+${p}-page>*{width:100%;max-width:1120px;min-width:0}
+${u}{gap:16px;font-size:13px;line-height:1.5;min-width:0}
+${u} .dsm-btn{box-sizing:border-box;font:inherit;font-size:13px;line-height:20px;padding:5px 14px;border-radius:8px;min-height:32px}
+${u} .dsm-btn-outline{background:transparent;border-color:var(--dsw-alias-border-l2,#777);color:var(--dsw-alias-label-secondary,#999)}
+${u} ${p}-tabs{display:flex;gap:8px}
+${u} ${p}-tab-cell{flex:1;min-width:0;padding:8px 12px;border-radius:10px}
+${u} ${p}-panels{position:sticky;top:var(--dsm-series-sticky-top,0px);z-index:2;display:flex;gap:2px;margin:0;padding:0;border-bottom:1px solid var(--dsw-alias-border-l1,#777);background:var(--dsw-alias-bg-layer-2,#24262c)}
+/* 吸顶背景覆盖卡片两侧内边距，顶部偏移抵消滚动容器的顶部内边距。 */
+${p}-page-body ${u} ${p}-panels{margin-inline:0;padding:0 0 8px;border:0;border-bottom:1px solid var(--dsw-alias-border-l2,#777);border-radius:0;background:var(--dsw-alias-bg-layer-3,#202126)}
+${p}-page[data-tabs-stuck="true"] ${p}-panels{margin-inline:-20px;padding-inline:20px;border-top:1px solid var(--dsw-alias-border-l2,#777);box-shadow:0 3px 6px rgba(0,0,0,.06)}
+${u} ${p}-panel-tab{font-size:13px;font-weight:600;line-height:20px;padding:7px 11px}
+${u} ${p}-panel{margin-top:0;min-width:0}
+${u} ${p}-models-summary,${u} ${p}-panel-note{margin:2px 0 0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary,#999)}
+${u} ${p}-free-quota-warn{font-weight:600}
+/* 说明段落的间距由容器统一控制，避免与卡片的纵向 gap 叠加。 */
+${u} ${p}-region-summary{display:flex;flex-direction:column;gap:2px}
+${u} ${p}-region-summary ${p}-models-summary{margin:0}
+/* 说明与页签之间保留 8px，抵消外层 16px 间隔中多出的部分。 */
+${u} ${p}-region-summary+${p}-panels{margin-top:-8px}
+/* 页签底边已经分隔账号区，不在账号池顶部重复画线。 */
+${u} #dsm-${plugin}-panel-accounts ${p}-pool{border-top:0;padding-top:0}
+
+${u} ${p}-pool{display:flex;flex-direction:column;gap:12px;margin:0;padding:14px 0 0;border-top:1px solid var(--dsw-alias-border-l2,#777)}
+${u} ${p}-pool-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+${u} ${p}-pool-title{margin:0;font-size:13px;font-weight:600;line-height:18px}
+${u} ${plugin === "trae" ? `${p}-pool-current` : `${p}-pool-current-badge`}{margin-left:auto;max-width:100%;overflow-wrap:anywhere;white-space:normal;padding:2px 8px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2,#777);font-size:11px;font-weight:500;line-height:16px;background:var(--dsw-alias-bg-layer-2,#24262c);color:var(--dsw-alias-label-secondary,#999)}
+${u} ${p}-pool-settings${p}-pool-modebar{padding:12px 14px;gap:8px;border:1px solid var(--dsw-alias-border-l2,#777);border-radius:12px;background:color-mix(in srgb,var(--dsw-alias-brand-primary,#cf795b) 5%,var(--dsw-alias-bg-layer-2,#24262c))}
+${u} ${p}-pool-modebar-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-height:20px}
+${u} ${p}-pool-modebar-label{font-size:13px;font-weight:600;line-height:20px}
+${u} ${p}-pool-modebar-state{padding:1px 9px;font-size:12px;line-height:18px;border-radius:999px;color:var(--dsw-alias-label-secondary,#999);border:1px solid var(--dsw-alias-border-l2,#777);background:var(--dsw-alias-bg-layer-2,#24262c)}
+${u} ${p}-pool-note,${u} ${p}-pool-modebar ${p}-pool-note{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary,#999)}
+${u} ${members}{display:flex;flex-direction:column;gap:0;min-width:0;border:1px solid var(--dsw-alias-border-l2,#777);border-radius:12px;background:var(--dsw-alias-bg-layer-2,#24262c);overflow:hidden}
+${u} ${memberHead}{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;padding:14px 14px 12px}
+${u} ${memberTitle}{margin:0;font-size:13px;font-weight:600;line-height:18px;color:var(--dsw-alias-label-primary,#eee)}
+${u} ${memberHead} ${p}-pool-note{margin-top:4px}
+${u} ${memberActions}{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+${u} ${memberActions} .dsm-btn{padding:5px 14px;font-size:13px;line-height:20px}
+${u} ${p}-pool-count,${u} ${memberActions} ${p}-pool-hint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary,#999)}
+${u} ${members} ${p}-pool-actions{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;padding:0 14px 12px}
+${u} ${p}-pool-actions-end{margin-left:auto}
+${u} ${members} ${p}-pool-action-note{margin:0;padding:0 14px 12px;font-size:12px;line-height:18px}
+${u} ${members} ${p}-pool-table{border:0;border-top:1px solid var(--dsw-alias-border-l1,#777);border-radius:0}
+${u} ${p}-pool-row{padding:10px 14px;align-items:start;font-size:13px;line-height:18px}
+${u} ${p}-pool-row-head{padding:8px 14px;font-size:11px;line-height:16px;align-items:center}
+${u} ${p}-pool-row-current{background:color-mix(in srgb,var(--dsw-alias-brand-primary,#cf795b) 5%,var(--dsw-alias-bg-layer-2,#24262c));box-shadow:inset 3px 0 0 var(--dsw-alias-brand-primary,#cf795b)}
+${u} ${p}-pool-row-actions .dsm-btn{min-height:26px;padding:2px 10px;font-size:12px;line-height:20px}
+${u} ${p}-pool-settings-wrap{display:flex;flex-direction:column;gap:10px;border-top:1px solid var(--dsw-alias-border-l2,#777);padding-top:14px}
+${u} ${p}-pool-settings{border-radius:12px;gap:0}
+${u} ${p}-pool-settings-wrap :is(h3,h4){margin:0;font-size:13px;font-weight:600;line-height:18px;color:var(--dsw-alias-label-primary,#eee)}
+${u} ${p}-pool-set-ctl select{box-sizing:border-box;width:240px;min-width:0;max-width:100%}
+${u} ${p}-pool-set{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 14px}
+${u} ${p}-pool-set-copy{flex:1;min-width:0;gap:3px}
+${u} ${p}-pool-set-copy b{font-size:13px;font-weight:500;line-height:18px}
+${u} ${p}-pool-set-copy span{font-size:12px;line-height:18px}
+/* ONCE THE SETTINGS ROW STACKS, THE CONTROL TAKES THE WHOLE LINE.
+ *
+ * Two rules above do the stacking (this file's .pool-set is the flex row, the
+ * plugin's own @container turns it into a column), and both of the things that
+ * finish that move were being overridden here:
+ *
+ *   - width:240px on the select — (0,2,1) beats the plugin's (0,1,0) width:100%,
+ *     so the dropdown stayed a 240px stub in a 612px column, sitting alone under its
+ *     label with ~180px of dead space on each side. The owner's screenshot:
+ *     「这个应该 100%宽度啊」.
+ *   - align-items:center on .pool-set — (0,2,0) beats the @container's
+ *     align-items:stretch, so even a width:100% child would have been centred
+ *     at its intrinsic width rather than filling.
+ *
+ * Restated here rather than narrowed above, because this is the same direction the
+ * plugin already declares and the file that wins the cascade has to say it too.
+ * Specificity matches the base rules above ((0,2,0)/(0,2,1)) and these come later,
+ * so they win by order. */
+@container (max-width:620px){
+ ${u} ${p}-pool-set{flex-direction:column;align-items:stretch;gap:8px}
+ ${u} ${p}-pool-set-ctl{flex:1 1 auto;justify-content:flex-start;max-width:100%;min-width:0}
+ ${u} ${p}-pool-set-ctl select{width:100%;max-width:none;min-width:0}
+}
+${u} ${p}-models-title{font-size:13px;line-height:18px;font-weight:600}
+${u} ${p}-model-list{border-radius:12px}
+${u} ${p}-model{padding:12px 14px;gap:8px}
+${u} ${p}-model-name{font-size:13px;line-height:20px}
+${u} ${p}-model-actions,${u} ${p}-pool-save-row{gap:12px;padding-top:12px}
+/* 保存栏以整个账号池为粘附范围，避免被更多设置的短父级截住。 */
+${u} ${p}-pool-settings-wrap{display:contents}
+${u} ${saveBar}{position:sticky;bottom:0;z-index:2;isolation:isolate;padding-bottom:12px;background:var(--dsw-alias-bg-layer-3,#202126)}
+/* 滚动容器底部的内边距也属于可见区域，负偏移让背景覆盖到视口底边。 */
+${p}-page ${saveBar}{bottom:-48px}
+${p}-page ${saveBar}[data-save-stuck="true"]{margin-inline:-20px;padding-inline:20px;border-top:1px solid var(--dsw-alias-border-l2,#777);border-bottom:1px solid var(--dsw-alias-border-l2,#777);border-radius:0;box-shadow:0 -3px 6px rgba(0,0,0,.06)}
+
+${u} #dsm-${plugin}-panel-capabilities:not([hidden]){display:flex;flex-direction:column;gap:14px}
+${u} ${p}-prefs{gap:14px;padding:0}
+${u} ${p}-pref{font-size:13px;line-height:18px;gap:10px}
+${u} ${p}-pref-hint{font-size:12px;line-height:18px}
+${u} ${p}-draw-image{margin:0;gap:10px;font-size:13px;line-height:18px}
+${u} ${p}-draw-image>span{display:flex;flex-direction:column;gap:3px}
+${u} ${p}-draw-image-hint{font-size:12px;line-height:18px}
+${u} ${p}-pool-table{container-type:inline-size}
+${u} ${p}-pool-current-tag{border:1px solid var(--dsw-alias-border-l2,#777);background:var(--dsw-alias-bg-layer-2,#24262c);color:var(--dsw-alias-label-secondary,#999)}
+/* The ≤700px RE-GRID OF THE POOL ROW IS DELIBERATELY ABSENT.
+ *
+ * The shared series layout used to switch the row to display:flex + flex-wrap:wrap,
+ * hide the header and give the actions their own full-width line here. That is the
+ * stacked form workbuddy REMOVED: the row is three lines at every width (identity +
+ * credits / verdict + timestamp + check-in + buttons / provenance), and its narrow
+ * concession is one detail — dropping the absolute timestamp where it cannot sit
+ * beside the verdict — not a second layout.
+ *
+ * Copied over, those four rules cost the row its whole shape: measured in headless
+ * Chrome at the 564px Settings column, the row went from 80px to 118px, the header
+ * disappeared, and the buttons fell onto a line of their own. The two-class selectors
+ * below would have outranked the row's own single-class rule, so nothing warned.
+ *
+ * The series layout keeps everything that is genuinely shared — sticky tabs, the
+ * save bar, the paddings and control metrics — and leaves each plugin row to
+ * itself. trae still ships its own stacked form in its own stylesheet. */
+/* 自动签到、设备参数和 SDK 是功能差异；沿用公共间距，不移除控件。 */
+${u} ${p}-device-mode{margin:0;padding:0 14px 12px}
+${u} ${p}-pool .sw{width:36px;height:20px}
+${u} ${p}-pool .sw-track::after{top:2px;left:2px;width:16px;height:16px;background:var(--dsw-alias-bg-layer-3,#fff)}
+${u} ${p}-pool .sw input:checked+.sw-track::after{transform:translateX(16px)}
+@media(max-width:600px){
+ ${p}-page${p}-page{padding:20px 16px 32px;--dsm-series-sticky-top:-20px}
+ ${p}-page ${saveBar}{bottom:-32px}
+ ${u} ${memberHead}{align-items:flex-start}
+ ${u} ${memberActions}{flex-wrap:wrap}
+ ${u} ${p}-pool-set{flex-wrap:wrap}
+ ${u} ${p}-pool-set-ctl{max-width:100%;flex-wrap:wrap}
+ ${u} ${p}-pool-set-ctl select{min-width:0;max-width:100%}
+}
+`;
+		}
+		/** 根据页签与保存栏的实际吸附位置显示边界。 */
+		function updateStickyTabs(page) {
+			const tabs = page.querySelector("[role=\"tablist\"][class$=\"-panels\"]");
+			const stuck = tabs !== null && page.scrollTop > 0 && tabs.getBoundingClientRect().top <= page.getBoundingClientRect().top + 1;
+			page.dataset.tabsStuck = String(stuck);
+			const viewportBottom = page.getBoundingClientRect().bottom;
+			for (const bar of Array.from(page.querySelectorAll("[class$=\"-pool-save-row\"],[class$=\"-pool-save-bar\"]"))) {
+				const visible = bar.getClientRects().length > 0;
+				const bottom = Number.parseFloat(getComputedStyle(bar).bottom) || 0;
+				bar.dataset.saveStuck = String(visible && Math.abs(bar.getBoundingClientRect().bottom + bottom - viewportBottom) <= 1);
+			}
+		}
+		//#endregion
 		//#region src/client/styles.ts
 		/**
 		* Client styles for the WorkBuddy plugin card.
@@ -4904,6 +6851,16 @@ window.__ModuleLoader__.load({
 		* @module dsh-connect-workbuddy/client/styles
 		*/
 		const WORKBUDDY_CARD_CSS = `
+.dsm-icon-preference{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px;padding:12px 0;color:var(--dsw-alias-label-primary,#e6e6e6)}
+.dsm-icon-preference-copy{display:flex;flex-direction:column;gap:4px;flex:1;min-width:180px;font-size:13px}
+.dsm-icon-preference-copy>span{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-tertiary,#999)}
+.dsm-icon-choices{display:flex;flex-wrap:wrap;gap:6px}
+.dsm-icon-choices>button{appearance:none;display:inline-flex;align-items:center;gap:8px;font:inherit;font-size:12px;line-height:20px;color:inherit;background:transparent;border:1px solid var(--dsw-alias-border-l2,#777);border-radius:8px;padding:7px 10px;cursor:pointer}
+.dsm-icon-choices>button[aria-checked="true"]{border-color:var(--dsw-alias-brand-primary,#cf795b);background:var(--dsw-alias-bg-layer-2,#25262b)}
+.dsm-icon-choices>button:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#cf795b);outline-offset:2px}
+.dsm-icon-save-error{flex-basis:100%;margin:0;color:var(--dsw-alias-state-error-primary,#c33);font-size:12px}
+
+
 .dsm-plugin-card{border:1px solid var(--dsw-alias-border-l2,#36373b);background:var(--dsw-alias-bg-layer-3,#202126);border-radius:12px;list-style:none;transition:border-color .16s,background .16s}
 .dsm-plugin-card:hover{border-color:var(--dsw-alias-label-dimmed,#777)}
 .dsm-plugin-card-open{background:var(--dsw-alias-bg-layer-2,#25262b);border-color:var(--dsw-alias-label-dimmed,#777)}
@@ -4927,7 +6884,7 @@ window.__ModuleLoader__.load({
 .dsm-btn-outline:hover:not(:disabled){color:var(--dsw-alias-label-primary);border-color:var(--dsw-alias-label-dimmed);background:rgba(255,255,255,.04)}
 .dsm-btn-primary{background:var(--dsw-alias-label-primary);color:var(--dsw-alias-bg-layer-3)}
 .dsm-btn-primary:hover:not(:disabled){opacity:.9}
-.dsm-workbuddy-usage{display:flex;flex-direction:column;gap:16px;margin:0;padding:16px 0 4px}
+.dsm-workbuddy-usage{--dsm-workbuddy-surface:var(--dsw-alias-bg-layer-1,#17181b);display:flex;flex-direction:column;gap:16px;margin:0;padding:16px 0 4px;background:var(--dsw-alias-bg-layer-1,#17181b);border-radius:12px}
 /* The provider bar: one CARD per region, side by side.
  *
  * COPIED FROM dsh-connect-trae, rule for rule, because an approximation of it
@@ -4994,12 +6951,100 @@ window.__ModuleLoader__.load({
  * inactive panel out of the accessibility tree, which is exactly what
  * role="tabpanel" wants — unlike display:none reached by a CSS class, it
  * cannot be overridden by a later rule. */
-.dsm-workbuddy-panels{display:flex;align-items:stretch;gap:2px;margin:16px 0 0;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24))}
+/* No top margin: this row is a flex child of .dsm-workbuddy-usage, whose
+ * column gap already separates it from the paragraph above. The margin stacked
+ * ON TOP of that gap and doubled the distance (measured: 32px where the rhythm
+ * is 16px).
+ *
+ * The bottom rule stays: it is the tabs' underline, not spacing.
+ *
+ * STICKY, so the strip cannot be scrolled away from the sections it switches
+ * (learned from dsh-connect-trae 4.9.0, same migration). This is NOT a decision
+ * to take over scrolling: the Settings panel's own .options column scrolls, and
+ * the card must not add a second scroller inside it — so there is no height:100%
+ * and no overflow here either. But "not scrolling" is not the same as "may
+ * disappear": the pool sits below the fold, and by the time the reader scrolls
+ * down to it the five tabs are off the top, so switching sections means
+ * scrolling the whole page back up first.
+ *
+ * The background is not decoration: it is what stops the rows sliding under a
+ * transparent strip and showing through the gaps between the labels — and under
+ * a wallpaper (issue #209) a transparent one would be unreadable outright.
+ *
+ * It paints --dsm-workbuddy-surface, NOT a hard-coded layer. That variable is
+ * declared beside the fill on every surface's own .dsm-workbuddy-usage rule
+ * (card / page / settings), which is the element whose opaque area the strip sits
+ * inside. The three do not agree — the page paints layer-3 while the other two
+ * paint layer-1 — so a strip pinned to either constant becomes a visibly lighter
+ * bar over the other. One variable, declared where the fill is declared, is what
+ * keeps the two from drifting; a test requires every declarer to declare it.
+ *
+ * top:-1px rather than 0, because the strip's own border-bottom is drawn
+ * OUTSIDE the box and 0 leaves a 1px slit for the scrolling rows to show
+ * through. */
+.dsm-workbuddy-panels{position:sticky;top:-1px;z-index:2;display:flex;align-items:stretch;gap:2px;margin:0;border-bottom:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.24));background:var(--dsm-workbuddy-surface,var(--dsw-alias-bg-layer-1,#17181b))}
 .dsm-workbuddy-panel-tab{appearance:none;font:inherit;cursor:pointer;border:0;background:transparent;padding:7px 11px;margin-bottom:-1px;border-bottom:2px solid transparent;color:var(--dsw-alias-label-tertiary,#999);font-size:13px;font-weight:600;line-height:20px;white-space:nowrap;transition:color .15s,border-color .15s}
 .dsm-workbuddy-panel-tab:hover:not(.dsm-workbuddy-panel-tab-active){color:var(--dsw-alias-label-primary,#e6e6e6)}
 .dsm-workbuddy-panel-tab:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#5686fe);outline-offset:1px}
 .dsm-workbuddy-panel-tab-active{color:var(--dsw-alias-label-primary,#e6e6e6);border-bottom-color:var(--dsw-alias-brand-primary,#5686fe)}
-.dsm-workbuddy-panel{margin-top:12px}
+/* Same rule as the tab row above: the usage column's gap is the only spacing
+ * between a tab row and the panel under it. This margin used to add 12px on top
+ * of the 16px gap, and the panel's first block (the pool, with its own 16px top
+ * padding) added a third layer. */
+.dsm-workbuddy-panel{margin:0}
+/* THE CAPABILITIES PANEL IS A COLUMN OF GROUPS, not a run of paragraphs.
+ *
+ * Measured before this rule existed: the panel was display:block with
+ * gap:normal, so its six blocks had NO space between them at all and the
+ * rhythm was being improvised by whatever padding each block happened to carry
+ * — ink-to-ink the gaps read 12 / 50 / 2 / 17 / 0 px. The 50px hole sat between
+ * the gateway card and the first switch (the card's own 10px bottom padding plus
+ * .prefs' 2px top), and the 2px squeeze sat between two switch groups that are
+ * different KINDS of setting. Neither number was chosen; both fell out of the
+ * order the blocks happen to be written in.
+ *
+ * One gap now owns the rhythm, and every group drops the ad-hoc padding it used
+ * to fake it. 18px is the same step the rest of this card uses between
+ * distinctly different things, and it is large enough to separate two groups of
+ * switches WITHOUT a divider — which is why the one divider that used to sit
+ * above the first upstream switch was deleted rather than kept: once the panel
+ * owns 18px, a border plus 10px of its own padding became a third spacing
+ * statement in the same 20px of air (measured 69px ink-to-ink against 18px
+ * everywhere else, the single visible hole in the panel). */
+/* THE ID IS THE HOOK, not a second class name.
+ *
+ * Every panel in this card renders as plain dsm-workbuddy-panel; none of them
+ * carries a per-panel class. A rule written as
+ * .dsm-workbuddy-panel-capabilities{...} therefore matches NOTHING — it parses,
+ * ships, and does nothing at all, which is the worst failure mode available
+ * here because the panel keeps looking slightly wrong and the CSS looks right.
+ * #dsm-workbuddy-panel-capabilities is the attribute that actually exists on
+ * the element. */
+#dsm-workbuddy-panel-capabilities{display:flex;flex-direction:column;gap:18px}
+/* THE PANEL MUST STILL BE HIDEABLE (regression fix, 5.20.1).
+ *
+ * An ID selector outranks the UA sheet's [hidden]{display:none} on
+ * specificity (1,0,0 vs 0,1,0), so adding display:flex above made the
+ * capabilities panel IGNORE its own hidden attribute. Result: it painted
+ * permanently and, being later in the DOM, covered the diagnostics and SDK
+ * panels entirely — clicking those tabs appeared to do nothing.
+ *
+ * The measure is simple: a panel that is hidden must never be displayed,
+ * whatever other rules set. Both declarations are needed and neither is
+ * redundant — display:none wins the cascade, and !important is what stops
+ * the same thing recurring the next time someone gives a panel a display value.
+ *
+ * Why the shot tool did not catch it: tools/capabilities-shot.tsx hides the
+ * other panels with display:none!important so the section can be measured in
+ * one screenful. That override masked this exact bug — the harness was fixing
+ * the thing it was supposed to observe. The tool no longer forces display on
+ * the panel, and tests/capabilities-layout.spec.tsx now pins that a hidden
+ * panel stays hidden. */
+#dsm-workbuddy-panel-capabilities[hidden]{display:none!important}
+/* The note keeps the panel's gap like every other block: a special-cased
+   tighter gap here would be one more number to decode, and the panel's own
+   rhythm is what this rule exists to establish. */
+#dsm-workbuddy-panel-capabilities > .dsm-workbuddy-panel-note{margin:0}
 /* DIAGNOSTICS: a two-column fact table rather than prose. Each row is one thing
  * the card actually READ, so a bug report can quote a line instead of
  * paraphrasing the UI. No control lives here on purpose — a diagnostics panel
@@ -5034,20 +7079,73 @@ window.__ModuleLoader__.load({
  * (the dsm-workbuddy-models-summary class) has no side padding, so copying the
  * reference's 2px would leave the two edges 2px apart — a difference too small
  * to name and just big enough to look unaligned. */
-.dsm-workbuddy-prefs{display:flex;flex-direction:column;gap:14px;padding:2px 0 0}
+.dsm-workbuddy-prefs{display:flex;flex-direction:column;gap:14px;padding:0}
+/* THE GROUP'S LEAD LINE BELONGS TO THE ROW UNDER IT (5.20.0).
+ *
+ * Every group opens with one sentence saying what the switches beneath it
+ * control. With the group's uniform 14px gap, that sentence sat as far from its
+ * first row as two rows sit from each other — measured 14px on all four groups,
+ * identical to the row-to-row distance — so it read as a paragraph of body text
+ * that happened to precede the list rather than as the list's heading.
+ *
+ * Pulling it 6px closer makes the pair visible as a pair without introducing a
+ * new step: the group's own rows stay 14px apart, the lead sits 8px from its
+ * first row, and the 18px panel gap still separates one group from the next. */
+.dsm-workbuddy-prefs > .dsm-workbuddy-pref-hint:first-child{margin-bottom:-6px}
 .dsm-workbuddy-pref{display:flex;align-items:flex-start;gap:10px;font-size:13px;line-height:18px;color:var(--dsw-alias-label-secondary,#c6c9d0);cursor:pointer}
 /* The platform's own checkbox, themed only with accent-color. A hand-drawn box
    was tried on this card and reverted: brand-primary resolves to the host's
    CONTRAST colour, so a ticked box painted itself as a heavy black pill — the
    loudest object in a section made of plain 13px text. */
 .dsm-workbuddy-pref input{flex:none;cursor:pointer;accent-color:var(--dsw-alias-brand-primary,#5686fe)}
-.dsm-workbuddy-pref-check,.dsm-workbuddy-image-tool-check,.dsm-workbuddy-video-tool-check,.dsm-workbuddy-cli-bridge-check,.dsm-workbuddy-upstream-check{inline-size:15px;block-size:15px;margin:3px 0 0}
+/* ── The CN gateway override (issue #220) ─────────────────────────────────────
+ * One bordered block so it does not read as a fifth switch: every other control
+ * in this section is a checkbox that commits on the click, this one is a text
+ * field that needs an explicit Save. Giving it a card of its own is what says
+ * "this answers a different question".
+ *
+ * The 25px LEFT padding is the same indent .dsm-workbuddy-pref-indent uses
+ * (15px checkbox + 10px row gap): it puts the card's title on the same left edge
+ * as every switch LABEL in the panel below it, measured 318px vs 330px before
+ * this value existed. A bordered box whose text starts 12px left of the text
+ * beside it reads as a misaligned column, not as a card.
+ *
+ * The row wraps, and the input takes the whole width when it does: a host name is
+ * long (https://wb.tencentbuddy.com is 26 characters) and a half-width input in
+ * the panel column would show about eight of them. */
+.dsm-workbuddy-cnbase{display:flex;flex-direction:column;gap:8px;padding:10px 12px 10px 25px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);border-radius:10px;background:var(--dsw-alias-bg-layer-2,#24262c)}
+/* SAME TYPOGRAPHY AS A SWITCH ROW (13px/18px).
+ *
+ * Measured before this rule: the card's title rendered at 16px while every
+ * switch label in the same panel rendered at 13px. The cause is structural
+ * rather than a wrong number — a switch row gets its 13px from
+ * .dsm-workbuddy-pref, and this row is NOT a .dsm-workbuddy-pref (it stacks
+ * its label above a text field instead of sitting beside a 15px box), so it
+ * inherited the page's 16px instead. One group rendering a size nobody chose is
+ * exactly the kind of defect a screenshot shows and nobody can name. */
+.dsm-workbuddy-cnbase-row{display:flex;flex-direction:column;gap:8px;font-size:13px;line-height:18px;color:var(--dsw-alias-label-secondary,#c6c9d0)}
+.dsm-workbuddy-cnbase-input{box-sizing:border-box;width:100%;padding:6px 10px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);border-radius:8px;background:var(--dsw-alias-bg-layer-3,#2a2c33);color:var(--dsw-alias-label-primary,#e6e6e6);font:inherit;font-size:13px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+.dsm-workbuddy-cnbase-input:disabled{opacity:.5;cursor:default}
+.dsm-workbuddy-cnbase-input:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#5686fe);outline-offset:1px}
+.dsm-workbuddy-cnbase-error{margin:0;font-size:12px;line-height:17px;color:var(--dsw-alias-state-error-primary,#ef4444)}
+.dsm-workbuddy-cnbase-notice{margin:0;font-size:12px;line-height:17px;color:var(--dsw-alias-state-success-primary,#22a06b)}
+.dsm-workbuddy-cnbase-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px}
+.dsm-workbuddy-pref-check,.dsm-workbuddy-image-tool-check,.dsm-workbuddy-video-tool-check,.dsm-workbuddy-cli-bridge-check,.dsm-workbuddy-sidebar-panel-check,.dsm-workbuddy-drop-thinking-check,.dsm-workbuddy-upstream-check,.dsm-workbuddy-channel-continue-check,.dsm-workbuddy-new-models-check{inline-size:15px;block-size:15px;margin:3px 0 0}
 /* The upstream-identity switches are their own group, so they get a divider
    above them instead of relying on spacing alone: they change the request the
    whole plugin sends, not a per-region display choice, and reading them as the
    tail of the preference list would misrepresent what flipping one costs. */
-.dsm-workbuddy-upstream-pref{margin-top:4px}
-.dsm-workbuddy-upstream-pref:first-of-type{border-top:1px solid var(--dsw-alias-bg-layer-3,#2e3034);padding-top:10px}
+/* The divider above the first upstream switch is GONE as of 5.20.0.
+ *
+ * It was doing double duty: separating "what this tab shows" from "what the
+ * plugin sends" AND propping up a panel that had no gap of its own. Once
+ * #dsm-workbuddy-panel-capabilities owns the rhythm at 18px, the border plus its
+ * 10px padding became a third spacing statement in the same 20px of air —
+ * measured ink-to-ink 69px against 18px everywhere else, i.e. the one visible
+ * hole in the panel. The semantic break it marked is still real, and it is now
+ * expressed the way the rest of the panel expresses it: one group, one gap.
+ * The 4px that remains is optical only, between the group's own rows. */
+.dsm-workbuddy-upstream-pref{margin-top:0}
 .dsm-workbuddy-pref input:disabled{cursor:default}
 .dsm-workbuddy-pref:has(input:disabled){opacity:.6;cursor:default}
 /* The NAME and what it does are TWO lines, not one wrapped blob: first what the
@@ -5164,13 +7262,31 @@ window.__ModuleLoader__.load({
 .dsm-workbuddy-searched-more{margin-top:6px;padding:0;border:0;background:none;color:var(--dsw-alias-brand-primary,#5686fe);font:inherit;font-size:12px;line-height:18px;cursor:pointer;text-align:left}
 .dsm-workbuddy-searched-more:hover{text-decoration:underline}
 .dsm-workbuddy-usage-error{margin:0;font-size:14px;line-height:22px;color:var(--dsw-alias-state-error-primary,#ef4444)}
+/* A failed status read is recoverable, so the banner carries an action: the
+   message alone told the user nothing they could do but close the card. */
+.dsm-workbuddy-usage-error-block{display:flex;flex-direction:column;align-items:flex-start;gap:10px;margin-top:12px}
 .dsm-workbuddy-usage-dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
 .dsm-workbuddy-models{display:flex;flex-direction:column;gap:10px;border-top:1px solid var(--dsw-alias-border-l2,#36373b);padding-top:14px}
 .dsm-workbuddy-models-fold{display:flex;flex-direction:column;gap:10px}
 /* A plain header now: the section does not fold, so it is neither clickable nor
    focusable, and the list-marker rules that hid the native <details> triangle are
    gone with it. */
-.dsm-workbuddy-models-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
+/* WRAPS, and the title column may shrink.
+ *
+ * In the Settings panel this header has ~538px for a title, a count line and
+ * FOUR buttons (refresh + two availability sweeps + the speed sweep), whose
+ * Chinese labels are long (一键测速启用模型). Without wrapping the flex line
+ * never breaks, so the buttons keep their intrinsic width and the title column
+ * is squeezed until 「已启用 3 个」 breaks mid-phrase — the header grows a second
+ * line while the buttons stay put, which reads as a layout accident.
+ *
+ * row-gap is smaller than gap: a wrapped row is a continuation of the same
+ * header, not a new section. */
+.dsm-workbuddy-models-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px 12px;flex-wrap:wrap}
+/* The title column must be allowed to shrink below its content (min-width:0),
+   or wrapping does not help — a flex item defaults to min-width:auto and would
+   still push the buttons onto their own line at full width. */
+.dsm-workbuddy-models-head>div:first-child{min-width:0}
 .dsm-workbuddy-models-title-row{display:flex;align-items:center;gap:6px;min-width:0}
 .dsm-workbuddy-models-title{margin:0;color:var(--dsw-alias-label-primary,#e6e6e6);font-size:14px;font-weight:600;line-height:20px}
 /* Unsaved-changes marker. It sits in the HEADER rather than beside the save
@@ -5188,7 +7304,39 @@ window.__ModuleLoader__.load({
    colour: it has to stand out from the three lines around it WITHOUT reading as
    an error banner, because the fact it states is normal product behaviour
    rather than a failure. Weight is the only signal it needs. */
-.dsm-workbuddy-free-quota-warn{font-weight:600}
+/* 这两句仍然连在一起读（先说这两个 tab 是什么，再说额度有限），但不再用负
+ * 外边距把它们压成一坨。
+ *
+ * 上一版是 margin-top:-10px，本意是「不要段落间距」。实测代价是两行底部只隔
+ * 6px，而第二行是加粗的：负外边距把上一行 18px 行高留下的空隙吃掉之后，加粗
+ * 的字面几乎顶到上一行的下缘，读起来像一个被挤住的块，而不是两句话。改成
+ * 4px 的正间距：仍然贴得比普通段落近，但加粗那一行有了自己的呼吸。 */
+/* Sits ON the pool heading's line now, in the gap between the title and the
+ * serving-account badge. It was a block paragraph (with margins tuned to follow
+ * the region-pair explanation), so it needs a row-appropriate box: no block
+ * margins, and flex:1 so it takes exactly the empty middle and pushes the
+ * badge to the right edge the way the heading row already wanted.
+ *
+ * It may WRAP rather than ellipsize: this is the sentence that stops a ×0 tier
+ * being read as "unlimited", and a truncated caveat is worse than a taller row. */
+.dsm-workbuddy-free-quota-warn{font-weight:600;flex:1 1 12em;min-width:0;margin:0;color:var(--dsw-alias-label-tertiary,#999);font-size:12px;line-height:18px}
+/* The line that explains the REGION pair, directly under it.
+ *
+ * It used to be a .dsm-workbuddy-models-summary inside the accounts panel,
+ * borrowing a class named for the model list. It describes the two provider
+ * cells above it, so it gets its own name and its own margin: the summary's
+ * margin:2px 0 0 was tuned to sit under a section heading, and here the line
+ * follows a row of boxed cells and needs more air, plus it precedes the section
+ * tabs whose own top margin would otherwise crowd it.
+ *
+ * 最后定成 margin:0，因为这个容器是 flex column 带 gap 的：外边距会**叠在**
+ * gap 之上。10px 时实测空隙 26px（10 + 16），18px 时 34px，而格子的边框让它
+ * 看起来更松。真正需要的只是 gap 本身——这一行本就跟着单元格，属于同一个
+ * 「范围」区块，中间不需要再插一层空气。
+ *
+ * 上一版反过来试过两个极端都算过账：负外边距（压成 6px，加粗那行顶到上一行）、
+ * 18px（34px 的空档）。正解是不加。 */
+.dsm-workbuddy-tab-hint{margin:0;color:var(--dsw-alias-label-tertiary,#999);font-size:12px;line-height:18px}
 /* Every model is laid out in full — NO inner scroll box.
  *
  * The previous rule capped this at max-height 520px with overflow-y auto, so a
@@ -5208,7 +7356,49 @@ window.__ModuleLoader__.load({
 .dsm-workbuddy-model{display:grid;grid-template-columns:minmax(0,1fr);gap:7px;padding:10px 12px;background:var(--dsw-alias-bg-layer-2,#232529);transition:opacity .16s}
 .dsm-workbuddy-model-disabled{opacity:.55}
 .dsm-workbuddy-model+.dsm-workbuddy-model{border-top:1px solid var(--dsw-alias-border-l2,#36373b)}
-.dsm-workbuddy-model-head{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0}
+/* ISSUE #198 — the model row's controls MUST WRAP.
+
+   The row carries four groups on one line: the name, the two checkboxes, the
+   context-budget control, and the test/measure buttons. (It was a radio GROUP;
+   as of 5.20.2 it is one select, which cannot wrap or clip internally — but the
+   row still has to wrap, because the four groups together are what overflow.)
+   The budget control had flex:none and the row had no flex-wrap, so on a narrow
+   card (dsh-go on a phone, a ~360 px settings panel) the row's intrinsic width
+   exceeded the
+   container and the model list's overflow:hidden CLIPPED THE REST — the third
+   radio (「模型原生窗口」, e.g. 1M) was neither visible nor clickable, and the
+   largest budget a user could pick looked like 500K. A control that is clipped is
+   worse than one that is missing: the README promises three tiers and the screen
+   silently contradicts it. Both halves are needed — the row wraps, AND the group
+   itself wraps, because its three labels can exceed even a whole narrow line —
+   hence the media query below as well, which gives the group the full width on a
+   phone so it reads as one deliberate line rather than a scramble. */
+/* ONE MODEL = TWO LINES (requested; it was three for one release).
+ *
+ *   1. WHAT IT IS + HOW IT BEHAVES — checkbox, name, price, badges, load icon
+ *                                    then the switches and the budget select
+ *   2. WHAT IT COSTS / WHAT YOU CAN DO — window + output + tier, then the buttons
+ *
+ * WHY THE SWITCHES MOVED BACK UP. As three lines the row left the whole right
+ * HALF of line 1 empty — the name is short, and nothing followed it — while
+ * line 2 carried three controls that together are narrower than that empty
+ * space. The row was three lines tall and two-thirds empty per line; two lines
+ * fit the same content in less height, which is what the list is for (reading
+ * a roster, not admiring whitespace).
+ *
+ * Line 1 is a two-part flex: the name label is flex:1 and the switch group is
+ * flex:none, so a long model name shrinks (it already ellipsizes) and the
+ * controls never move. When the column is too narrow for both, the controls
+ * wrap UNDER the name — the same visual as the old three-line layout, decided
+ * by the available width rather than always. */
+.dsm-workbuddy-model-head{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;row-gap:8px;min-width:0}
+/* Line 1's right half. flex:none so the switches and the select keep their own
+   width and the NAME is the only thing that gives way. */
+.dsm-workbuddy-model-controls{display:flex;align-items:center;flex-wrap:wrap;gap:12px;row-gap:8px;min-width:0;flex:none}
+/* Line 2: facts left, actions right. Indented to the name (22px = the
+   checkbox box + its 8px gap) so the two lines read as one block rather than
+   as a checkbox with two toppled fragments beside it. */
+.dsm-workbuddy-model-details{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;padding-inline-start:22px}
 .dsm-workbuddy-model-enabled{display:flex;align-items:center;gap:8px;min-width:0;cursor:pointer;flex:1}
 .dsm-workbuddy-model-enabled input{margin:0;accent-color:var(--dsw-alias-brand-primary,#5686fe);flex:none}
 .dsm-workbuddy-model-image{display:inline-flex;align-items:center;gap:5px;flex:none;cursor:pointer;color:var(--dsw-alias-label-secondary,#c6c9d0);font-size:11px;line-height:16px}
@@ -5217,7 +7407,36 @@ window.__ModuleLoader__.load({
 .dsm-workbuddy-model-off input{margin:0;accent-color:var(--dsw-alias-brand-primary,#5686fe)}
 .dsm-workbuddy-model-off-blocked{cursor:not-allowed;opacity:.75}
 .dsm-workbuddy-model-off-flag{margin-left:2px;padding:0 4px;border-radius:4px;background:var(--dsw-alias-label-caution-background,#4a3a1f);color:var(--dsw-alias-label-caution,#e8b34b);font-size:10px;line-height:14px;white-space:nowrap}
-.dsm-workbuddy-model-copy{display:flex;align-items:baseline;gap:8px;min-width:0}
+/* The name and its chips share one line, and WHICH ONE gives way matters.
+ *
+ * The chips are flex:none (a half-drawn pill reads as a rendering bug), so the
+ * only shrinkable item is the name — and it is also the one thing a reader
+ * needs. Left alone, a long name plus two or three chips squeezes the name down
+ * to a few characters: 「GLM-5.」 with nothing after it, which is exactly the
+ * report this fixes.
+ *
+ * So the chips wrap among themselves when the line is tight, and the name gets a
+ * floor. It may still ellipsize — a name longer than the whole row cannot fit —
+ * but it never collapses to a stub while a badge sits whole beside it. */
+.dsm-workbuddy-model-copy{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 8px;min-width:0}
+/* THE NAME MUST NOT CLAIM LEFTOVER WIDTH.
+ *
+ * It was flex:1 1 auto; min-width:9em, which made the name box grow to fill
+ * whatever the row had spare — 117px (9em) for "Hy4", whose text is ~30px. The
+ * promo chip therefore sat at the END of that inflated box, and the gap between
+ * the price and the chip read as a stray blank block: it appears ONLY on rows
+ * that have a chip, because that is the only case where anything follows the
+ * name.
+ *
+ * flex:0 1 auto takes the name's own width and allows SHRINKING (so a long
+ * name still ellipsizes and still cannot push the chip out of view). The floor
+ * is gone with it: a minimum of 9em was what turned "do not collapse" into
+ * "always at least 117px". */
+.dsm-workbuddy-model-copy>.dsm-workbuddy-model-name{flex:0 1 auto;min-width:0}
+/* Below the panel's own width the floor is too greedy: 9em plus two chips is
+   wider than the line, and the NAME would force the wrap it is meant to avoid.
+   Give it less and let the chips take the second line. */
+
 .dsm-workbuddy-model-name{display:inline-flex;align-items:baseline;gap:7px;color:var(--dsw-alias-label-primary,#e6e6e6);font-size:13px;font-weight:500;line-height:19px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dsm-workbuddy-model-name-rate{color:var(--dsw-alias-label-tertiary,#999);font-size:11px;font-weight:400;line-height:16px;flex:none}
 /* The upstream's own promotion badge ("限时免费" / "Free now" / "Pro Only").
@@ -5238,18 +7457,65 @@ window.__ModuleLoader__.load({
    "· N 新模型" segment (label-dimmed), but no chip border and one step smaller,
    so it reads as a side note beside the promotion chip rather than a second
    badge competing with the model name. */
+/* A badge another PROVIDER published for its own model, reproduced in the
+   host's picker so it survives this plugin holding the cell. Geometry and the
+   no-border rule are copied from the host's own Tag.module.css (0.2.2-rc.1) —
+   the chip must be indistinguishable from one the host drew itself, which is
+   also why there is no max-width here: the host does not truncate, and a chip
+   that turned "限时免费" into "限时免…" at the same row width would be the one
+   visible difference. Colours arrive inline per tone. */
+.dsm-workbuddy-model-label-host-badge{flex:none;display:inline-flex;align-items:center;border-radius:999px;padding:1px 8px;font-size:11px;line-height:17px;font-weight:500;white-space:nowrap}
+/* A foreign row reuses .dsm-workbuddy-model-label as its flex wrapper so both
+   branches share ONE alignment model (a bare span put the pill on the text
+   baseline, which rode visibly high). That class carries this plugin's own
+   gap:5px, while the host's fallback uses gap:4px; the one-pixel override
+   keeps the host's metric without giving our own rows a second wrapper. */
+.dsm-workbuddy-model-label-host-row{gap:4px}
 .dsm-workbuddy-model-label-new{flex:none;display:inline-flex;align-items:center;padding:0 5px;border-radius:999px;font-size:10px;line-height:16px;font-weight:600;white-space:nowrap;color:var(--dsw-alias-label-dimmed,rgba(127,127,127,.6))}
 .dsm-workbuddy-busy{flex:none;display:inline-flex;align-items:center;block-size:12px;color:var(--dsm-workbuddy-busy-color);vertical-align:-2px}
 .dsm-workbuddy-busy svg{display:block;block-size:12px;inline-size:auto}
 .dsm-workbuddy-model-promo{flex:none;display:inline-flex;align-items:center;padding:0 7px;border-radius:999px;font-size:10px;line-height:16px;font-weight:600;white-space:nowrap;color:var(--dsm-workbuddy-promo-color,var(--dsw-alias-brand-primary,#5686fe));background:rgba(255,255,255,.08);background:color-mix(in srgb,var(--dsm-workbuddy-promo-color,var(--dsw-alias-brand-primary,#5686fe)) 16%,transparent);border:1px solid transparent;border-color:color-mix(in srgb,var(--dsm-workbuddy-promo-color,var(--dsw-alias-brand-primary,#5686fe)) 40%,transparent)}
 .dsm-workbuddy-model-id{color:var(--dsw-alias-label-tertiary,#999);font-size:11px;line-height:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dsm-workbuddy-model-desc{margin:0;color:var(--dsw-alias-label-tertiary,#9aa0a8);font-size:12px;line-height:18px}
-.dsm-workbuddy-model-details{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0}
 .dsm-workbuddy-model-meta{display:flex;align-items:center;gap:7px 12px;flex-wrap:wrap;color:var(--dsw-alias-label-tertiary,#999);font-size:11px;line-height:16px}
 .dsm-workbuddy-model-meta-tag{padding:1px 7px;border-radius:999px;font-size:11px;line-height:15px;background:rgba(174,179,187,.11);color:var(--dsw-alias-label-secondary,#c6c9d0)}
-.dsm-workbuddy-context-budget{display:flex;align-items:center;justify-content:flex-end;gap:12px;flex:none;margin:0;padding:0;border:0;color:var(--dsw-alias-label-secondary,#c6c9d0);font-size:11px;line-height:16px}
-.dsm-workbuddy-context-budget label{display:inline-flex;align-items:center;gap:4px;cursor:pointer}
-.dsm-workbuddy-context-budget input{margin:0;accent-color:var(--dsw-alias-brand-primary,#5686fe)}
+/* The per-model default thinking tier (issue #179). It lives INSIDE the meta row
+   so it sits on the same baseline as the context/output figures it belongs with,
+   and stays a small inline control rather than a third row of its own — the row
+   already carries the probe buttons on its right-hand side. */
+.dsm-workbuddy-model-effort{display:inline-flex;align-items:center;gap:5px;cursor:pointer}
+.dsm-workbuddy-model-effort-select{font:inherit;font-size:11px;line-height:15px;color:var(--dsw-alias-label-secondary,#c6c9d0);background:rgba(174,179,187,.11);border:1px solid transparent;border-radius:999px;padding:1px 6px;cursor:pointer;max-width:180px}
+.dsm-workbuddy-model-effort-select:hover:not(:disabled){border-color:var(--dsw-alias-border-l2,#3a3d45)}
+.dsm-workbuddy-model-effort-select:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#5686fe);outline-offset:1px}
+.dsm-workbuddy-model-effort-select:disabled{opacity:.55;cursor:default}
+/* The three tiers plus the two probe buttons plus the two checkboxes are MORE
+   than one narrow line can hold, so this group must be allowed to break between
+   its own labels too (issue #199's sibling, #198): flex:none alone was half of
+   the clipping bug, and flex-wrap is the other half — a 1.048M label is wider
+   than 200K. Left-aligning the group under the media query makes the group
+   own its line on a phone instead of dangling at the right edge. */
+/* ONE SELECT, NOT A ROW OF RADIOS.
+ *
+ * It was a wrapping flex row of three radios. In the Settings column (564px,
+ * of which the model row already spends ~300px on the id/speed column) those
+ * three wrapped onto a second line, and a wrapped row of radios reads as three
+ * independent switches rather than as one choice.
+ *
+ * A FIXED min-inline-size keeps the three rows' columns aligned. Without it the
+ * control sizes to its widest option, so a model offering only 192K drew a
+ * 56px control while its neighbours drew 58px and the left edges stepped by 2px
+ * down the list — the same misalignment the wrapped radios had, in miniature.
+ *
+ * Being a <select>, this is now a single fixed-width control that cannot wrap,
+ * and the native dropdown is what the platform draws — so the styling here is
+ * only about the closed state: the same 11px secondary text the radios used, a
+ * chevron the platform provides, and a chevron-affordance gap.
+ *
+ * flex:none matters: the row is a flex line, and a select that grows steals
+ * width from the model name beside it. */
+.dsm-workbuddy-context-budget{flex:none;margin:0;min-inline-size:58px;padding:2px 4px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);border-radius:6px;background:var(--dsw-alias-bg-layer-3,#2a2c33);color:var(--dsw-alias-label-secondary,#c6c9d0);font-family:inherit;font-size:11px;line-height:16px;cursor:pointer}
+.dsm-workbuddy-context-budget:disabled{cursor:default;opacity:.6}
+.dsm-workbuddy-context-budget:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#5686fe);outline-offset:1px}
 .dsm-workbuddy-model-capability-note{margin:0;color:var(--dsw-alias-label-tertiary,#999);font-size:12px;line-height:18px}
 /* Model probe (test button + result). The result line is its own row under the
    meta line, because a cooldown sentence ("rate limited - the upstream gave no
@@ -5272,7 +7538,7 @@ window.__ModuleLoader__.load({
 .dsm-workbuddy-model-probe-result-ok{color:var(--dsw-alias-state-success-primary,#22a06b)}
 .dsm-workbuddy-model-probe-result-warn{color:var(--dsw-alias-state-warn-primary,#f59e0b)}
 .dsm-workbuddy-model-probe-result-bad{color:var(--dsw-alias-state-error-primary,#ef4444)}
-.dsm-workbuddy-model-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;border-top:1px solid var(--dsw-alias-border-l2,#36373b);padding-top:12px}
+.dsm-workbuddy-model-actions{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;row-gap:8px;border-top:1px solid var(--dsw-alias-border-l2,#36373b);padding-top:12px}
 .dsm-workbuddy-model-save-error{flex:1;min-width:0;color:var(--dsw-alias-state-error-primary,#ef4444);font-size:12px;line-height:16px;text-align:right}
 .dsm-workbuddy-model-actions-buttons{display:flex;align-items:center;justify-content:flex-end;gap:8px}
 .dsm-workbuddy-usage-cheer{display:inline-flex;align-items:center;gap:4px;flex:none;text-decoration:underline;text-underline-offset:2px;color:var(--dsw-alias-label-tertiary,#999);font-size:13px;line-height:1.5;transition:color .16s}
@@ -5281,7 +7547,11 @@ window.__ModuleLoader__.load({
 .dsm-workbuddy-usage-cheer:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#5686fe);outline-offset:2px}
 
 /* ---- Account pool ---- */
-.dsm-workbuddy-pool{display:flex;flex-direction:column;gap:12px;margin:0;padding:16px 0 4px;border-top:1px solid var(--dsw-alias-border-l2,#36373b)}
+/* No top rule any more. It separated the 「免费模型并非无限量」 warning from the
+ * pool; that warning moved up beside the region hint it belongs with, so the
+ * line now had nothing above it to separate and only added a seam between the
+ * section tabs and the first thing they contain. */
+.dsm-workbuddy-pool{display:flex;flex-direction:column;gap:12px;margin:0;padding:0 0 4px}
 /* The block's heading: title on the left, serving-account badge on the right.
  *
  * It used to hold a THIRD child — the credit-readout switch, slotted in between
@@ -5312,7 +7582,7 @@ window.__ModuleLoader__.load({
  * a sentence: it is read as a shape first, a word second. The border keeps the
  * pill from bleeding into the row tint if a theme remaps success to something
  * dark. */
-.dsm-workbuddy-pool-current-badge{margin-left:auto;padding:2px 10px;border-radius:999px;background:var(--dsw-alias-state-success-primary,#22c55e);border:1px solid rgba(34,197,94,.55);color:#fff;font-size:12px;font-weight:600;line-height:18px;white-space:nowrap}
+.dsm-workbuddy-pool-current-badge{margin-left:auto;max-width:100%;overflow:hidden;text-overflow:ellipsis;padding:2px 10px;border-radius:999px;background:var(--dsw-alias-state-success-primary,#22c55e);border:1px solid rgba(34,197,94,.55);color:#fff;font-size:12px;font-weight:600;line-height:18px;white-space:nowrap}
 /* Sits under the header block, before the batch buttons: account discovery is
    the first step of using the pool, so it reads above the actions it enables. */
 /* THE HEAD SLOT — one place that answers "who is serving?".
@@ -5347,30 +7617,159 @@ window.__ModuleLoader__.load({
 .dsm-workbuddy-pool-ghost-remove:hover:not(:disabled){background:rgba(245,158,11,.2)}
 .dsm-workbuddy-pool-ghost-remove:disabled{cursor:default;opacity:.5}
 .dsm-workbuddy-pool-error{margin:0;font-size:12px;line-height:17px;color:var(--dsw-alias-state-error-primary,#ef4444);white-space:pre-line}
-.dsm-workbuddy-pool-table{border:1px solid var(--dsw-alias-border-l2,#3a3d45);border-radius:12px;overflow:hidden;background:var(--dsw-alias-bg-layer-2,#24262c)}
-.dsm-workbuddy-pool-row{display:grid;grid-template-columns:1.6fr 1fr 1.3fr .9fr .8fr;gap:10px;align-items:center;padding:10px 14px;border-top:1px solid var(--dsw-alias-border-l1,#2c2d31);font-size:13px;color:var(--dsw-alias-label-secondary,#c6c9d0)}
-/* No check-in column (the international region): the freed track goes to the actions. */
-.dsm-workbuddy-pool-table:not(.dsm-workbuddy-pool-table-checkin) .dsm-workbuddy-pool-row{grid-template-columns:1.6fr 1fr 1.3fr 1.7fr}
+/* CONTAINMENT ROOT for the row breakpoints below.
+ *
+ * The card now renders in three places whose WIDTHS have nothing to do with the
+ * window: the composer card, the full page (capped at 860px), and the Settings
+ * panel's content column (~560px on a 1400px screen). Every @media breakpoint
+ * in this file measures the VIEWPORT, so inside the Settings panel they never
+ * fire — a 564px column got the five-column desktop table and each cell clipped.
+ *
+ * container-type: inline-size lets the breakpoints below measure the TABLE
+ * instead, which is the width the rows actually have to fit into.
+ *
+ * Deliberately on the table and NOT on an ancestor: container-type makes the
+ * element the containing block for position:fixed descendants, and the busy
+ * veils and the device dialog are siblings of this table inside
+ * .dsm-workbuddy-pool. Putting the containment here leaves them on the
+ * viewport, which is where a full-screen overlay belongs. The table itself
+ * contains only the header and member rows — no fixed-position descendants. */
+.dsm-workbuddy-pool-table{container-type:inline-size;border:1px solid var(--dsw-alias-border-l2,#3a3d45);border-radius:12px;overflow:hidden;background:var(--dsw-alias-bg-layer-2,#24262c)}
+/* THREE LINES AT EVERY WIDTH — the shape the row is meant to have.
+ *
+ * The row used to be five columns on one line when the table was wide, and a
+ * different re-grid when it was not, so its SHAPE depended on how wide the box
+ * around it happened to be: the same account read differently in the composer
+ * card, the full page and the Settings column. Named lines fix the shape once,
+ * whatever width it lands in:
+ *   line 1:  who it is ...................... credits
+ *   line 2:  what state it is in ... check-in  actions
+ *   line 3:  how it was measured (provenance)
+ *
+ * TWO ROWS OF AREAS, THREE LINES OF TEXT. The provenance line is the PROBE
+ * CELL's own second line (the -probe-line and -probe-prov spans), so the row
+ * grows to three lines without a third grid row, and the verdict line and the
+ * provenance line keep the same left edge and wrap independently.
+ *
+ * What this replaced: the verdict and 「测试于 …」 were separate sub-rows, so
+ * every row with a measured account was FOUR lines — the last one holding
+ * nothing but a timestamp. The owner asked for those two on one line and for the
+ * whole row to be three.
+ *
+ * NAMED AREAS, not five anonymous tracks. Every cell declares where it goes, so
+ * a cell that is absent — the international region renders no check-in — leaves
+ * its area empty instead of pulling the cells after it into the wrong columns.
+ * That failure is not hypothetical: it is what made the international table
+ * stack (5.20.26), where a template naming five cells over four tracks was
+ * discarded wholesale by the browser. Both variants therefore keep the same
+ * three tracks and the same three cells per line; only the areas differ.
+ *
+ * The first track is minmax(0,1fr) and not a bare 1fr on purpose: a bare 1fr
+ * carries an automatic minimum of the item's min-content width, so a long
+ * account name or verdict would push the row wider than its table instead of
+ * ellipsizing. With a zero minimum the flexible track gives way, which is what
+ * lets the same template serve the ~564px Settings column without a breakpoint.
+ *
+ * The LAST track is fixed px, never auto: the header and the rows are separate
+ * grid containers, so an auto track is sized twice against different contents
+ * and the two disagree. Measured at 820px, the actions track came out at 691 in
+ * the header (it holds one empty span) and 615 in the row (it holds three
+ * buttons), which dragged the check-in track beside it out of place by 76px. See
+ * the credits rule below for the A/B numbers.
+ *
+ * The check-in track is minmax(0,auto) — flexible, so it can hold 「不适用（企业
+ * 版）」 (96px) without overflowing, but with a ZERO minimum so it yields to the
+ * account name instead of widening the row. It is also the one auto track the
+ * header drift cannot reach: every cell in it is justify-self:end, so a header
+ * label 24px wide and a value 36px wide still share their RIGHT edge exactly —
+ * an auto track can move a left edge, and that is all it moves.
+ *
+ * The last track is 160px because that is what the button group needs AT REST in
+ * the widest locale, measured in headless Chrome: ⚙ Test Remove is 156px, ⚙ 测试
+ * 删除 134px. At 132px — the value this briefly shipped with — even the Chinese
+ * resting group wrapped, dropping 删除 onto a line of its own and growing every
+ * row by ~24px at every width. The in-flight labels (Testing… / Removing…,
+ * 194-208px) still wrap, and that is exactly what flex-wrap on the group is for:
+ * a momentary second line while a request is in flight beats a track wide enough
+ * to waste ~48px per row at rest. */
+.dsm-workbuddy-pool-row{
+  display:grid;
+  grid-template-columns:minmax(0,1fr) minmax(0,auto) 160px;
+  grid-template-areas:
+    "account account credits"
+    "probe   checkin actions";
+  column-gap:12px;row-gap:4px;align-items:center;padding:10px 14px;
+  border-top:1px solid var(--dsw-alias-border-l1,#2c2d31);
+  font-size:13px;color:var(--dsw-alias-label-secondary,#c6c9d0);
+}
+/* WITHOUT the check-in the verdict takes the freed area, so the actions stay in
+   the last track — the same track, and the same right edge, in both variants.
+   Three cells again: the count never changes, only which area a cell owns. */
+.dsm-workbuddy-pool-table:not(.dsm-workbuddy-pool-table-checkin) .dsm-workbuddy-pool-row{
+  grid-template-areas:
+    "account account credits"
+    "probe   probe   actions";
+}
 .dsm-workbuddy-pool-row:first-child{border-top:0}
-.dsm-workbuddy-pool-row-head{padding:8px 14px;background:var(--dsw-alias-bg-layer-3,#2a2c33);color:var(--dsw-alias-label-tertiary,#999);font-size:11px;font-weight:600;letter-spacing:.02em;text-transform:uppercase}
+.dsm-workbuddy-pool-row-head{padding:8px 14px;row-gap:1px;background:var(--dsw-alias-bg-layer-3,#2a2c33);color:var(--dsw-alias-label-tertiary,#999);font-size:11px;font-weight:600;letter-spacing:.02em;text-transform:uppercase}
+/* THE HEADER SPEAKS THE SAME TEMPLATE AS THE ROWS.
+ *
+ * It used to be a five-span row against a five-track template, and the narrow
+ * form hid it because its labels pointed at tracks that no longer existed.
+ * Both templates now name the same AREAS, so the labels line up in both
+ * directions — and a label cannot drift away from the value it names, because
+ * there is no second column definition to keep in step.
+ *
+ * The cells are emitted in reading order (line one, then line two) and the
+ * areas decide where each lands, exactly as in the rows.
+ *
+ * The check-in label is ABSENT where the region has none, exactly as its cell
+ * is: an empty area stays empty, and a label over nothing is worse than none.
+ * The actions cell has no text — the buttons speak — but it still has to exist,
+ * or the area named in the template would have no box to fill. */
+.dsm-workbuddy-pool-row-head .dsm-workbuddy-pool-col-credits{grid-area:credits;justify-self:end;text-align:right}
+.dsm-workbuddy-pool-row-head .dsm-workbuddy-pool-col-probe{grid-area:probe}
+.dsm-workbuddy-pool-row-head .dsm-workbuddy-pool-col-checkin{grid-area:checkin;justify-self:end}
+.dsm-workbuddy-pool-row-head .dsm-workbuddy-pool-col-actions{grid-area:actions}
+/* WHERE THE LABELED COLUMN ACTUALLY STARTS (learned from dsh-connect-trae, which
+   carries the same rule for the same reason).
+ *
+ * The account cell's first element is the membership checkbox, so the account
+ * NAME begins well inside the track. Measured at the plugin page's 1120px: the
+ * header cell starts at x=65 and the name at x=103 — a 38px gap. Flush to the
+ * cell edge, the word 「账号」 floated in the padding and pointed at nothing.
+ *
+ * 38px is the checkbox (13px) plus the cell's 8px gap plus the vertical
+ * centring slack of an 18px glyph in a 20px label; rounded to the value that
+ * measured flush rather than derived, because the two cells do not share a
+ * box. The offset holds at every width now that the header is no longer hidden:
+ * the cell keeps the same leading checkbox in both forms. */
+.dsm-workbuddy-pool-col-account{grid-area:account;padding-inline-start:38px}
 .dsm-workbuddy-pool-row-current{background:rgba(86,134,254,.07)}
 /* The serving row, made findable at a glance: a left accent bar plus the tint.
    The bar is what distinguishes it in a long table, where a 7%-opacity wash
    alone reads as an alternating-row stripe. */
 .dsm-workbuddy-pool-row-current{box-shadow:inset 3px 0 0 var(--dsw-alias-brand-primary,#5686fe)}
-.dsm-workbuddy-pool-account{display:flex;align-items:center;gap:8px;min-width:0}
-.dsm-workbuddy-pool-account-name{display:flex;flex-direction:column;gap:1px;min-width:0}
-.dsm-workbuddy-pool-account-name b{font-weight:500;color:var(--dsw-alias-label-primary,#e6e6e6);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsm-workbuddy-pool-account{grid-area:account;display:flex;align-items:center;gap:8px;min-width:0}
+/* The account block WRAPS AMONG ITSELF instead of stacking.
+ *
+ * It was a column — name / rank+arrows / current pill / membership line — which
+ * is what a whole cell per fact needs, but this cell now shares line one with
+ * the credits. Stacked, those four become four lines and the three-line row the
+ * rest of the card promises is a lie on every row. Read as a sentence it is one
+ * line — 「账号A · 第 1 位 · 当前使用」 — so it wraps instead. */
+.dsm-workbuddy-pool-account-name{display:flex;flex-direction:row;flex-wrap:wrap;align-items:baseline;gap:2px 8px;min-width:0}
+.dsm-workbuddy-pool-account-name b{font-weight:500;color:var(--dsw-alias-label-primary,#e6e6e6);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;max-width:100%}
 .dsm-workbuddy-pool-account-name span{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary,#999)}
 /* Declared AFTER the blanket span rule so it wins: the badge must not inherit
    the muted 11px tertiary treatment the membership line uses. */
-.dsm-workbuddy-pool-account-name .dsm-workbuddy-pool-current-tag{align-self:flex-start;margin-top:2px;padding:1px 6px;border-radius:999px;background:var(--dsw-alias-state-success-primary,#22c55e);border:1px solid rgba(34,197,94,.55);color:#fff;font-size:11px;font-weight:600;line-height:16px;white-space:nowrap}
+.dsm-workbuddy-pool-account-name .dsm-workbuddy-pool-current-tag{align-self:center;padding:1px 6px;border-radius:999px;background:var(--dsw-alias-state-success-primary,#22c55e);border:1px solid rgba(34,197,94,.55);color:#fff;font-size:11px;font-weight:600;line-height:16px;white-space:nowrap}
 /* Manual-priority chrome (order badge + up/down arrows). The rank badge is a SPAN,
    not a button: it only DESCRIBES the current order and must not read as a
    control (nor join the row's button list). The solid vs dashed distinction is
    load-bearing — a numeric rank must NOT appear when the credit policy still
    decides the order, so the -auto modifier is the dashed/grey state. */
-.dsm-workbuddy-pool-account-name .dsm-workbuddy-pool-order{display:flex;align-items:center;gap:6px;margin-top:2px;flex-wrap:wrap}
+.dsm-workbuddy-pool-account-name .dsm-workbuddy-pool-order{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .dsm-workbuddy-pool-account-name .dsm-workbuddy-pool-rank{display:inline-flex;align-items:center;border-radius:999px;border:1px solid rgba(86,134,254,.32);background:rgba(86,134,254,.12);color:var(--dsw-alias-brand-primary,#5686fe);font-size:11px;font-weight:600;line-height:16px;padding:1px 6px;white-space:nowrap;cursor:default;font-variant-numeric:tabular-nums}
 .dsm-workbuddy-pool-account-name .dsm-workbuddy-pool-rank-auto{border:1px dashed var(--dsw-alias-border-l1,#2c2d31);background:var(--dsw-alias-bg-layer-3,#2a2c33);color:var(--dsw-alias-label-secondary,#c6c9d0)}
 .dsm-workbuddy-pool-account-name .dsm-workbuddy-pool-move{display:inline-flex;align-items:center;gap:2px}
@@ -5407,10 +7806,42 @@ window.__ModuleLoader__.load({
 /* The "why expiring credits win" note is the sentence users push back on, so
    it is tinted rather than buried in the same grey as the eight rules. */
 .dsm-workbuddy-pool-order-rules-why{margin:0;padding:8px 10px;border-radius:8px;border-left:3px solid var(--dsw-alias-state-warn-primary,#f59e0b);background:rgba(245,158,11,.10);font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary,#c6c9d0)}
-.dsm-workbuddy-pool-credits{display:flex;flex-direction:column;gap:1px;min-width:0;font-variant-numeric:tabular-nums}
+/* THE CREDITS TRACK IS ITS OWN COLUMN, right-aligned against the row's edge.
+ *
+ * This cell is pinned to its right end (justify-self:end) so one right edge
+ * stands under every row, however wide the number is.
+ *
+ * AUTO IS THE THING THAT FAILED HERE, for the track that follows it. The header
+ * and the data rows are two SEPARATE grid containers, so an auto track is
+ * measured twice, each against its own contents — and it is the ACTIONS track
+ * that differs (one empty span in the header, three buttons in the row). Because
+ * the check-in sits immediately before it, a 76px difference there moves the
+ * check-in label 76px away from the value it names: measured in headless Chrome
+ * at 820px, header 691 vs data 615. jsdom does no layout and cannot see it. Fixed
+ * px on the actions track keeps the two containers in step — the same reason
+ * dsh-connect-qoder pins its trailing tracks.
+ *
+ * The cell is a ROW, not a column, and it is ONE track: the fixed 160px the
+ * actions need (see the row rule). The figure and its warning sit side by side
+ * and share that width — 「1,556」 is 38px and 「300 积分 3 天内过期」 103px, so
+ * together they are 122px and never wrap here. Stacked, as they were, the cell
+ * was 35px instead of 18px: line one grew by 17px on EVERY row, and the
+ * warning's baseline landed between the verdict and the provenance line, so the
+ * right side of the row read as detached from the left. flex-wrap is kept as a
+ * last resort (a 3-digit figure plus a longer locale) rather than a clipped
+ * number.
+ *
+ * THE ONE STATE THAT IS NOT THREE LINES: a claimable-benefit entry (issue #79)
+ * also renders in this cell, and its own min-content is 229px — a full label
+ * plus the claim pill — so inside 160px it wraps to two lines and line one
+ * becomes two lines, i.e. a four-line row. That predates the three-line shape
+ * and is deliberate in the benefit rule below (its tag clamps to two lines so an
+ * unexpectedly long upstream title cannot push the row taller than the pill can
+ * travel). Fitting it would mean moving the claim button OFF line one; the pill
+ * is a seasonal campaign, so the row keeps its honest wrap instead. */
+.dsm-workbuddy-pool-credits{grid-area:credits;display:flex;flex-direction:row;flex-wrap:wrap;align-items:baseline;justify-content:flex-end;gap:0 6px;min-width:0;justify-self:end;text-align:right;font-variant-numeric:tabular-nums}
 .dsm-workbuddy-pool-credits b{color:var(--dsw-alias-label-primary,#e6e6e6);font-weight:600}
 .dsm-workbuddy-pool-soon{font-size:11px;line-height:16px;color:var(--dsw-alias-state-warn-primary,#f59e0b)}
-.dsm-workbuddy-pool-soon-plain{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary,#999)}
 /* Claimable benefits (issue #79). A quiet line by default — it is an opportunity, not a fault — and loud only when the window is about to close. */
 .dsm-workbuddy-pool-benefits{display:flex;flex-wrap:wrap;align-items:center;gap:6px;font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary,#999);min-width:0}
 /* One entry = text + pill, and the text wraps rather than being cut.
@@ -5520,8 +7951,33 @@ window.__ModuleLoader__.load({
   box-shadow:none;
 }
 .dsm-workbuddy-pool-probe,.dsm-workbuddy-pool-checkin{font-size:12px;line-height:17px;color:var(--dsw-alias-label-tertiary,#999);min-width:0;overflow-wrap:anywhere}
-.dsm-workbuddy-pool-probe{display:flex;flex-direction:column;gap:4px}
-.dsm-workbuddy-pool-probe-main{color:var(--dsw-alias-label-secondary,#c6c9d0)}
+/* The verdict cell: LINE TWO of the row, and two lines of its own.
+ *
+ * The -probe-line span holds the verdict together with the moment it was
+ * measured (see the rule below); -probe-prov is line THREE. A 2px gap is what
+ * keeps those two from reading as one wrapped paragraph: at 4px they looked like
+ * a single block of text that happened to break, which is how the four-line row
+ * it replaced looked. */
+.dsm-workbuddy-pool-probe{grid-area:probe;display:flex;flex-direction:column;gap:2px;min-width:0}
+/* VERDICT · TESTED-AT, ONE LINE.
+ *
+ * These were two sub-rows, and every measured account was therefore four lines
+ * tall with a timestamp on the last one. They are one sentence — "被限流 · 11/08
+ * 15:44 之后可再用 · 约 15 小时后 · 测试于 11/07 17:36" — so they wrap together
+ * as a unit, and the measured widths say why that matters: the longest verdict
+ * is 260px and 「测试于 11/07 17:36」 another 102, so the pair needs ~380px. It
+ * fits from ~700px up; below that only the verdict fits, and the block further
+ * down drops the timestamp rather than letting the pair wrap onto a line the row
+ * does not have. */
+.dsm-workbuddy-pool-probe-line{display:flex;flex-wrap:wrap;align-items:baseline;gap:0 6px;min-width:0}
+.dsm-workbuddy-pool-probe-main{color:var(--dsw-alias-label-secondary,#c6c9d0);min-width:0;overflow-wrap:anywhere}
+/* The separator belongs to the timestamp it introduces, so a wrapped line can
+   never leave a lone 「·」 hanging at the end of the verdict. */
+.dsm-workbuddy-pool-probe-sep,.dsm-workbuddy-pool-tested-at{font-size:11px;line-height:15px;color:var(--dsw-alias-label-tertiary,#999);white-space:nowrap}
+.dsm-workbuddy-pool-probe-sep{color:var(--dsw-alias-label-dimmed,#9aa0a6);opacity:.7}
+/* WHEN, in the verdict's own sentence but at the weight of a timestamp: at 12px
+   and the verdict's colour it read as a second verdict, and the row looked like
+   two statements fighting for the same line. */
 .dsm-workbuddy-pool-probe-prov{display:flex;align-items:center;gap:5px;font-size:11px;line-height:15px;color:var(--dsw-alias-label-tertiary,#999);min-width:0;flex-wrap:wrap}
 .dsm-workbuddy-pool-prov-tag{padding:1px 6px;border-radius:999px;background:var(--dsw-alias-bg-layer-3,#2a2c33);color:var(--dsw-alias-label-tertiary,#999);font-size:10px;font-weight:600;line-height:15px;white-space:nowrap}
 .dsm-workbuddy-pool-prov-live{background:rgba(245,158,11,.16);color:var(--dsw-alias-state-warn-primary,#f59e0b)}
@@ -5547,6 +8003,15 @@ window.__ModuleLoader__.load({
 .dsm-workbuddy-pool-check input{margin:0;cursor:pointer;accent-color:var(--dsw-alias-brand-primary,#5686fe)}
 .dsm-workbuddy-pool-check input:disabled{cursor:default;opacity:.5}
 .dsm-workbuddy-pool-checked{color:var(--dsw-alias-state-success-primary,#22a06b)}
+/* Line two, middle: the daily claim. Its own AREA so that a region WITHOUT it
+   leaves that slot empty instead of sliding the actions one track left.
+ *
+ * BASELINE-aligned, not centred: line two is two lines tall (verdict above,
+ * provenance below), and a centred cell floats between them — measured, 「已签到」
+ * sat 8px below the verdict's baseline, which read as belonging to neither line.
+ * Sharing the verdict's baseline puts the state on the same line as the verdict
+ * it belongs to. */
+.dsm-workbuddy-pool-checkin{grid-area:checkin;justify-self:end;align-self:baseline;white-space:nowrap;min-width:0;overflow-wrap:anywhere}
 .dsm-workbuddy-pool-unknown{color:var(--dsw-alias-label-dimmed,#9aa0a6)}
 .dsm-workbuddy-pool-not-member{color:var(--dsw-alias-label-dimmed,#9aa0a6)}
 /* A section break, not just a gap: below this line the page stops showing what
@@ -5554,7 +8019,12 @@ window.__ModuleLoader__.load({
    heading floated under the table with nothing marking the change of subject. */
 .dsm-workbuddy-pool-settings-wrap{display:flex;flex-direction:column;gap:10px;border-top:1px solid var(--dsw-alias-border-l2,#36373b);padding-top:14px}
 .dsm-workbuddy-pool-dirty{font-size:12px;line-height:18px;font-weight:500;color:var(--dsw-alias-state-warn-primary,#f59e0b)}
-.dsm-workbuddy-pool-settings{display:flex;flex-direction:column;gap:1px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);border-radius:12px;overflow:hidden;background:var(--dsw-alias-bg-layer-2,#24262c)}
+/* Second containment root, for the settings rows. They are NOT inside
+ * .dsm-workbuddy-pool-table (that is the member table only), so the table's
+ * container query cannot reach them. This element holds just the stacked
+ * setting rows — no position:fixed descendants, so containment here cannot move
+ * an overlay's containing block. */
+.dsm-workbuddy-pool-settings{container-type:inline-size;display:flex;flex-direction:column;gap:1px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);border-radius:12px;overflow:hidden;background:var(--dsw-alias-bg-layer-2,#24262c)}
 /* THE MODE BAR — the page's master control, directly under the title.
  *
  * It reuses the .dsm-workbuddy-pool-settings class for the bordered, stacked
@@ -5569,12 +8039,40 @@ window.__ModuleLoader__.load({
  */
 .dsm-workbuddy-pool-modebar{padding:12px 14px;gap:8px;border-color:rgba(86,134,254,.36);background:linear-gradient(180deg,rgba(86,134,254,.10),rgba(86,134,254,.02)),var(--dsw-alias-bg-layer-2,#24262c)}
 .dsm-workbuddy-pool-modebar-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+/* A ROW that holds one switch and its label — NOT a card.
+ *
+ * Split out from .dsm-workbuddy-pool-modebar (which is the tinted CARD) because
+ * the automatic check-in switch used to carry the card class by mistake: it was
+ * drawn as a second, nested card inside the mode bar, so the two switches came
+ * out at different sizes with a deep dark gap between them (issue #191
+ * follow-up).
+ *
+ * Keeping the row shape in its own class is what stops that from coming back: a
+ * switch row can never inherit a card's padding, border or background, because
+ * those live on a class this one does not share. Rendered geometry matches
+ * .dsm-workbuddy-pool-modebar-row exactly, so switches stacked in one bar line
+ * up on both axes. */
+.dsm-workbuddy-pool-switchrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .dsm-workbuddy-pool-modebar-label{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary,#e6e6e6)}
 /* The mode in words. A switch's position is a 20px shape to decode; this says
    which of the two modes is in force, and therefore how to read the table. */
 .dsm-workbuddy-pool-modebar-state{flex:none;padding:1px 9px;border-radius:999px;font-size:12px;line-height:18px;font-weight:500;color:var(--dsw-alias-brand-primary,#5686fe);background:rgba(86,134,254,.14);border:1px solid rgba(86,134,254,.3)}
 .dsm-workbuddy-pool-modebar .dsm-workbuddy-pool-dirty{margin-left:auto}
 .dsm-workbuddy-pool-modebar .dsm-workbuddy-pool-note{line-height:18px;color:var(--dsw-alias-label-secondary,#c6c9d0)}
+/* The automatic check-in block (issue #191): a switch, its hint, and — once it
+   has run — a one-line progress readout. Indented under the pool switch because
+   it is a second, narrower consent: the pool switch says "pick my account", this
+   one says "write to it every day". */
+.dsm-workbuddy-pool-auto-checkin{margin-top:10px;padding-left:2px;display:flex;flex-direction:column;gap:6px}
+.dsm-workbuddy-pool-auto-checkin-status{display:flex;flex-wrap:wrap;gap:10px;font-size:12px;line-height:17px;color:var(--dsw-alias-label-secondary,#c6c9d0)}
+/* The progress figure is the ANSWER to "did it work?", so it is the one part
+   that carries primary text colour rather than the muted note colour. */
+.dsm-workbuddy-pool-auto-checkin-line{color:var(--dsw-alias-label-primary,CanvasText);font-weight:500}
+.dsm-workbuddy-pool-auto-checkin-pending{color:var(--dsw-alias-label-secondary,#c6c9d0)}
+/* A failed attempt is a real condition the user may need to act on, so it is
+   not muted — but it is also not an error the plugin can fix, hence warn, not
+   the error red reserved for "this broke". */
+.dsm-workbuddy-pool-auto-checkin-error{color:var(--dsw-alias-label-warning,#d9822b)}
 /* Orthogonal concepts in one sentence when they collide ("in use" vs "in the
    pool"). A left rule marks it as an aside about the row above, not a warning. */
 .dsm-workbuddy-pool-serving-note{padding-left:10px;border-left:2px solid rgba(86,134,254,.5);color:var(--dsw-alias-label-secondary,#c6c9d0)}
@@ -5633,18 +8131,92 @@ window.__ModuleLoader__.load({
 .dsm-workbuddy-pool-log-error{color:var(--dsw-alias-state-error-primary,#ef4444)}
 .dsm-workbuddy-pool-log-info{color:var(--dsw-alias-label-secondary,#c6c9d0)}
 .dsm-workbuddy-pool-log-empty{padding:14px;font-size:12px;color:var(--dsw-alias-label-tertiary,#999)}
-/* Per-row actions (test / remove), right side of each pool row. */
-/* Per-row actions (test / remove), right side of each pool row.
-   The nowrap is NOT cosmetic: a two-character label (测试) belongs on one line,
-   and this row's track is a fraction of the table — in a narrow window it let
-   the label break into 测 / 试. Clipping is the right failure for a button
-   whose label is fixed and tiny. */
-.dsm-workbuddy-pool-row-actions{display:flex;gap:6px;align-items:center;justify-content:flex-end;flex:none}
+/* Per-row actions (test / device / remove), closing line two.
+ *
+ * Their third resting place. They have been (1) the row's last grid cell of the
+ * old single-line table, where a separate track put them on a line of their own
+ * below the credits; (2) inside the account cell, pushed right by an auto
+ * margin, which on the re-grid put them at the END OF LINE ONE — before the
+ * reader met the facts they act on; and now (3) the row's last cell again,
+ * which with two named lines means the end of line two, right after the verdict
+ * they respond to. The reading order is the point:
+ * who it is → what state it is in → what you can do about it.
+ *
+ * BASELINE-aligned for the same reason as the check-in beside them: line two is
+ * two lines tall, and a centred button group sits in the gap between the verdict
+ * and the provenance line — measured, the buttons' text baseline was 8px below
+ * the verdict's. Sharing that baseline makes the buttons read as the end of the
+ * sentence they act on.
+ *
+ * The nowrap is NOT cosmetic: a two-character label (测试) belongs on one line,
+ * and clipping is the right failure for a button whose label is fixed and tiny.
+ * flex:none is load-bearing: the name may truncate, the buttons may not, and a
+ * shrunken button is unclickable. */
+.dsm-workbuddy-pool-row-actions{grid-area:actions;display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px;align-items:center;flex:none;justify-self:end;align-self:baseline;max-width:100%}
 .dsm-workbuddy-pool-row-actions .dsm-workbuddy-pool-small-btn{white-space:nowrap}
 .dsm-workbuddy-pool-row-actions .dsm-workbuddy-pool-small-btn{padding:2px 10px;font-size:12px}
-/* This account's own test model (issue #61). Narrower than the section-level
-   picker so a long model name cannot push the two buttons out of the row. */
-@media (max-width:760px){.dsm-workbuddy-pool-row{grid-template-columns:1fr 1fr;row-gap:6px}.dsm-workbuddy-pool-select{max-width:180px}}
+/* The picker's cap, narrowed on a phone. NOTE this @media measures the VIEWPORT,
+   which is why it is the only rule left here that is allowed to: it exists for
+   the Plugins page at phone width, where the viewport IS the constraint. The
+   ROW's own narrow form is the @container block further down — a media query
+   cannot express it, because inside the Settings panel the viewport is 1400px
+   while the table gets 564px.
+ *
+ * The row's re-grid that used to live here was the source of that panel's
+ * 2x2 defect: it fired at phone widths only, so the 564px column kept the
+ * five-track desktop grid and clipped every cell. Removed rather than left
+ * behind, because a second, half-correct narrow form is worse than none. */
+@media (max-width:760px){.dsm-workbuddy-pool-select{max-width:180px}}
+/* The settings rows (target model, probe size) are flex with a content column
+ * that grows and a control that does not. In the Settings panel the control was
+ * squeezed to a sliver: max-width:260px caps it but nothing gives it a floor,
+ * and the copy beside it takes everything else. Stacking gives each one a whole
+ * line, which beats two columns of clipped text.
+ *
+ * NOTE: this is NOT the move the pool table makes. The table is three lines at
+ * every width now (see the grid above), so a narrow column no longer changes
+ * its shape — only these two settings rows still switch. */
+@container (max-width:620px){.dsm-workbuddy-pool-set{flex-direction:column;align-items:stretch;gap:8px}
+.dsm-workbuddy-pool-set-ctl{flex:1 1 auto;justify-content:flex-start}
+.dsm-workbuddy-pool-select{max-width:none;width:100%}}
+/* THE ONE THING THAT STILL DEPENDS ON WIDTH — and it is a DETAIL, not a shape.
+ *
+ * The three-line row above is the same shape at every width, so nothing here
+ * re-arranges cells any more: no second track count, no second set of occupied
+ * cells, no display:none on the header. All three existed because the wide and
+ * narrow forms disagreed about where a cell went; both templates now name the
+ * same areas, so the labels describe the rows at every width.
+ *
+ * What this block DOES drop is 「测试于 11/07 17:36」, and only where it cannot
+ * fit beside the verdict. Measured in headless Chrome: the longest verdict is
+ * 260px and the timestamp 102px, so the verdict line needs ~380px; at the
+ * Settings column's 564px the probe cell has ~330px in the Chinese table (the
+ * check-in and the 160px button track take the rest). Letting the pair wrap there
+ * is what turns three lines into four — the exact shape the owner rejected — and
+ * the timestamp is the fragment to lose, not the verdict: the provenance line
+ * directly below already dates the same measurement, as 「2 小时前」. Nothing is
+ * hidden that is not said again on the next line, and the absolute moment stays
+ * in the activity log the test wrote.
+ *
+ * ONE CASE IS STILL FOUR LINES, and it is left that way on purpose: an ENGLISH
+ * enterprise row in the 564px column, whose check-in cell says 「N/A (enterprise)」
+ * (~96px) while the verdict is the 301px English rate-limit sentence. The probe
+ * cell then has ~262px, so the verdict wraps. The alternative — clipping the
+ * verdict, or ellipsizing the check-in — trades a rare extra line for a lie about
+ * whether the account works, which is the one thing this row exists to say. The
+ * Chinese table in the same state fits (262px for a 260px verdict). */
+@container (max-width:700px){
+  .dsm-workbuddy-pool-row{column-gap:8px;row-gap:3px;padding:9px 12px}
+  .dsm-workbuddy-pool-row-head{padding:7px 12px}
+  .dsm-workbuddy-pool-probe-sep,.dsm-workbuddy-pool-tested-at{display:none}
+}
+
+/* ISSUE #198, the same breakpoint the pool row already uses. On a phone the model
+   row's budget group takes the WHOLE line and left-aligns: right-justified, a
+   wrapped two-tier group reads as a stray fragment under the buttons, and the tier
+   the user is trying to find — the native window — is the last label in the group,
+   so the line has to start at the left to have room to end at all. */
+
 /* Pool switch, namespaced under .dsm-workbuddy-pool so it cannot collide with host styles. */
 .dsm-workbuddy-pool .sw{position:relative;display:inline-block;width:38px;height:22px;flex:none;cursor:pointer}
 .dsm-workbuddy-pool .sw input{position:absolute;opacity:0;width:0;height:0}
@@ -5675,7 +8247,11 @@ window.__ModuleLoader__.load({
 /* Secondary text inside the transfer DIALOG (not a bar): the privacy note
    shown when credentials leave the machine. Kept independent of the bar
    classes so the dialog does not depend on the bar's layout to be readable. */
-.dsm-workbuddy-hint{color:var(--dsw-alias-label-tertiary,#999)}
+/* 辅助说明文字的**唯一**入口。字号与行高必须写死在这里，不能靠继承：
+   这个类同时被用在 <p> 与 <span> 上，而 <p> 在宿主里带默认段落样式，于是
+   同一句说明在两处会长成两种大小（实测截图里 SDK 那两段比周围 12px 的辅助
+   文字大了一圈，正是这个原因）。全仓其它 hint 类都写了 12px/18px，这里补齐。 */
+.dsm-workbuddy-hint{color:var(--dsw-alias-label-tertiary,#999);font-size:12px;line-height:18px}
 /* The transfer dialog is deliberately a block: it holds a scrollable account
    list and per-entry checkboxes, which cannot live in a one-row bar. */
 .dsm-workbuddy-transfer-dialog{margin-top:8px;padding:10px 12px;border:1px solid var(--dsw-alias-border-l2,#3a3d45);border-radius:10px;background:var(--dsw-alias-bg-secondary,transparent)}
@@ -5745,7 +8321,195 @@ window.__ModuleLoader__.load({
 @keyframes dsm-workbuddy-veil-spin{to{transform:rotate(360deg)}}
 @keyframes dsm-workbuddy-veil-dash{0%{stroke-dasharray:12 150;stroke-dashoffset:0}50%{stroke-dasharray:24 150;stroke-dashoffset:-6}to{stroke-dasharray:12 150;stroke-dashoffset:0}}
 @media (prefers-reduced-motion: reduce){.dsm-workbuddy-veil-spinner{animation:none}.dsm-workbuddy-veil-spinner-arc{animation:none;stroke-dasharray:18 150;stroke-dashoffset:-3}}
-`;
+.dsm-workbuddy-page{box-sizing:border-box;height:100%;display:flex;flex-direction:column;align-items:center;gap:20px;padding:28px clamp(24px,4vw,48px) 48px;overflow:auto;color:var(--dsw-alias-label-primary,#e6e6e6)}
+/* 1120px, not 860: the page is the WIDE layout — that is the whole reason the
+ * sidebar row and the readout's button exist — so capping it at 860 left a third
+ * of a 1440px window empty while the table inside still had five columns to
+ * place. The cap still matters: past ~1120 a five-column row of short figures
+ * starts to read as scattered, and a line of prose runs longer than the eye
+ * likes to track. */
+.dsm-workbuddy-page>*{width:100%;max-width:1120px}
+.dsm-workbuddy-page-head{display:flex;flex-direction:column;gap:6px}
+.dsm-workbuddy-page-back{appearance:none;font:inherit;cursor:pointer;border:1px solid var(--dsw-alias-border-l2,#36373b);background:var(--dsw-alias-bg-layer-1,#17181b);color:var(--dsw-alias-label-secondary,#c7c7c7);border-radius:8px;padding:5px 12px;display:inline-flex;align-items:center;gap:6px;align-self:flex-start;font-size:13px;line-height:20px}
+.dsm-workbuddy-page-back:hover{color:var(--dsw-alias-label-primary,#e6e6e6);border-color:var(--dsw-alias-label-dimmed,#777)}
+.dsm-workbuddy-page-back svg{flex:none}
+.dsm-workbuddy-page-icon{width:40px;height:40px;border-radius:9px;align-self:flex-start;margin-top:14px}
+.dsm-workbuddy-page-title{margin:0;font-size:20px;font-weight:600;line-height:1.4}
+.dsm-workbuddy-page-desc{margin:0;font-size:13px;line-height:1.5;color:var(--dsw-alias-label-tertiary,#999)}
+.dsm-workbuddy-page-body .dsm-workbuddy-usage{--dsm-workbuddy-surface:var(--dsw-alias-bg-layer-3,#202126);padding:20px 20px 8px;border:1px solid var(--dsw-alias-border-l2,#36373b);background:var(--dsw-alias-bg-layer-3,#202126);border-radius:12px}
+/* ---- 设置面板里的一节（settings.section，5.19.0）------------------------
+   面板内容列本来就窄（800px 面板减 188px 导航），而且它自己滚动。所以这一页
+   不去抢整页的高度与居中：height:100% 会在列里撑出第二根滚动条，860px 的
+   居中上限又会让内容缩在左边。改成从上往下排、宽度交给列，只有内边距是本插件
+   自己的；卡片边框也去掉——它现在是页面内容，不再是别人列表里的一行。 */
+.dsm-workbuddy-settings{height:auto;min-height:0;padding:0;gap:14px;overflow:visible}
+
+.dsm-workbuddy-settings>*{max-width:none}
+/* 顶部那块自报家门：图标与标题同排，简介独占一行。面板已有一层标题栏，这里
+   不再叠一个大标题，只把"这是什么"说清楚。 */
+.dsm-workbuddy-settings .dsm-workbuddy-settings-head{display:grid;grid-template-columns:auto minmax(0,1fr);column-gap:10px;row-gap:2px;align-items:center}
+.dsm-workbuddy-settings .dsm-workbuddy-page-icon{width:28px;height:28px;border-radius:6px;margin-top:0;grid-row:1}
+.dsm-workbuddy-settings .dsm-workbuddy-page-title{font-size:15px;line-height:22px;grid-row:1;min-width:0}
+.dsm-workbuddy-settings .dsm-workbuddy-page-desc{grid-column:1/-1;font-size:12px;line-height:18px}
+/* 内容块不再是一张浮在页面上的卡：去掉边框与底色，内边距改成横向对齐列边。
+ *
+ * 但那是「外壳那一列是实底色」时的结论。issue #209：换上个性化壁纸后，外壳的列
+ * 是半透明的，这一页自己又没有任何底色，于是壁纸整片透过内容区——标题、说明段落、
+ * 标签栏、账号池 全部直接压在壁纸上。这台机器上其余内容块各自有实底
+ * （表格、设置组），唯独它们之间的留白与正文没有，所以只有「什么都没有」的地方在
+ * 透。修复是给内容区自己一层底，取外壳的 layer 色；实底主题上与原来看不出差别。 */
+/* 页头那两行（标题、一句简介）在内容区外面，壁纸下同样没有承托。
+ *
+ * 补一块底而不是把它并进内容区：面板自己已经有一层标题栏，页头与正文之间要
+ * 留出间隔，两块底拼成一片会让页头看起来属于正文。取同一个 layer 色，实底主题
+ * 上与原来看不出差别。
+ *
+ * 这一条同时作用于整页（侧边栏入口那个宽页面），它同样没有底色。 */
+.dsm-workbuddy-settings .dsm-workbuddy-settings-head,
+.dsm-workbuddy-page .dsm-workbuddy-page-head{background:var(--dsw-alias-bg-layer-1,#17181b);border-radius:12px;padding:10px 12px}
+/* 这一页的内容区不能有内边距，否则底色会缩进一截，与页头对不齐。 */
+.dsm-workbuddy-settings .dsm-workbuddy-page-body .dsm-workbuddy-usage{--dsm-workbuddy-surface:var(--dsw-alias-bg-layer-1,#17181b);padding:0;border:0;border-radius:0;background:var(--dsw-alias-bg-layer-1,#17181b)}.dsm-workbuddy-panel-icon{display:block;border-radius:4px;flex:none}
+/* ---- 设备头档位与逐账号参数弹窗 ------------------------------------------
+   档位那一行贴着账号表：它同时决定"这台机器对外声称自己是谁"和"每行的齿轮能
+   不能用"，埋进「更多设置」会让齿轮看起来时好时坏。
+   弹窗用 fixed 遮罩而不是行内展开：每行已经有两个按钮和一段探针文本，再展开
+   两块输入框会把表格挤成表单；而且这些值必须显式确认，误点不该直接生效。 */
+.dsm-workbuddy-device-mode{
+  display:flex;flex-wrap:wrap;align-items:center;gap:8px;
+  margin:10px 0 2px;
+}
+.dsm-workbuddy-device-mode-title{font-size:12px;font-weight:600;color:var(--dsw-alias-label-primary,#e8e9ed)}
+.dsm-workbuddy-device-mode-seg{
+  display:inline-flex;border:1px solid var(--dsw-alias-border-l2,#3a3d45);
+  border-radius:999px;overflow:hidden;
+}
+/* 分段控件：两个按钮共享一条边框，选中态用底色而不是描边——描边会让"选中"
+   与"聚焦"看起来一样，键盘操作时分不清光标在哪。 */
+.dsm-workbuddy-device-seg-btn{
+  appearance:none;border:0;background:transparent;cursor:pointer;
+  padding:2px 10px;font:inherit;font-size:12px;line-height:20px;
+  color:var(--dsw-alias-label-secondary,#b8bcc4);
+}
+/* 悬停必须排除选中项：btn:hover 的选择器权重比 .seg-on 高，不排除的话鼠标
+   一划过去，选中的那一格就会被换成半透明底，看起来像"选中被取消了"。 */
+.dsm-workbuddy-device-seg-btn:hover:not(:disabled):not(.dsm-workbuddy-device-seg-on){background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.12))}
+.dsm-workbuddy-device-seg-btn:disabled{opacity:.55;cursor:default}
+/* 选中态用"前景色做底、底色做字"这一对，而不是品牌色底 + 白字。
+   原因写在截图里：暗色主题下 --dsw-alias-brand-primary 本身就是一枚浅色，
+   白字落上去等于整格消失（用户看到的是一个空白胶囊）。把两者绑成反相关系后，
+   亮色主题是深底浅字、暗色主题是浅底深字，任何主题都不可能出现同色叠同色——
+   因为这两个变量按定义就互为背景与文字。 */
+.dsm-workbuddy-device-seg-on{
+  background:var(--dsw-alias-label-primary,#ededed);
+  color:var(--dsw-alias-bg-base,#181818);
+  font-weight:600;
+}
+/* 兜底：万一宿主没注入 bg-base，回落值也得跟着主题走，否则亮色主题下会变成
+   "深底 + 深字"。变量在的时候这一段不生效。 */
+@media (prefers-color-scheme: light){
+  .dsm-workbuddy-device-seg-on{background:var(--dsw-alias-label-primary,#202020);color:var(--dsw-alias-bg-base,#fff)}
+}
+/* 齿轮：置灰只表达"现在用不了"，仍然可点——点了会说明原因。 */
+.dsm-workbuddy-device-gear{line-height:1;padding:0 6px}
+.dsm-workbuddy-device-gear-off{opacity:.45}
+.dsm-workbuddy-device-backdrop{
+  position:fixed;inset:0;z-index:70;
+  display:flex;align-items:center;justify-content:center;
+  padding:16px;
+  background:var(--dsw-alias-bg-mask-1,rgba(0,0,0,.32));
+  backdrop-filter:var(--dsw-mask-blur);
+}
+.dsm-workbuddy-device-dialog{
+  width:min(460px,100%);max-height:calc(100vh - 32px);overflow:auto;
+  padding:16px;
+  border:1px solid var(--dsw-alias-border-l2,#3a3d45);border-radius:12px;
+  background:var(--dsw-alias-bg-layer-3,var(--dsw-alias-bg-l1,#1b1d23));
+  color:var(--dsw-alias-label-primary,#e8e9ed);
+  box-shadow:0 12px 40px rgba(0,0,0,.35);
+}
+.dsm-workbuddy-device-title{margin:0 0 8px;font-size:13px;font-weight:600}
+.dsm-workbuddy-device-field{display:flex;flex-direction:column;gap:4px;margin:10px 0}
+.dsm-workbuddy-device-field-label{font-size:12px;color:var(--dsw-alias-label-secondary,#b8bcc4)}
+.dsm-workbuddy-device-input{
+  font:inherit;font-size:12px;line-height:20px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  padding:4px 8px;border-radius:6px;
+  color:var(--dsw-alias-label-primary,#e8e9ed);
+  background:var(--dsw-alias-bg-l1,transparent);
+  border:1px solid var(--dsw-alias-border-l2,#3a3d45);
+}
+
+/* SDK 目录输入行（作者意见 #1）：输入框吃掉剩余宽度，按钮不换行。
+   与 .dsm-workbuddy-device-input 同一套外观，只改布局——单独一条而不是复用
+   弹窗那条，是因为这里旁边还有 1~2 个按钮，而弹窗里是上下堆叠。 */
+.dsm-workbuddy-sdk-dir-row{display:flex;align-items:center;gap:8px;margin:2px 0 4px}
+.dsm-workbuddy-sdk-dir-input{flex:1 1 auto;min-width:0;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+/* 回退开关：勾选框交回平台（accent-color），方框尺寸/圆角/勾形不由我们画。 */
+.dsm-workbuddy-sdk-switch{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--dsw-alias-label-primary,#e8e9ed);cursor:pointer}
+.dsm-workbuddy-sdk-switch input{accent-color:var(--dsw-alias-brand-primary,#5686fe)}
+/* 总开关区块：它在面板最上面，与下面那组诊断之间要有一道肉眼可见的分界——
+   否则"关掉它"和"看它现在的状态"会被读成同一件事。 */
+.dsm-workbuddy-sdk-master{
+  display:flex;flex-direction:column;gap:4px;
+  margin:0 0 10px;padding:10px 12px;
+  border:1px solid var(--dsw-alias-border-l2,#3a3d45);border-radius:10px;
+  background:var(--dsw-alias-bg-layer-2,#232529);
+}
+.dsm-workbuddy-sdk-master .dsm-workbuddy-hint{margin:0}
+/* 关掉时整块诊断降饱和度：它仍然是事实（"现在没在跑"），但不再是当前动作的重点。 */
+.dsm-workbuddy-sdk-master-off + .dsm-workbuddy-panel-note{opacity:.75}
+.dsm-workbuddy-device-input:focus{outline:none;border-color:var(--dsw-alias-brand-primary,#5686fe)}
+.dsm-workbuddy-device-input-bad{border-color:var(--dsw-alias-label-error,#e5534b)}
+.dsm-workbuddy-device-error{color:var(--dsw-alias-label-error,#e5534b);font-size:12px;margin:4px 0 0}
+.dsm-workbuddy-device-random-row{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:6px 0 12px}
+/* P3 的占位行：虚线边框 + 降低对比度，读起来是"位置已经留好，还没接线"。
+   标题用 label-primary 而不是 label-dimmed：它是这一段的主语（"真实设备
+   Token"），dimmed 在亮色主题下几乎和背景同色，在暗色主题下又只剩一层灰雾。
+   虚线边框已经表达了"占位"，不需要再靠文字颜色降级。 */
+.dsm-workbuddy-device-p3{
+  display:flex;flex-direction:column;gap:2px;margin:0 0 12px;padding:8px 10px;
+  border:1px dashed var(--dsw-alias-border-l2,#3a3d45);border-radius:8px;
+}
+.dsm-workbuddy-device-p3-label{font-size:12px;font-weight:600;color:var(--dsw-alias-label-primary,#e8e9ed)}
+.dsm-workbuddy-device-p3 .dsm-workbuddy-hint{color:var(--dsw-alias-label-secondary,#b8bcc4)}
+/* 自动派生值：只在对应输入框为空时出现，所以它承担的是"你留空会发生什么"这个
+   答案，必须能被复制走。等宽 + 可整段选中最省事（user-select:all 一次点击就
+   选中整串 36 位 id，比再放一个复制按钮少一次交互，也不用管剪贴板权限）。 */
+.dsm-workbuddy-device-derived{
+  display:flex;flex-wrap:wrap;align-items:baseline;gap:6px;
+  font-size:11px;line-height:16px;
+  color:var(--dsw-alias-label-secondary,#b8bcc4);
+}
+.dsm-workbuddy-device-derived code{
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:11px;line-height:16px;
+  color:var(--dsw-alias-label-primary,#e8e9ed);
+  word-break:break-all;user-select:all;
+}
+.dsm-workbuddy-device-derived-missing{color:var(--dsw-alias-label-secondary,#b8bcc4);font-size:11px}
+.dsm-workbuddy-device-dialog-actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
+
+/* ---- 「SDK」分区：连接状态与真实取值 --------------------------------------
+   状态点用 6px 圆点而不是图标：这一行已经有文字说清楚状态，圆点只负责"一眼"。
+   token 块必须能换行——真实 token 一千多字符，不换行会把面板撑出一条横向滚动，
+   而横向滚动条会让"复制"按钮跑出视口。 */
+.dsm-workbuddy-sdk-dot{
+  display:inline-block;width:6px;height:6px;margin-right:6px;border-radius:50%;
+  background:var(--dsw-alias-label-error,#e5534b);vertical-align:middle;
+}
+.dsm-workbuddy-sdk-dot-ok{background:var(--dsw-alias-label-success,#3fb950)}
+.dsm-workbuddy-sdk-value{
+  display:block;max-height:96px;overflow:auto;
+  font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  font-size:11px;line-height:16px;
+  word-break:break-all;white-space:pre-wrap;
+  padding:4px 8px;border-radius:6px;
+  color:var(--dsw-alias-label-primary,#e8e9ed);
+  background:var(--dsw-alias-bg-l1,transparent);
+  border:1px solid var(--dsw-alias-border-l2,#3a3d45);
+}
+
+` + seriesLayoutCss("workbuddy");
 		/**
 		* Composer credit readout styles, injected by the readout component itself.
 		*
@@ -5805,19 +8569,113 @@ window.__ModuleLoader__.load({
   font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary,#444);
 }
 .dsm-workbuddy-composer-panel-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
-.dsm-workbuddy-composer-panel-title{font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary,CanvasText)}
-/* Self-contained: the dsm-btn primitive lives in TRAE_CARD_CSS, which the
-   composer never loads, so the refresh button must style itself. */
+/* nowrap: the header is a title plus an 11px control in a ~250px popover, and
+   without it the TITLE broke across two lines ("WB AI" / "积分") the moment the
+   settings control joined the row — measured on the live Desktop host. The
+   title is the one thing that must stay on one line; what follows it is short by
+   construction. */
+.dsm-workbuddy-composer-panel-title{flex:none;white-space:nowrap;font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary,CanvasText)}
+/* The header's TEST control, left of settings.
+   A quiet pill like its neighbour, but WITHOUT the brand fill: re-testing is a
+   local, repeatable action on the table right below it, while the settings pill
+   is the one control that leaves the panel. Two equally loud pills would make
+   the header read as a toolbar; this one stays a step quieter and earns its
+   colour only on hover. */
 .dsm-workbuddy-composer-panel-refresh{
-  appearance:none;flex:none;margin-left:auto;padding:3px 10px;
-  border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.34));
-  border-radius:7px;background:transparent;
+  appearance:none;flex:none;
+  display:inline-flex;align-items:center;gap:4px;
+  padding:3px 8px 3px 6px;margin-right:6px;
+  border:1px solid transparent;border-radius:999px;
+  background:transparent;
   color:var(--dsw-alias-label-secondary,#444);
-  font:inherit;font-size:11px;line-height:16px;cursor:pointer;
+  font:inherit;font-size:11px;line-height:16px;font-weight:500;
+  cursor:pointer;
+  transition:background-color .12s ease,border-color .12s ease,color .12s ease;
 }
-.dsm-workbuddy-composer-panel-refresh:hover:not(:disabled){border-color:var(--dsw-alias-label-dimmed,rgba(127,127,127,.6));color:var(--dsw-alias-label-primary,CanvasText)}
+.dsm-workbuddy-composer-panel-refresh:hover:not(:disabled){
+  background:rgba(127,127,127,.10);
+  border-color:var(--dsw-alias-border-l2,rgba(127,127,127,.34));
+  color:var(--dsw-alias-label-primary,CanvasText);
+}
+.dsm-workbuddy-composer-panel-refresh:active:not(:disabled){background:rgba(127,127,127,.16)}
 .dsm-workbuddy-composer-panel-refresh:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#5686fe);outline-offset:1px}
-.dsm-workbuddy-composer-panel-refresh:disabled{opacity:.5;cursor:default}
+/* A running batch keeps the label readable but stops the hover: the button is
+   disabled, and a disabled control that still lights up on hover invites a
+   second press that will be ignored. */
+.dsm-workbuddy-composer-panel-refresh:disabled{cursor:default;opacity:.6}
+/* The circular arrow does not shrink (a flex item defaults to it) and never
+   wraps away from the label. */
+.dsm-workbuddy-composer-panel-refresh-icon{flex:none;display:block}
+/* While the batch runs the arrow TURNS. A disabled button with a static icon
+   reads as broken, and a serial batch is long enough that "did my press land?"
+   is a real question. One turn per 900ms: fast enough to read as motion, slow
+   enough not to look like a rendering fault. */
+.dsm-workbuddy-composer-panel-refresh-icon-spin{animation:dsm-workbuddy-panel-refresh-spin .9s linear infinite}
+@keyframes dsm-workbuddy-panel-refresh-spin{to{transform:rotate(360deg)}}
+.dsm-workbuddy-composer-panel-refresh-label{flex:none;white-space:nowrap}
+/* The spinner is the ONLY indication the batch is alive, so under reduced
+   motion it must not disappear: the animation is dropped and the icon keeps a
+   distinct look (dimmed) plus the label says 「正在测试…」. */
+@media (prefers-reduced-motion:reduce){
+  .dsm-workbuddy-composer-panel-refresh{transition:none}
+  .dsm-workbuddy-composer-panel-refresh-icon-spin{animation:none;opacity:.55}
+}
+
+/* The header's right-hand control: the link to this plugin's settings.
+   A wrapper rather than an auto margin on the button, because the button is NOT
+   always rendered (a host with no route renders none) and a wrapper that is
+   always present keeps the header layout identical either way. */
+.dsm-workbuddy-composer-panel-actions{flex:none;margin-left:auto;display:flex;align-items:center}
+/* The header holds ONE control (refresh) now that the settings page lives in
+   the Settings panel: the gear pill that navigated to the Plugins page retired
+   with the page it pointed at. margin-left:auto on the wrapper keeps the
+   control pinned right regardless of how many buttons the actions row holds. */
+/* The header's right-hand control: the link to this plugin's settings.
+   A wrapper rather than an auto margin on the button, because the button is NOT
+   always rendered (a host with no route renders none) and a wrapper that is
+   always present keeps the header layout identical either way. */
+.dsm-workbuddy-composer-panel-actions{flex:none;margin-left:auto;display:flex;align-items:center}
+/* Styled as a quiet text link rather than a bordered button: navigating away is
+   not the header's primary action, and a loud button beside a 13px title reads as
+   a toolbar. The border appears only on hover/focus, which is where the
+   affordance is needed. */
+/* A quiet PILL, not an underlined link. The underline made a one-word label
+   read as body text that happened to be clickable — in a 13px header the eye
+   does not register it as a control at all. The tinted fill plus the gear give
+   it a shape at rest, which is where the affordance is actually needed; the
+   underline only appeared on hover, i.e. after the user already knew.
+   The fill is the brand colour at 10%, so it reads as "secondary action in this
+   product" rather than as a fourth grey chip beside the title. */
+.dsm-workbuddy-composer-panel-settings{
+  appearance:none;flex:none;
+  display:inline-flex;align-items:center;gap:4px;
+  padding:3px 8px 3px 6px;
+  border:1px solid transparent;border-radius:999px;
+  background:rgba(86,134,254,.10);
+  color:var(--dsw-alias-brand-primary,#5686fe);
+  font:inherit;font-size:11px;line-height:16px;font-weight:500;
+  cursor:pointer;
+  transition:background-color .12s ease,border-color .12s ease,color .12s ease;
+}
+.dsm-workbuddy-composer-panel-settings:hover{
+  background:rgba(86,134,254,.18);
+  border-color:rgba(86,134,254,.34);
+  color:var(--dsw-alias-brand-primary,#5686fe);
+}
+.dsm-workbuddy-composer-panel-settings:active{background:rgba(86,134,254,.26)}
+.dsm-workbuddy-composer-panel-settings:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#5686fe);outline-offset:1px}
+/* The gear does not shrink when the label is a longer word ("Settings" vs
+   "设置"): a flex item defaults to shrinking, which would squash the icon into
+   an oval on a narrow popover. */
+.dsm-workbuddy-composer-panel-settings-icon{flex:none;display:block}
+/* The label never wraps. Two lines in a 16px-tall pill would push the header
+   taller and unstick the table below it. */
+.dsm-workbuddy-composer-panel-settings-label{flex:none;white-space:nowrap}
+/* Reduced motion: the colour transition is decoration, and the hover state is
+   still fully visible without it. */
+@media (prefers-reduced-motion:reduce){
+  .dsm-workbuddy-composer-panel-settings{transition:none}
+}
 /* The panel is a TABLE: one row per account in the region, one figure (the
    general balance) per row, and a row click switches accounts.
 
@@ -6131,7 +8989,31 @@ window.__ModuleLoader__.load({
 		*
 		* @module dsh-connect-workbuddy/client/WorkBuddyCard
 		*/
-		const POLL_INTERVAL_MS = 6e4;
+		/**
+		* The refresh cadence when the Host does not say.
+		*
+		* The Host answers with the SAVED interval on every document (see
+		* `pollIntervalMs`), and that is what the card actually arms — this constant is
+		* only the fallback for an older Host that cannot answer, so it stays a plain
+		* number rather than a second source of truth.
+		*
+		* It is NOT a module-level `POLL_INTERVAL_MS` any more: the value is a setting
+		* now, and a constant that the timer did not read would be exactly the kind of
+		* duplicate that drifts from the control it describes.
+		*/
+		const FALLBACK_POLL_INTERVAL_MS = 3e5;
+		/**
+		* Retry cadence for a status read that FAILED.
+		*
+		* The failed read used to be terminal: `status.status === 'error'` made
+		* `hasAccounts` false, which gated both the 60s poll and the open effect, so a
+		* single transient failure (a WebView fetch rejected while the DSH web process
+		* was restarting) left "Failed to fetch" on screen until the card was closed
+		* and reopened. Backoff doubles from BASE up to MAX and resets on the first
+		* read that lands; nothing is armed while the card is collapsed.
+		*/
+		const STATUS_RETRY_BASE_MS = 3e3;
+		const STATUS_RETRY_MAX_MS = 3e4;
 		/**
 		* The reasoning tiers the local CodeBuddy CLI accepts for its `--effort` flag.
 		*
@@ -6534,9 +9416,12 @@ window.__ModuleLoader__.load({
 			if (props.t === void 0) throw new Error("WorkBuddy plugin card requires its translation function");
 			return (0, react.createElement)(WorkBuddyCardBody, props);
 		}
-		function WorkBuddyCardBody({ t, settingsScope, view }) {
+		function WorkBuddyCardBody({ t, settingsScope, view, surface, backToConversation }) {
 			if (t === void 0) throw new Error("WorkBuddy plugin card requires its translation function");
-			const [open, setOpen] = (0, react.useState)(view === "page");
+			const pageSurface = surface === "page";
+			const settingsSurface = surface === "settings";
+			const [cardOpen, setCardOpen] = (0, react.useState)(view === "page");
+			const open = pageSurface || settingsSurface || cardOpen;
 			/** The region whose tab is on screen; each tab is its own provider stack. */
 			const [activeRegion, setActiveRegion] = (0, react.useState)("cn");
 			/**
@@ -6595,6 +9480,13 @@ window.__ModuleLoader__.load({
 			* — the two save buttons are serialized to make that impossible.
 			*/
 			const [poolBusy, setPoolBusy] = (0, react.useState)(false);
+			/**
+			* 设备头设置：`undefined` = 还没读到 / 这台 Host 没有这条路由。
+			*
+			* 两种"没有值"必须合并成同一个信号（不渲染控件），因为卡片无论哪种情况都不该
+			* 显示一个点不动的开关；区别只在实现上：前者下一轮轮询会补上，后者永远不会。
+			*/
+			const [deviceSettings, setDeviceSettings] = (0, react.useState)(void 0);
 			/** A refused account write (silently unpersisted settings on a locked file). */
 			const [accountError, setAccountError] = (0, react.useState)(void 0);
 			/** Region whose on/off checkbox write is in flight, so its box can't race. */
@@ -6607,6 +9499,15 @@ window.__ModuleLoader__.load({
 			* other control, and both must stay serialized against the SAVE writers.
 			*/
 			const [togglingCredits, setTogglingCredits] = (0, react.useState)(void 0);
+			/**
+			* Which region's new-model-segment flag is being written right now.
+			*
+			* Tracked separately from {@link togglingCredits} for the same reason those
+			* are separate from `togglingRegion`: they are different fields of one region
+			* slot, so one in-flight write must not disable the other control while both
+			* stay serialized against the SAVE writers.
+			*/
+			const [togglingNewModels, setTogglingNewModels] = (0, react.useState)(void 0);
 			/**
 			* Which video-model pin is being written right now: the tag string, or
 			* undefined.
@@ -6624,6 +9525,26 @@ window.__ModuleLoader__.load({
 			*/
 			const [cliBridgeOn, setCliBridgeOn] = (0, react.useState)(void 0);
 			const [cliBridgeBusy, setCliBridgeBusy] = (0, react.useState)(false);
+			/**
+			* The OPTIONAL sidebar-row switch (PR #188).
+			*
+			* `undefined` until the first Host answer arrives, so the box renders the
+			* committed value instead of guessing — the same rule as `cliBridgeOn`.
+			*/
+			const [sidebarPanelOn, setSidebarPanelOn] = (0, react.useState)(void 0);
+			const [sidebarPanelBusy, setSidebarPanelBusy] = (0, react.useState)(false);
+			/** This card's own successful write of the refresh interval, if any. */
+			const [pollIntervalOn, setPollIntervalOn] = (0, react.useState)(void 0);
+			const [pollIntervalBusy, setPollIntervalBusy] = (0, react.useState)(false);
+			/**
+			* The CN gateway editor's draft (issue #220). `undefined` = "not edited", so
+			* the field shows the SAVED value and a background refresh cannot overwrite
+			* what the user is typing — the same rule the model drafts follow.
+			*/
+			const [cnBaseDraft, setCnBaseDraft] = (0, react.useState)(void 0);
+			const [cnBaseSaving, setCnBaseSaving] = (0, react.useState)(false);
+			const [cnBaseError, setCnBaseError] = (0, react.useState)(void 0);
+			const [cnBaseNotice, setCnBaseNotice] = (0, react.useState)(void 0);
 			/**
 			* The quick-adjust pins of the CLI route (model, effort, region order) made
 			* by THIS card instance.
@@ -6655,6 +9576,10 @@ window.__ModuleLoader__.load({
 			const [keepPromptLastBusy, setKeepPromptLastBusy] = (0, react.useState)(false);
 			const [sessionTitleOn, setSessionTitleOn] = (0, react.useState)(void 0);
 			const [sessionTitleBusy, setSessionTitleBusy] = (0, react.useState)(false);
+			const [channelRejectContinueOn, setChannelRejectContinueOn] = (0, react.useState)(void 0);
+			const [channelRejectContinueBusy, setChannelRejectContinueBusy] = (0, react.useState)(false);
+			const [dropAllThinkingOn, setDropAllThinkingOn] = (0, react.useState)(void 0);
+			const [dropAllThinkingBusy, setDropAllThinkingBusy] = (0, react.useState)(false);
 			/**
 			* Probe results, keyed by region then model id.
 			*
@@ -6874,6 +9799,18 @@ window.__ModuleLoader__.load({
 			*/
 			const signedIn = status.status === "signed-in";
 			/**
+			* The refresh cadence to arm, from the Host's answer.
+			*
+			* Read off the ACTIVE region's document, which is the one the timer refreshes.
+			* An absent or unrecognized value falls back to 5 minutes — the same coercion
+			* the Host applies, so a hand-edited profile cannot make the card poll faster
+			* than the setting allows.
+			*/
+			const pollIntervalMs = (() => {
+				const raw = "pollIntervalMs" in status ? status.pollIntervalMs : void 0;
+				return typeof raw === "number" && WORKBUDDY_POLL_INTERVALS_MS.includes(raw) ? raw : FALLBACK_POLL_INTERVAL_MS;
+			})();
+			/**
 			* Whether the ACTIVE region knows of any account at all.
 			*
 			* This is the poll's precondition in place of `status === 'signed-in'`. The
@@ -6888,7 +9825,7 @@ window.__ModuleLoader__.load({
 				const controller = new AbortController();
 				const timer = window.setInterval(() => {
 					refreshUsage(activeRegion, controller.signal);
-				}, POLL_INTERVAL_MS);
+				}, pollIntervalMs);
 				return () => {
 					window.clearInterval(timer);
 					controller.abort();
@@ -6897,7 +9834,68 @@ window.__ModuleLoader__.load({
 				open,
 				activeRegion,
 				refreshUsage,
-				status.status
+				status.status,
+				pollIntervalMs
+			]);
+			/**
+			* 设备头设置：卡片打开时读一次。
+			*
+			* 不跟 60 秒轮询走：这份文档只在用户自己点开关或保存齿轮时变，定时重读只是
+			* 每分钟多一次请求。每次写完都把 Host 的返回值直接放进状态（见下面两个
+			* handler），所以这个标签页看到的永远是最新写入的那一份。
+			*/
+			(0, react.useEffect)(() => {
+				if (!open) return;
+				let cancelled = false;
+				(async () => {
+					try {
+						const settings = await fetchDeviceSettings(WORKBUDDY_DEVICE_PROFILE_PATH);
+						if (!cancelled && mounted.current) setDeviceSettings(settings);
+					} catch {}
+				})();
+				return () => {
+					cancelled = true;
+				};
+			}, [open]);
+			/** 切档：Host 是唯一真源，所以用它的返回值覆盖本地状态，而不是猜一个。 */
+			const changeDeviceMode = async (mode) => {
+				const settings = await putDeviceMode(WORKBUDDY_DEVICE_PROFILE_PATH, mode);
+				if (mounted.current) setDeviceSettings(settings);
+			};
+			/** 保存一个账号的覆盖值。抛错由 AccountPool 接住并留在弹窗里。 */
+			const saveDeviceProfile = async (accountId, values) => {
+				const settings = await putDeviceProfile(WORKBUDDY_DEVICE_PROFILE_PATH, accountId, values);
+				if (mounted.current) setDeviceSettings(settings);
+			};
+			/**
+			* Recover from a failed status read without a close/reopen.
+			*
+			* Keyed on the document identity (`loaded`), not on `status.status`: every
+			* failed read writes a FRESH `{ status: 'error' }` object, so the identity
+			* changes and the next attempt is armed. A successful read replaces it with a
+			* new object too, which resets the counter through the branch below.
+			*/
+			const statusRetries = (0, react.useRef)(0);
+			(0, react.useEffect)(() => {
+				if (!open || status.status !== "error") {
+					statusRetries.current = 0;
+					return;
+				}
+				const delay = Math.min(STATUS_RETRY_MAX_MS, STATUS_RETRY_BASE_MS * 2 ** statusRetries.current);
+				const controller = new AbortController();
+				const timer = window.setTimeout(() => {
+					statusRetries.current += 1;
+					refreshUsage(activeRegion, controller.signal);
+				}, delay);
+				return () => {
+					window.clearTimeout(timer);
+					controller.abort();
+				};
+			}, [
+				open,
+				activeRegion,
+				refreshUsage,
+				loaded
 			]);
 			/**
 			* Re-detect the local sign-ins and refresh the panel.
@@ -6983,6 +9981,20 @@ window.__ModuleLoader__.load({
 				const fromHost = statusByRegion[item]?.showCreditsInMainUi;
 				if (typeof fromHost === "boolean") return fromHost;
 				return regionCreditsShownOf(settingsScope?.getSnapshot().value, item);
+			};
+			/**
+			* Whether this region's composer pill may show its "· N 新模型" segment.
+			*
+			* Host answer first, settings mirror second — same measured reason as
+			* {@link creditsShownOn}. Both sources read this flag OPT-IN (`=== true`):
+			* "new" means first seen by THIS machine, so on a fresh install it would
+			* announce the entire roster, and an absent value must not become consent.
+			* See `showNewModelsInMainUi` in the schema.
+			*/
+			const newModelsShownOn = (item) => {
+				const usage = statusByRegion[item];
+				if (typeof usage?.showNewModelsInMainUi === "boolean") return usage.showNewModelsInMainUi;
+				return regionNewModelsShownOf(settingsScope?.getSnapshot().value, item);
 			};
 			/**
 			* Whether the model may call the image tool in this region.
@@ -7099,6 +10111,19 @@ window.__ModuleLoader__.load({
 					if (mounted.current) setTogglingCredits(void 0);
 				}
 			};
+			const toggleNewModels = async (item, shown) => {
+				if (settingsScope === void 0) return;
+				setTogglingNewModels(item);
+				try {
+					const slot = nextRegionNewModelsShown(settingsScope.getSnapshot().value, item, shown)[item];
+					await writeRegionNewModelsShown(settingsScope, item, shown, typeof slot === "object" && slot !== null ? slot : {});
+					await refreshUsage(item);
+				} catch (error) {
+					if (mounted.current) setAccountError(error instanceof Error ? error.message : t("row.requestFailed"));
+				} finally {
+					if (mounted.current) setTogglingNewModels(void 0);
+				}
+			};
 			const toggleCredits = async (item, shown) => {
 				if (settingsScope === void 0) return;
 				setTogglingCredits(item);
@@ -7146,6 +10171,71 @@ window.__ModuleLoader__.load({
 				}
 			};
 			/**
+			* Whether the OPTIONAL sidebar row is switched on (PR #188).
+			*
+			* Read Host-first, mirror-second, for the same measured reason as
+			* `cliBridgeSwitchedOn`: the browser's settings mirror is stale for this
+			* namespace on the affected 0.1.7 deployments. `=== true` on both — absent is
+			* not consent, and this switch claims a global sidebar seat.
+			*/
+			const sidebarPanelSwitchedOn = () => {
+				if (sidebarPanelOn !== void 0) return sidebarPanelOn;
+				const fromHost = statusByRegion[activeRegion]?.sidebarPanelEnabled;
+				if (typeof fromHost === "boolean") return fromHost;
+				return sidebarPanelEnabledOf(settingsScope?.getSnapshot().value);
+			};
+			/**
+			* Flip the sidebar-row switch.
+			*
+			* Published to the entry's opt-in store on success, because the row is built
+			* from slot ENTRY METADATA and therefore cannot decide its own visibility —
+			* see `panel-switch.ts`. Publishing only AFTER the write is verified keeps the
+			* two from disagreeing: the row never appears for a value the Host refused.
+			*/
+			/**
+			* The refresh interval, read from the status document first and the settings
+			* snapshot second.
+			*
+			* The document is the fresher of the two (the Host answers with the value it
+			* actually stored), but the settings snapshot is what a save is verified
+			* against, and it is also the only thing available before the first document
+			* lands. Reading both, in that order, means the picker never shows a value the
+			* timer is not using.
+			*/
+			const pollIntervalValue = () => {
+				if (pollIntervalOn !== void 0) return pollIntervalOn;
+				const fromSettings = pollIntervalMsOf(settingsScope?.getSnapshot().value);
+				if ("pollIntervalMs" in status && typeof status.pollIntervalMs === "number" && WORKBUDDY_POLL_INTERVALS_MS.includes(status.pollIntervalMs)) return status.pollIntervalMs;
+				return fromSettings;
+			};
+			const changePollInterval = async (intervalMs) => {
+				if (settingsScope === void 0) return;
+				setPollIntervalBusy(true);
+				try {
+					await writePollIntervalMs(settingsScope, intervalMs);
+					if (mounted.current) setPollIntervalOn(intervalMs);
+					await refreshUsage(activeRegion);
+				} catch (error) {
+					if (mounted.current) setAccountError(error instanceof Error ? error.message : t("row.requestFailed"));
+				} finally {
+					if (mounted.current) setPollIntervalBusy(false);
+				}
+			};
+			const toggleSidebarPanel = async (enabled) => {
+				if (settingsScope === void 0) return;
+				setSidebarPanelBusy(true);
+				try {
+					await writeSidebarPanelEnabled(settingsScope, enabled);
+					if (mounted.current) setSidebarPanelOn(enabled);
+					setSidebarPanelWanted(enabled);
+					await refreshUsage(activeRegion);
+				} catch (error) {
+					if (mounted.current) setAccountError(error instanceof Error ? error.message : t("row.requestFailed"));
+				} finally {
+					if (mounted.current) setSidebarPanelBusy(false);
+				}
+			};
+			/**
 			* The three upstream-identity switches, read the same three-level way the CLI
 			* switch is: this card's own successful write, then the settings snapshot.
 			*
@@ -7166,6 +10256,33 @@ window.__ModuleLoader__.load({
 			/** The custom injected prefixes in effect, used only to REPORT their count. */
 			const extraInjectedPrefixes = () => extraInjectedPrefixesOf(settingsScope?.getSnapshot().value);
 			/**
+			* The auto-continue block after a channel-gate refusal (see
+			* `src/channel-continue.ts`), read the three-level way the other switches are.
+			*
+			* The cap and the text are read from the committed document rather than
+			* mirrored in card state: only `enabled` has a control here, so a local copy of
+			* the other two would be a second source of truth for values this card can
+			* only READ.
+			*/
+			const channelRejectContinueValue = () => {
+				const committed = channelRejectContinueOf(settingsScope?.getSnapshot().value);
+				return channelRejectContinueOn === void 0 ? committed : {
+					...committed,
+					enabled: channelRejectContinueOn
+				};
+			};
+			/**
+			* The reasoning-redaction switch (issue #213).
+			*
+			* Same three-level resolution as every other switch: this card's own verified
+			* write, then the committed snapshot. No Host mirror, because this one has no
+			* status-document field — it does not change any number the card displays.
+			*/
+			const dropAllThinkingValue = () => {
+				if (dropAllThinkingOn !== void 0) return dropAllThinkingOn;
+				return (settingsScope?.getSnapshot().value)?.["dropAllThinking"] === true;
+			};
+			/**
 			* Flip one upstream-identity switch.
 			*
 			* No `refreshUsage` afterwards, unlike the CLI switch: these change the shape
@@ -7175,12 +10292,15 @@ window.__ModuleLoader__.load({
 			*/
 			const toggleUpstreamSwitch = async (field, enabled) => {
 				if (settingsScope === void 0) return;
-				const setBusy = field === "usageIdentity" ? setUsageIdentityBusy : field === "keepPromptLast" ? setKeepPromptLastBusy : setSessionTitleBusy;
-				const setOwn = field === "usageIdentity" ? setUsageIdentityOn : field === "keepPromptLast" ? setKeepPromptLastOn : setSessionTitleOn;
+				const setBusy = field === "usageIdentity" ? setUsageIdentityBusy : field === "keepPromptLast" ? setKeepPromptLastBusy : field === "sessionTitle" ? setSessionTitleBusy : field === "channelRejectContinue" ? setChannelRejectContinueBusy : setDropAllThinkingBusy;
+				const setOwn = field === "usageIdentity" ? setUsageIdentityOn : field === "keepPromptLast" ? setKeepPromptLastOn : field === "sessionTitle" ? setSessionTitleOn : field === "channelRejectContinue" ? setChannelRejectContinueOn : setDropAllThinkingOn;
 				setBusy(true);
 				try {
 					await writeUpstreamSwitch(settingsScope, field, field === "sessionTitle" ? {
 						...sessionTitleOf(settingsScope.getSnapshot().value),
+						enabled
+					} : field === "channelRejectContinue" ? {
+						...channelRejectContinueOf(settingsScope.getSnapshot().value),
 						enabled
 					} : enabled);
 					if (mounted.current) setOwn(enabled);
@@ -7416,6 +10536,11 @@ window.__ModuleLoader__.load({
 						const budget = activeContextBudgets[id];
 						if (typeof budget === "number") stillBudgets[id] = budget;
 					}
+					const stillEfforts = {};
+					for (const id of freshIds) {
+						const effort = activeDefaultEfforts[id];
+						if (typeof effort === "string" && effort !== "") stillEfforts[id] = effort;
+					}
 					setDrafts((prev) => ({
 						...prev,
 						[activeRegion]: {
@@ -7423,7 +10548,8 @@ window.__ModuleLoader__.load({
 							enabledIds: new Set(stillEnabled),
 							imageIds: new Set(upstreamImages),
 							offIds: new Set(activeOffIds),
-							contextBudgets: stillBudgets
+							contextBudgets: stillBudgets,
+							defaultThinkingEfforts: stillEfforts
 						}
 					}));
 				} catch (error) {
@@ -7458,7 +10584,9 @@ window.__ModuleLoader__.load({
 			const activeOffIds = draft?.offIds ?? savedOffIds;
 			settingsScope?.getSnapshot().value;
 			const savedContextBudgets = status.status === "signed-in" ? status.contextBudgets ?? {} : {};
+			const savedDefaultEfforts = status.status === "signed-in" ? status.defaultThinkingEfforts ?? {} : {};
 			const activeContextBudgets = draft?.contextBudgets ?? savedContextBudgets;
+			const activeDefaultEfforts = draft?.defaultThinkingEfforts ?? savedDefaultEfforts;
 			const dirty = draft !== void 0;
 			/**
 			* Whether the card's inputs accept edits.
@@ -7480,7 +10608,8 @@ window.__ModuleLoader__.load({
 						enabledIds: new Set(activeEnabledIds),
 						imageIds: new Set(activeImageIds),
 						offIds: new Set(activeOffIds),
-						contextBudgets: { ...activeContextBudgets }
+						contextBudgets: { ...activeContextBudgets },
+						defaultThinkingEfforts: { ...activeDefaultEfforts }
 					})
 				}));
 			};
@@ -7523,14 +10652,54 @@ window.__ModuleLoader__.load({
 					};
 				});
 			};
+			/**
+			* Set one model's DSH context budget, or CLEAR it.
+			*
+			* `undefined` means "no cap — use the model's native window", and it is
+			* written as the ABSENCE of the key rather than as a stored number equal to
+			* the window. That distinction is the whole of issue #215: a stored
+			* `{ id: 1000000 }` and an absent entry both resolve to 1,000,000 today, but
+			* only the absent one keeps following the model if the upstream ever raises
+			* its window. It is also what makes the "native" radio mean one thing —
+			* "no budget" — instead of sometimes meaning "a budget that happens to equal
+			* the window".
+			*
+			* The key is DELETED rather than assigned `undefined`: an explicit
+			* `undefined` survives `structuredClone` and the settings write path's strict
+			* JSON codec rejects the whole save (see `setDefaultThinkingEffort`, which
+			* follows the same rule for the same reason).
+			*/
 			const setContextBudget = (modelId, budget) => {
-				editDraft((current) => ({
-					...current,
-					contextBudgets: {
-						...current.contextBudgets,
-						[modelId]: budget
-					}
-				}));
+				editDraft((current) => {
+					const next = { ...current.contextBudgets };
+					if (budget === void 0) delete next[modelId];
+					else next[modelId] = budget;
+					return {
+						...current,
+						contextBudgets: next
+					};
+				});
+			};
+			/**
+			* Choose one model's default thinking tier (issue #179).
+			*
+			* `''` — the picker's first option — means "follow the upstream default", and
+			* is written as the ABSENCE of the key rather than as an empty string. The
+			* stored map is the whole answer the runtime reads, so an `''` entry would
+			* persist a tier nothing declares and then silently fall back; deleting the
+			* key keeps "no opinion" representable, which is what lets a future upstream
+			* change to `defaultEffort` take effect for this model.
+			*/
+			const setDefaultThinkingEffort = (modelId, effort) => {
+				editDraft((current) => {
+					const next = { ...current.defaultThinkingEfforts };
+					if (effort === "") delete next[modelId];
+					else next[modelId] = effort;
+					return {
+						...current,
+						defaultThinkingEfforts: next
+					};
+				});
 			};
 			const discardModels = () => {
 				setDrafts((prev) => {
@@ -7756,16 +10925,6 @@ window.__ModuleLoader__.load({
 			const sweepTpsEnabledModels = () => {
 				measureTpsFor(visibleModels.filter((model) => activeEnabledIds.has(model.id)).map((model) => model.id));
 			};
-			/**
-			* Sweep EVERY model in the region's live catalog, enabled or not.
-			*
-			* Deliberately the whole VISIBLE catalog and nothing else: those are the ids
-			* the host can validate against its own catalog, so this cannot spend credit
-			* on an id that only exists in a config file.
-			*/
-			const sweepAllModels = () => {
-				sweepModels(visibleModels.map((model) => model.id));
-			};
 			const saveModels = async () => {
 				if (settingsScope === void 0) return;
 				if (status.status !== "signed-in") return;
@@ -7777,8 +10936,10 @@ window.__ModuleLoader__.load({
 						lastCatalog: visibleModels.map(toPersistedWorkBuddyModel),
 						enabledModelIds: [...activeEnabledIds],
 						imageModelIds: [...activeImageIds],
+						imageSelectionExplicit: true,
 						offModelIds: [...activeOffIds],
-						contextBudgets: activeContextBudgets
+						contextBudgets: activeContextBudgets,
+						defaultThinkingEfforts: activeDefaultEfforts
 					});
 					if (mounted.current) setSaving(false);
 					discardModels();
@@ -7804,6 +10965,16 @@ window.__ModuleLoader__.load({
 			const nameOf = (value) => value === "" ? t("row.accountUnnamed") : value;
 			/** The saved choice no longer matches a local sign-in (tokens are fine). */
 			const selectionLost = status.status === "signed-out" && status.selectionLost === true;
+			/**
+			* The vault directory could not be READ at all (issue #199).
+			*
+			* A permissions failure masquerades as "the account is gone": `syncVault`
+			* skips the vault when its readdir fails, so the saved OAuth-only account
+			* drops out of the list while the desktop scan's accounts remain. Without
+			* this the card tells the user to re-sign-in, which cannot repair a DACL.
+			* The raw error is shown because it names the actual failing operation.
+			*/
+			const vaultUnreadable = status.status === "signed-out" ? status.vaultUnreadable : void 0;
 			/**
 			* The paths the Host probed, on the branch where nothing was found at all.
 			* Absent on the legacy card payload (an older Host), so it defaults empty
@@ -8098,6 +11269,223 @@ window.__ModuleLoader__.load({
 				})]
 			});
 			/**
+			* The sidebar-row switch (PR #188).
+			*
+			* Its own class for the reason the CLI box has one: the credit-switch suite's
+			* "exactly one switch" selector (`.dsm-workbuddy-pref-check`) must keep
+			* resolving to the credit box alone.
+			*
+			* NOT gated on the active tab's provider: the row is a property of the whole
+			* plugin, not of one region, and a signed-out card can still turn it on.
+			*/
+			/**
+			* The CN gateway override editor (issue #220).
+			*
+			* A DRAFT + explicit Save, unlike the switches above it: a host name is typed,
+			* so committing per keystroke would write `https://w`, `https://wb`, … — six
+			* settings writes and six `warn` log lines for one word. The switches commit on
+			* the click precisely because a click IS a complete statement; a text field is
+			* not.
+			*
+			* CN only. The international gateways follow the credential's own brand domain
+			* (`workbuddy.ai` / `codebuddy.ai`), where an override against a host of a
+			* DIFFERENT brand is rejected by the upstream — there is no "equivalent host"
+			* to fall back to, so the control is absent on that tab rather than present and
+			* unusable.
+			*
+			* The draft is validated HERE and not by the Host: the Host falls back to the
+			* built-in gateway and logs, which keeps a running process correct but tells a
+			* half-attending user nothing. Refusing the save with the specific rule it
+			* broke ("not https" vs "not a CN brand") is what makes the setting findable.
+			*/
+			const cnBaseSaved = regionCnBaseOf(settingsScope?.getSnapshot().value, "cn");
+			const cnBaseDraftValue = cnBaseDraft ?? cnBaseSaved;
+			const cnBaseDirty = cnBaseDraft !== void 0 && cnBaseDraft.trim() !== cnBaseSaved.trim();
+			const cnBasePreview = resolveCnGateway(cnBaseDraftValue);
+			const saveCnBase = async () => {
+				if (settingsScope === void 0 || cnBaseSaving) return;
+				const resolved = cnBasePreview;
+				if (!resolved.ok) {
+					setCnBaseError(resolved.reason === "malformed" ? t("row.cnBaseInvalidMalformed") : resolved.reason === "insecure" ? t("row.cnBaseInvalidInsecure") : t("row.cnBaseInvalidHost"));
+					return;
+				}
+				setCnBaseSaving(true);
+				setCnBaseError(void 0);
+				try {
+					const next = resolved.overridden ? resolved.base : "";
+					await writeRegionCnBase(settingsScope, "cn", next, nextRegionCnBase(settingsScope.getSnapshot().value, "cn", next));
+					if (mounted.current) {
+						setCnBaseDraft(void 0);
+						setCnBaseNotice(t(next === "" ? "row.cnBaseCleared" : "row.cnBaseSaved"));
+					}
+					await refreshUsage("cn");
+				} catch (error) {
+					if (mounted.current) setCnBaseError(error instanceof Error ? error.message : t("row.requestFailed"));
+				} finally {
+					if (mounted.current) setCnBaseSaving(false);
+				}
+			};
+			const cnBasePreference = activeRegion !== "cn" ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "dsm-workbuddy-cnbase",
+				title: t("row.cnBaseHint"),
+				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+						className: "dsm-workbuddy-cnbase-row",
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+							className: "dsm-workbuddy-pref-copy",
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "dsm-workbuddy-pref-label",
+								children: t("row.cnBaseLabel")
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "dsm-workbuddy-pref-hint",
+								children: t("row.cnBaseHint")
+							})]
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+							type: "url",
+							className: "dsm-workbuddy-cnbase-input",
+							value: cnBaseDraftValue,
+							placeholder: t("row.cnBasePlaceholder"),
+							disabled: !canWrite || saving || cnBaseSaving,
+							spellCheck: false,
+							autoComplete: "off",
+							onChange: (event) => {
+								setCnBaseDraft(event.target.value);
+								setCnBaseError(void 0);
+								setCnBaseNotice(void 0);
+							}
+						})]
+					}),
+					cnBaseError !== void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: "dsm-workbuddy-cnbase-error",
+						role: "alert",
+						children: cnBaseError
+					}) : null,
+					cnBaseError === void 0 && cnBaseNotice !== void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+						className: "dsm-workbuddy-cnbase-notice",
+						role: "status",
+						children: cnBaseNotice
+					}) : null,
+					cnBaseDirty ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+						className: "dsm-workbuddy-cnbase-actions",
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+							type: "button",
+							className: "dsm-btn dsm-btn-outline",
+							disabled: cnBaseSaving,
+							onClick: () => {
+								setCnBaseDraft(void 0);
+								setCnBaseError(void 0);
+								setCnBaseNotice(void 0);
+							},
+							children: t("row.poolDiscard")
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+							type: "button",
+							className: "dsm-btn dsm-btn-primary",
+							disabled: cnBaseSaving,
+							onClick: () => {
+								saveCnBase();
+							},
+							children: cnBaseSaving ? t("row.poolSaving") : t("row.poolSaved")
+						})]
+					}) : null
+				]
+			});
+			/**
+			* The refresh cadence, as a five-option picker.
+			*
+			* It lives in the capability panel because it commits on the click like every
+			* other control there — no Save button. A dropdown rather than a free number
+			* because the offered set IS the validation: the same five values are what the
+			* Host accepts, so the control cannot produce something the Host refuses.
+			*
+			* Placed last among the capability groups: it changes how often the plugin
+			* ASKS, not what it may do, and it is the one control here whose effect is
+			* purely about request volume.
+			*/
+			const pollIntervalPreference = /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "dsm-workbuddy-prefs",
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					className: "dsm-workbuddy-pref-hint",
+					children: t("row.pollIntervalLead")
+				}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("label", {
+					className: "dsm-workbuddy-pref dsm-workbuddy-upstream-pref",
+					title: t("row.pollIntervalHint"),
+					children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+						className: "dsm-workbuddy-pref-copy",
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "dsm-workbuddy-pref-label",
+								children: t("row.pollIntervalLabel")
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "dsm-workbuddy-pref-hint",
+								children: t("row.pollIntervalHint")
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("select", {
+								className: "dsm-workbuddy-credit-position",
+								value: String(pollIntervalValue()),
+								disabled: !canWrite || saving || poolBusy || pollIntervalBusy,
+								"aria-label": t("row.pollIntervalAria"),
+								onChange: (event) => {
+									const next = Number(event.currentTarget.value);
+									if (!WORKBUDDY_POLL_INTERVALS_MS.includes(next)) return;
+									changePollInterval(next);
+								},
+								children: [
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+										value: String(6e4),
+										children: t("row.pollInterval1m")
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+										value: String(3e5),
+										children: t("row.pollInterval5m")
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+										value: String(6e5),
+										children: t("row.pollInterval10m")
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+										value: String(18e5),
+										children: t("row.pollInterval30m")
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+										value: String(36e5),
+										children: t("row.pollInterval60m")
+									})
+								]
+							})
+						]
+					})
+				})]
+			});
+			const sidebarPanelPreference = /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "dsm-workbuddy-prefs",
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					className: "dsm-workbuddy-pref-hint",
+					children: t("row.sidebarPanelLead")
+				}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+					className: "dsm-workbuddy-pref",
+					title: t("row.sidebarPanelHint"),
+					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+						type: "checkbox",
+						className: "dsm-workbuddy-sidebar-panel-check",
+						checked: sidebarPanelSwitchedOn(),
+						disabled: !canWrite || saving || poolBusy || sidebarPanelBusy,
+						onChange: (event) => {
+							toggleSidebarPanel(event.target.checked);
+						}
+					}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+						className: "dsm-workbuddy-pref-copy",
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "dsm-workbuddy-pref-label",
+							children: t("row.sidebarPanelLabel")
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "dsm-workbuddy-pref-hint",
+							children: t("row.sidebarPanelHint")
+						})]
+					})]
+				})]
+			});
+			/**
 			* The two quick-adjust pins of the CLI route, rendered under its switch the
 			* way the seat picker sits under its switch: indented, and only while the
 			* switch is ON — the pickers configure the route the switch turned on, and
@@ -8302,9 +11690,107 @@ window.__ModuleLoader__.load({
 					})]
 				}, field))]
 			});
+			/**
+			* The opt-in auto-continue after a channel-gate refusal.
+			*
+			* Its own group, NOT a row in {@link upstreamSwitches} above, because it
+			* breaks that group's one shared promise: those four are sampled when the
+			* plugin mounts and need a reload, while this one is read on every failure and
+			* takes effect immediately. Hiding that difference behind a shared hint would
+			* teach the user the wrong rule for exactly the switch where being wrong is
+			* expensive — this one spends real requests.
+			*
+			* The cap and the text are REPORTED while the switch is on, not edited: both
+			* already live in the config file, and the cap is the one number the user asked
+			* to be exactly 3, so an unvalidated free-text field here would be a second way
+			* to get it wrong.
+			*/
+			const channelRejectContinuePreference = /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "dsm-workbuddy-prefs",
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					className: "dsm-workbuddy-pref-hint",
+					children: t("row.channelRejectHint")
+				}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+					className: "dsm-workbuddy-pref dsm-workbuddy-upstream-pref",
+					title: t("row.channelRejectContinueHint"),
+					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+						type: "checkbox",
+						className: "dsm-workbuddy-channel-continue-check",
+						checked: channelRejectContinueValue().enabled,
+						disabled: !canWrite || saving || poolBusy || channelRejectContinueBusy,
+						onChange: (event) => {
+							toggleUpstreamSwitch("channelRejectContinue", event.target.checked);
+						}
+					}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+						className: "dsm-workbuddy-pref-copy",
+						children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "dsm-workbuddy-pref-label",
+								children: t("row.channelRejectContinueLabel")
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "dsm-workbuddy-pref-hint",
+								children: t("row.channelRejectContinueHint")
+							}),
+							channelRejectContinueValue().enabled ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+								className: "dsm-workbuddy-pref-hint",
+								children: [
+									t("row.channelRejectContinueLimit"),
+									" ",
+									String(channelRejectContinueValue().maxConsecutive),
+									" · ",
+									t("row.channelRejectContinueText"),
+									" ",
+									channelRejectContinueValue().text
+								]
+							}) : null
+						]
+					})]
+				})]
+			});
+			/**
+			* ISSUE #213: redact past reasoning from the request.
+			*
+			* Its own group rather than a row inside the channel-reject block, because the
+			* two answer different failures: that switch RESENDS after a refusal, this one
+			* removes the text that gets scanned in the first place. Grouping them would
+			* imply they are alternatives of one feature.
+			*/
+			const dropAllThinkingPreference = /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: "dsm-workbuddy-prefs",
+				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+					className: "dsm-workbuddy-pref-hint",
+					children: t("row.dropAllThinkingLead")
+				}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+					className: "dsm-workbuddy-pref dsm-workbuddy-upstream-pref",
+					title: t("row.dropAllThinkingHint"),
+					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+						type: "checkbox",
+						className: "dsm-workbuddy-drop-thinking-check",
+						checked: dropAllThinkingValue(),
+						disabled: !canWrite || saving || poolBusy || dropAllThinkingBusy,
+						onChange: (event) => {
+							toggleUpstreamSwitch("dropAllThinking", event.target.checked);
+						}
+					}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+						className: "dsm-workbuddy-pref-copy",
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "dsm-workbuddy-pref-label",
+							children: t("row.dropAllThinkingLabel")
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+							className: "dsm-workbuddy-pref-hint",
+							children: t("row.dropAllThinkingHint")
+						})]
+					})]
+				})]
+			});
 			const creditPreferences = /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
 				className: "dsm-workbuddy-prefs",
 				children: [
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: "dsm-workbuddy-pref-hint",
+						children: t("row.modelToolsHint")
+					}),
 					cliBridgePreference,
 					cliBridgeSwitchedOn() ? cliBridgePickers : null,
 					imageToolPreference,
@@ -8333,6 +11819,28 @@ window.__ModuleLoader__.load({
 							})]
 						})]
 					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+						className: "dsm-workbuddy-pref",
+						title: t("row.showNewModelsHint"),
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+							type: "checkbox",
+							className: "dsm-workbuddy-new-models-check",
+							checked: activeRegionOn ? newModelsShownOn(activeRegion) : false,
+							disabled: !activeRegionOn || togglingNewModels === activeRegion || !canWrite || saving || poolBusy,
+							onChange: (event) => {
+								toggleNewModels(activeRegion, event.target.checked);
+							}
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+							className: "dsm-workbuddy-pref-copy",
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "dsm-workbuddy-pref-label",
+								children: t("row.showNewModels")
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+								className: "dsm-workbuddy-pref-hint",
+								children: t("row.showNewModelsHintInline")
+							})]
+						})]
+					}),
 					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("label", {
 						className: "dsm-workbuddy-pref dsm-workbuddy-pref-indent",
 						title: t("row.creditPositionHint"),
@@ -8352,6 +11860,765 @@ window.__ModuleLoader__.load({
 					})
 				]
 			});
+			/**
+			* The page header: the sidebar panel's own page, and the Settings section.
+			*
+			* Both are "a page about WorkBuddy" rather than a row in someone else's list,
+			* so both say what this is in one line. They differ in exactly one control:
+			* the sidebar page needs a way back to the conversation, while the Settings
+			* section is inside a dialog the shell closes for you — a back arrow there
+			* would point at a place the reader did not come from.
+			*/
+			const pageHead = pageSurface || settingsSurface ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: settingsSurface ? "dsm-workbuddy-page-head dsm-workbuddy-settings-head" : "dsm-workbuddy-page-head",
+				children: [
+					pageSurface && backToConversation !== void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+						type: "button",
+						className: "dsm-workbuddy-page-back",
+						onClick: backToConversation,
+						children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("svg", {
+							width: "14",
+							height: "14",
+							viewBox: "0 0 16 16",
+							fill: "none",
+							"aria-hidden": "true",
+							children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("path", {
+								d: "M10 3.5 5.5 8l4.5 4.5",
+								stroke: "currentColor",
+								strokeWidth: "1.6",
+								strokeLinecap: "round",
+								strokeLinejoin: "round"
+							})
+						}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("nav.back") })]
+					}) : null,
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)(PluginIcon, { className: "dsm-workbuddy-page-icon" }),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: "dsm-workbuddy-page-title",
+						children: title
+					}),
+					/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+						className: "dsm-workbuddy-page-desc",
+						children: t("row.desc")
+					})
+				]
+			}) : null;
+			const cardBody = /* @__PURE__ */ (0, react_jsx_runtime.jsx)(CardBodyBoundary, {
+				t,
+				children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+					className: "dsm-workbuddy-usage",
+					children: [
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+							className: "dsm-workbuddy-tabs",
+							role: "tablist",
+							"aria-label": title,
+							children: WORKBUDDY_REGIONS.map((region) => {
+								const regionStatus = statusByRegion[region];
+								const regionOnState = regionOn(region);
+								return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: "dsm-workbuddy-tab-cell",
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+										type: "button",
+										role: "tab",
+										"aria-selected": region === activeRegion,
+										className: `dsm-workbuddy-tab${region === activeRegion ? " dsm-workbuddy-tab-active" : ""}${regionOnState ? "" : " dsm-workbuddy-tab-off"}`,
+										onClick: () => {
+											setActiveRegion(region);
+											setAccountError(void 0);
+										},
+										children: [regionStatus === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											"aria-hidden": "true",
+											className: "dsm-workbuddy-tab-dot",
+											style: dotStyle(regionStatus.status)
+										}), region === "cn" ? t("row.tabCn") : t("row.tabGlobal")]
+									}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("label", {
+										className: "dsm-workbuddy-tab-switch",
+										title: t("row.tabSwitchHint"),
+										children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+											type: "checkbox",
+											checked: regionOnState,
+											disabled: togglingRegion === region || !canWrite || saving || poolBusy,
+											"aria-label": t("row.tabSwitchAria", { region: region === "cn" ? t("row.tabCn") : t("row.tabGlobal") }),
+											onChange: (event) => {
+												toggleRegion(region, event.target.checked);
+											}
+										})
+									})]
+								}, region);
+							})
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+							className: "dsm-workbuddy-models-summary dsm-workbuddy-tab-hint",
+							children: t("row.tabHint")
+						}),
+						signedIn ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "dsm-workbuddy-panels",
+							role: "tablist",
+							"aria-label": t("row.panelAria"),
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									role: "tab",
+									id: "dsm-workbuddy-tab-accounts",
+									"aria-controls": "dsm-workbuddy-panel-accounts",
+									"aria-selected": panel === "accounts",
+									className: `dsm-workbuddy-panel-tab${panel === "accounts" ? " dsm-workbuddy-panel-tab-active" : ""}`,
+									onClick: () => {
+										setPanel("accounts");
+									},
+									children: t("row.panelAccounts")
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									role: "tab",
+									id: "dsm-workbuddy-tab-models",
+									"aria-controls": "dsm-workbuddy-panel-models",
+									"aria-selected": panel === "models",
+									className: `dsm-workbuddy-panel-tab${panel === "models" ? " dsm-workbuddy-panel-tab-active" : ""}`,
+									onClick: () => {
+										setPanel("models");
+									},
+									children: t("row.panelModels")
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									role: "tab",
+									id: "dsm-workbuddy-tab-capabilities",
+									"aria-controls": "dsm-workbuddy-panel-capabilities",
+									"aria-selected": panel === "capabilities",
+									className: `dsm-workbuddy-panel-tab${panel === "capabilities" ? " dsm-workbuddy-panel-tab-active" : ""}`,
+									onClick: () => {
+										setPanel("capabilities");
+									},
+									children: t("row.panelCapabilities")
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									role: "tab",
+									id: "dsm-workbuddy-tab-diag",
+									"aria-controls": "dsm-workbuddy-panel-diag",
+									"aria-selected": panel === "diag",
+									className: `dsm-workbuddy-panel-tab${panel === "diag" ? " dsm-workbuddy-panel-tab-active" : ""}`,
+									onClick: () => {
+										setPanel("diag");
+									},
+									children: t("row.panelDiag")
+								}),
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									role: "tab",
+									id: "dsm-workbuddy-tab-sdk",
+									"aria-controls": "dsm-workbuddy-panel-sdk",
+									"aria-selected": panel === "sdk",
+									className: `dsm-workbuddy-panel-tab${panel === "sdk" ? " dsm-workbuddy-panel-tab-active" : ""}`,
+									onClick: () => {
+										setPanel("sdk");
+									},
+									children: t("row.panelSdk")
+								})
+							]
+						}) : null,
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "dsm-workbuddy-panel",
+							role: "tabpanel",
+							id: "dsm-workbuddy-panel-accounts",
+							"aria-labelledby": "dsm-workbuddy-tab-accounts",
+							hidden: signedIn && panel !== "accounts",
+							children: [
+								!activeRegionOn ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+									className: "dsm-workbuddy-tab-off-notice",
+									children: t("row.tabOffNotice")
+								}) : null,
+								status.status === "error" || status.status === "signed-in" && status.creditsError !== void 0 ? status.status === "signed-in" && status.credentialRejected === true ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+									className: "dsm-workbuddy-usage-hint",
+									children: t("row.reloginHint")
+								}) : null,
+								accountError === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+									className: "dsm-workbuddy-account-error",
+									role: "alert",
+									children: accountError
+								}),
+								selectionLost ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+									className: "dsm-workbuddy-usage-hint",
+									children: t("row.selectionLostHint")
+								}) : null,
+								vaultUnreadable !== void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+									className: "dsm-workbuddy-account-error",
+									role: "alert",
+									children: t("row.vaultUnreadableHint", { message: vaultUnreadable })
+								}) : null,
+								status.status === "signed-in" ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+									status.credentialRejected === true ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("section", {
+										className: "dsm-workbuddy-usage-error",
+										role: "alert",
+										children: [
+											/* @__PURE__ */ (0, react_jsx_runtime.jsx)("strong", { children: t("row.credentialRejectedTitle") }),
+											/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", { children: t("row.credentialRejectedIntro", { accountName: nameOf(status.accountName) }) }),
+											status.recovery?.usableAccount !== void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", { children: t("row.credentialRejectedSwitch", { accountName: nameOf(status.recovery.usableAccount.accountName) }) }) : status.recovery?.reloginRequired === true ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", { children: t("row.credentialRejectedRelogin") }) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", { children: t("row.credentialRejectedChoose") }),
+											status.recovery?.usableAccount === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+												type: "button",
+												className: "dsm-btn dsm-btn-outline",
+												disabled: switchingAccount || !canWrite,
+												onClick: () => {
+													const target = status.recovery?.usableAccount;
+													if (target !== void 0) switchAccount(target.accountId);
+												},
+												children: switchingAccount ? t("row.accountsScanning") : t("row.credentialRejectedSwitchAction", { accountName: nameOf(status.recovery.usableAccount.accountName) })
+											})
+										]
+									}) : null,
+									status.creditsError === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+										className: "dsm-workbuddy-usage-error",
+										children: t("row.creditsError", { message: status.creditsError })
+									}),
+									status.refreshError === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+										className: "dsm-workbuddy-usage-error",
+										role: "alert",
+										children: t("row.requestFailedHint", { message: status.refreshError })
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsx)(AccountPool, {
+										t,
+										region: activeRegion,
+										...status.pool === void 0 ? {} : { pool: status.pool },
+										...settingsScope === void 0 ? {} : { settingsScope },
+										onRescan: () => {
+											rescanAccounts();
+										},
+										rescanning: busy,
+										onSelectAccount: (accountId) => {
+											switchAccount(accountId);
+										},
+										selectingAccount: switchingAccount,
+										accountTools,
+										siblingBusy: saving || togglingRegion !== void 0,
+										onBusyChange: setPoolBusy,
+										onSaved: async () => await refreshUsage(activeRegion) !== void 0,
+										onRefresh: () => refreshUsage(activeRegion),
+										...deviceSettings === void 0 ? {} : {
+											deviceMode: deviceSettings.mode,
+											deviceProfiles: deviceSettings.accounts,
+											...deviceSettings.derived === void 0 ? {} : { deviceDerived: deviceSettings.derived },
+											onDeviceModeChange: changeDeviceMode,
+											onSaveDeviceProfile: saveDeviceProfile,
+											...deviceSettings.realTier === void 0 ? {} : { realTier: deviceSettings.realTier }
+										}
+									})
+								] }) : null
+							]
+						}),
+						signedIn ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+							className: "dsm-workbuddy-panel",
+							role: "tabpanel",
+							id: "dsm-workbuddy-panel-models",
+							"aria-labelledby": "dsm-workbuddy-tab-models",
+							hidden: panel !== "models",
+							children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("section", {
+								className: "dsm-workbuddy-models",
+								"aria-label": t("row.modelsTitle"),
+								children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: "dsm-workbuddy-models-fold",
+									children: [
+										/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+											className: "dsm-workbuddy-models-head",
+											children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", { children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+												className: "dsm-workbuddy-models-title-row",
+												children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("h3", {
+													className: "dsm-workbuddy-models-title",
+													children: [t("row.modelsTitle"), dirty ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+														className: "dsm-workbuddy-models-dirty",
+														children: t("row.modelsDirty")
+													}) : null]
+												})
+											}) }), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+												className: "dsm-workbuddy-models-head-actions",
+												children: [
+													/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+														type: "button",
+														className: "dsm-btn dsm-btn-outline",
+														disabled: busy,
+														onClick: () => {
+															refreshModels();
+														},
+														children: busy ? t("row.modelsRefreshing") : t("row.modelsRefresh")
+													}),
+													/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+														type: "button",
+														className: "dsm-btn dsm-btn-outline dsm-workbuddy-models-sweep",
+														disabled: busy || sweeping !== void 0 || activeEnabledIds.size === 0,
+														title: t("row.modelsTestEnabledHint"),
+														onClick: sweepEnabledModels,
+														children: sweeping === void 0 ? t("row.modelsTestEnabled") : t("row.modelsTesting", {
+															done: sweeping.done,
+															total: sweeping.total
+														})
+													}),
+													/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+														type: "button",
+														className: "dsm-btn dsm-btn-outline dsm-workbuddy-models-sweep",
+														disabled: busy || tpsSweeping !== void 0 || tpsBusy || activeEnabledIds.size === 0,
+														title: t("row.tpsSweepEnabledHint"),
+														onClick: sweepTpsEnabledModels,
+														children: tpsSweeping === void 0 ? t("row.tpsSweepEnabled") : t("row.tpsTesting", {
+															done: tpsSweeping.done,
+															total: tpsSweeping.total
+														})
+													})
+												]
+											})]
+										}),
+										probeError === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+											className: "dsm-workbuddy-model-probe-result dsm-workbuddy-model-probe-result-bad",
+											role: "alert",
+											children: t("row.probeError", { message: probeError })
+										}),
+										sweepSummary === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+											className: "dsm-workbuddy-models-sweep-summary",
+											role: "status",
+											children: sweepSummary
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+											className: "dsm-workbuddy-model-list",
+											children: visibleModels.map((model) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+												className: `dsm-workbuddy-model${activeEnabledIds.has(model.id) ? "" : " dsm-workbuddy-model-disabled"}`,
+												children: [
+													/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+														className: "dsm-workbuddy-model-head",
+														children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+															className: "dsm-workbuddy-model-enabled",
+															children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+																type: "checkbox",
+																checked: activeEnabledIds.has(model.id),
+																disabled: !canWrite || saving,
+																onChange: () => {
+																	toggleModel(model.id);
+																}
+															}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+																className: "dsm-workbuddy-model-copy",
+																children: [
+																	/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+																		className: "dsm-workbuddy-model-name",
+																		children: [model.name, effectiveRate(model) === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+																			className: "dsm-workbuddy-model-name-rate",
+																			children: ["x", effectiveRate(model).toFixed(2)]
+																		})]
+																	}),
+																	promoChip(model),
+																	busyIcon(busyLevels[model.id], uiLanguage())
+																]
+															})]
+														}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+															className: "dsm-workbuddy-model-controls",
+															children: [
+																/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+																	className: "dsm-workbuddy-model-image",
+																	title: imageCheckboxHint(model, t),
+																	children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+																		type: "checkbox",
+																		checked: activeImageIds.has(model.id),
+																		disabled: !canWrite || saving,
+																		onChange: () => {
+																			toggleImage(model.id);
+																		}
+																	}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("row.modelImage") })]
+																}),
+																/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+																	className: `dsm-workbuddy-model-off${offBlocked(model) ? " dsm-workbuddy-model-off-blocked" : ""}`,
+																	title: offBlocked(model) ? t("row.modelOffRefusedHint") : t("row.modelOffHint"),
+																	children: [
+																		/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
+																			type: "checkbox",
+																			checked: activeOffIds.has(model.id),
+																			disabled: !canWrite || saving || offBlocked(model),
+																			onChange: () => {
+																				toggleOff(model.id);
+																			}
+																		}),
+																		/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("row.modelOff") }),
+																		offBlocked(model) ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+																			className: "dsm-workbuddy-model-off-flag",
+																			children: t("row.modelOffRefused")
+																		}) : null
+																	]
+																}),
+																/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("select", {
+																	className: "dsm-workbuddy-context-budget",
+																	"aria-label": t("row.contextBudget"),
+																	value: String(effectiveContextBudget(model.nativeContextWindow, activeContextBudgets[model.id])),
+																	disabled: !canWrite || saving,
+																	onChange: (event) => {
+																		const picked = Number(event.target.value);
+																		setContextBudget(model.id, picked === model.nativeContextWindow ? void 0 : picked);
+																	},
+																	children: [
+																		model.nativeContextWindow > 2e5 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+																			value: 2e5,
+																			children: "200K"
+																		}) : null,
+																		model.nativeContextWindow > 5e5 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+																			value: 5e5,
+																			children: "500K"
+																		}) : null,
+																		/* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+																			value: model.nativeContextWindow,
+																			children: formatCapacity(model.nativeContextWindow, t("row.modelUnknown"))
+																		})
+																	]
+																})
+															]
+														})]
+													}),
+													/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+														className: "dsm-workbuddy-model-details",
+														children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+															className: "dsm-workbuddy-model-meta",
+															children: [
+																/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("row.modelContext", { context: formatCapacity(model.nativeContextWindow, t("row.modelUnknown")) }) }),
+																/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("row.modelOutput", { output: formatCapacity(model.maxTokens, t("row.modelUnknown")) }) }),
+																(() => {
+																	const efforts = selectableEfforts(model.reasoning);
+																	if (efforts.length === 0) return null;
+																	const saved = activeDefaultEfforts[model.id];
+																	const chosen = typeof saved === "string" && efforts.includes(saved) ? saved : "";
+																	const follow = defaultEffortFor(model);
+																	const followLabel = follow !== void 0 ? t("row.modelEffortFollowNamed", { effort: follow }) : t("row.modelEffortFollow");
+																	return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
+																		className: "dsm-workbuddy-model-effort",
+																		title: t("row.modelEffortHint"),
+																		children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("row.modelEffortLabel") }), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("select", {
+																			className: "dsm-workbuddy-model-effort-select",
+																			value: chosen,
+																			disabled: !canWrite || saving,
+																			"aria-label": t("row.modelEffortAria", { model: model.name }),
+																			onChange: (event) => {
+																				setDefaultThinkingEffort(model.id, event.currentTarget.value);
+																			},
+																			children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+																				value: "",
+																				children: followLabel
+																			}), efforts.map((level) => /* @__PURE__ */ (0, react_jsx_runtime.jsx)("option", {
+																				value: level,
+																				children: level
+																			}, level))]
+																		})]
+																	});
+																})()
+															]
+														}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+															className: "dsm-workbuddy-model-actions-buttons",
+															children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+																type: "button",
+																className: "dsm-btn dsm-btn-outline dsm-workbuddy-model-probe",
+																disabled: probing[model.id] === true || status.status !== "signed-in",
+																title: t("row.probeHint"),
+																onClick: () => {
+																	probeModels([model.id]);
+																},
+																children: probing[model.id] === true ? t("row.probing") : t("row.probe")
+															}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+																type: "button",
+																className: "dsm-btn dsm-btn-outline dsm-workbuddy-model-probe",
+																disabled: tpsProbing[model.id] === true || status.status !== "signed-in",
+																title: t("row.tpsHint"),
+																onClick: () => {
+																	measureTpsFor([model.id]);
+																},
+																children: tpsProbing[model.id] === true ? t("row.tpsMeasuring") : t("row.tpsMeasure")
+															})]
+														})]
+													}),
+													(() => {
+														const result = probes[activeRegion]?.[model.id];
+														if (result === void 0) return null;
+														const view = probeResultView(result, t);
+														const reason = inlineProbeReason(result.outcome, result.message);
+														return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("p", {
+															className: `dsm-workbuddy-model-probe-result dsm-workbuddy-model-probe-result-${view.tone}`,
+															role: "status",
+															...result.message === void 0 ? {} : { title: result.message },
+															children: [view.text, reason === void 0 ? null : " · " + reason]
+														});
+													})(),
+													(() => {
+														const measured = tpsResults[model.id];
+														if (measured === void 0) return null;
+														const view = tpsResultView(measured, t, tpsMeasuredAt[model.id]);
+														return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+															className: `dsm-workbuddy-model-probe-result dsm-workbuddy-model-probe-result-${view.tone}`,
+															role: "status",
+															children: view.text
+														});
+													})()
+												]
+											}, model.id))
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+											className: "dsm-workbuddy-model-capability-note",
+											children: t("row.modelCapabilityPending")
+										}),
+										/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+											className: "dsm-workbuddy-model-actions",
+											children: [
+												/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("a", {
+													className: "dsm-workbuddy-usage-cheer",
+													href: WORKBUDDY_GITHUB_URL,
+													target: "_blank",
+													rel: "noopener noreferrer",
+													children: [t("row.cheer"), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+														className: "dsm-workbuddy-usage-cheer-star",
+														"aria-hidden": "true",
+														children: "★"
+													})]
+												}),
+												saveError === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+													className: "dsm-workbuddy-model-save-error",
+													children: t("row.saveError", { message: saveError })
+												}),
+												/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+													className: "dsm-workbuddy-model-actions-buttons",
+													children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+														type: "button",
+														className: "dsm-btn dsm-btn-outline",
+														disabled: !dirty || saving || poolBusy || togglingRegion !== void 0,
+														onClick: discardModels,
+														children: t("row.discard")
+													}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+														type: "button",
+														className: "dsm-btn dsm-btn-primary",
+														disabled: !dirty || saving || poolBusy || togglingRegion !== void 0 || activeEnabledIds.size === 0,
+														onClick: () => {
+															saveModels();
+														},
+														children: saving ? t("row.saving") : t("row.save")
+													})]
+												})
+											]
+										})
+									]
+								})
+							})
+						}) : null,
+						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "dsm-workbuddy-panel",
+							role: "tabpanel",
+							id: "dsm-workbuddy-panel-capabilities",
+							"aria-labelledby": "dsm-workbuddy-tab-capabilities",
+							hidden: signedIn && panel !== "capabilities",
+							children: [
+								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+									className: "dsm-workbuddy-panel-note",
+									children: t("row.panelCapabilitiesHint")
+								}),
+								cnBasePreference,
+								creditPreferences,
+								upstreamSwitches,
+								channelRejectContinuePreference,
+								dropAllThinkingPreference,
+								sidebarPanelPreference,
+								pollIntervalPreference,
+								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+									className: "dsm-workbuddy-prefs",
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+										className: "dsm-workbuddy-pref-hint",
+										children: t("row.iconStyleLead")
+									}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(IconStylePreference, { t })]
+								})
+							]
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+							className: "dsm-workbuddy-panel",
+							role: "tabpanel",
+							id: "dsm-workbuddy-panel-diag",
+							"aria-labelledby": "dsm-workbuddy-tab-diag",
+							hidden: !signedIn || panel !== "diag",
+							children: status.status !== "signed-in" ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+								className: "dsm-workbuddy-diag",
+								children: [
+									/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										className: "dsm-workbuddy-diag-row",
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-label",
+											children: t("row.diagRegion")
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-value",
+											children: status.region === "cn" ? t("row.tabCn") : t("row.tabGlobal")
+										})]
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										className: "dsm-workbuddy-diag-row",
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-label",
+											children: t("row.diagDomain")
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-value dsm-workbuddy-diag-mono",
+											children: status.domain === void 0 || status.domain === "" ? t("row.modelUnknown") : status.domain
+										})]
+									}),
+									status.region === "cn" ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										className: "dsm-workbuddy-diag-row",
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-label",
+											children: t("row.diagCnBase")
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-value dsm-workbuddy-diag-mono",
+											children: (() => {
+												const resolved = resolveCnGateway(regionCnBaseOf(settingsScope?.getSnapshot().value, "cn"));
+												return resolved.ok && resolved.overridden ? resolved.base : t("row.diagCnBaseDefault");
+											})()
+										})]
+									}) : null,
+									/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										className: "dsm-workbuddy-diag-row",
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-label",
+											children: t("row.diagAccount")
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-value",
+											children: nameOf(status.accountName)
+										})]
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										className: "dsm-workbuddy-diag-row",
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-label",
+											children: t("row.diagToken")
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-value dsm-workbuddy-diag-mono",
+											children: formatDate(status.tokenExpiresAtMs)
+										})]
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										className: "dsm-workbuddy-diag-row",
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-label",
+											children: t("row.diagCatalog")
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-value",
+											children: formatNumber(status.models.length)
+										})]
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										className: "dsm-workbuddy-diag-row",
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-label",
+											children: t("row.diagEnabled")
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-value",
+											children: formatNumber(status.enabledModelIds.length)
+										})]
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										className: "dsm-workbuddy-diag-row",
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-label",
+											children: t("row.diagPool")
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-value",
+											children: status.pool?.enabled === true ? t("row.diagPoolOn", { count: status.pool.accounts.length }) : t("row.diagPoolOff")
+										})]
+									}),
+									/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+										className: "dsm-workbuddy-diag-row",
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-diag-label",
+											children: t("row.diagFailures")
+										}), (() => {
+											const failures = [];
+											if (status.credentialRejected === true) failures.push(t("row.credentialRejectedTitle"));
+											if (status.refreshError !== void 0) failures.push(status.refreshError);
+											if (status.creditsError !== void 0) failures.push(status.creditsError);
+											const unreadable = status.models.reduce((count, model) => count + (model.promos ?? []).filter((promo) => promo.schedule?.dailyUnusable === true).length, 0);
+											if (unreadable > 0) failures.push(t("row.diagPromoUnreadable", { count: unreadable }));
+											return failures.length === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												className: "dsm-workbuddy-diag-value",
+												children: t("row.diagNoFailures")
+											}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+												className: "dsm-workbuddy-diag-value dsm-workbuddy-diag-bad dsm-workbuddy-diag-mono",
+												children: failures.join(" · ")
+											});
+										})()]
+									})
+								]
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+								className: "dsm-workbuddy-diag-hint",
+								children: t("row.diagHint")
+							})] })
+						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+							className: "dsm-workbuddy-panel",
+							role: "tabpanel",
+							id: "dsm-workbuddy-panel-sdk",
+							"aria-labelledby": "dsm-workbuddy-tab-sdk",
+							hidden: !signedIn || panel !== "sdk",
+							children: panel === "sdk" ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(DeviceSdkPanel, {
+								t,
+								path: WORKBUDDY_DEVICE_SDK_PATH,
+								settingsPath: WORKBUDDY_DEVICE_PROFILE_PATH
+							}) : null
+						}),
+						status.status === "signed-out" && loading ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+							className: "dsm-workbuddy-usage-text",
+							role: "status",
+							children: t("row.accountsLoading")
+						}) : null,
+						status.status === "signed-out" && !loading ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+								className: "dsm-workbuddy-usage-text",
+								children: signedOutText(notice, t)
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								className: "dsm-workbuddy-usage-account-actions",
+								children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+									type: "button",
+									className: "dsm-btn dsm-btn-outline",
+									disabled: busy,
+									onClick: () => {
+										rescanAccounts();
+									},
+									children: busy ? t("row.accountsScanning") : t("row.accountsRescan")
+								})
+							}),
+							/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+								className: "dsm-workbuddy-pool-tools",
+								children: accountTools
+							}),
+							searched.length > 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SearchedPaths, {
+								items: searched,
+								t
+							}) : null
+						] }) : null,
+						status.status === "error" ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+							className: "dsm-workbuddy-usage-error-block",
+							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+								className: "dsm-workbuddy-usage-error",
+								role: "alert",
+								children: t("row.usageErrorHint", { message: status.message === "" ? t("row.requestFailed") : status.message })
+							}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
+								type: "button",
+								className: "dsm-btn dsm-btn-outline",
+								onClick: () => {
+									statusRetries.current = 0;
+									refreshUsage(activeRegion);
+								},
+								children: t("row.usageRetry")
+							})]
+						}) : null
+					]
+				})
+			});
+			if (pageSurface || settingsSurface) return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
+				className: settingsSurface ? "dsm-workbuddy-page dsm-workbuddy-settings" : "dsm-workbuddy-page",
+				ref: (page) => {
+					if (page !== null) requestAnimationFrame(() => {
+						updateStickyTabs(page);
+					});
+				},
+				onScroll: (event) => {
+					updateStickyTabs(event.currentTarget);
+				},
+				children: [pageHead, /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
+					className: "dsm-workbuddy-page-body",
+					children: cardBody
+				})]
+			});
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("li", {
 				className: `dsm-plugin-card${open ? " dsm-plugin-card-open" : ""}`,
 				children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
@@ -8360,14 +12627,10 @@ window.__ModuleLoader__.load({
 					"aria-expanded": open,
 					"aria-label": `${t(open ? "row.collapse" : "row.expand")}: ${title}`,
 					onClick: () => {
-						setOpen(!open);
+						setCardOpen(!cardOpen);
 					},
 					children: [
-						/* @__PURE__ */ (0, react_jsx_runtime.jsx)("img", {
-							className: "dsm-plugin-card-icon",
-							src: WORKBUDDY_PLUGIN_ICON,
-							alt: ""
-						}),
+						/* @__PURE__ */ (0, react_jsx_runtime.jsx)(PluginIcon, { className: "dsm-plugin-card-icon" }),
 						/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
 							className: "dsm-plugin-card-head",
 							children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
@@ -8386,633 +12649,7 @@ window.__ModuleLoader__.load({
 				}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
 					className: "dsm-plugin-card-body",
 					hidden: !open,
-					children: open ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(CardBodyBoundary, {
-						t,
-						children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-							className: "dsm-workbuddy-usage",
-							children: [
-								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-									className: "dsm-workbuddy-tabs",
-									role: "tablist",
-									"aria-label": title,
-									children: WORKBUDDY_REGIONS.map((region) => {
-										const regionStatus = statusByRegion[region];
-										const regionOnState = regionOn(region);
-										return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-											className: "dsm-workbuddy-tab-cell",
-											children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
-												type: "button",
-												role: "tab",
-												"aria-selected": region === activeRegion,
-												className: `dsm-workbuddy-tab${region === activeRegion ? " dsm-workbuddy-tab-active" : ""}${regionOnState ? "" : " dsm-workbuddy-tab-off"}`,
-												onClick: () => {
-													setActiveRegion(region);
-													setAccountError(void 0);
-												},
-												children: [regionStatus === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-													"aria-hidden": "true",
-													className: "dsm-workbuddy-tab-dot",
-													style: dotStyle(regionStatus.status)
-												}), region === "cn" ? t("row.tabCn") : t("row.tabGlobal")]
-											}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("label", {
-												className: "dsm-workbuddy-tab-switch",
-												title: t("row.tabSwitchHint"),
-												children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
-													type: "checkbox",
-													checked: regionOnState,
-													disabled: togglingRegion === region || !canWrite || saving || poolBusy,
-													"aria-label": t("row.tabSwitchAria", { region: region === "cn" ? t("row.tabCn") : t("row.tabGlobal") }),
-													onChange: (event) => {
-														toggleRegion(region, event.target.checked);
-													}
-												})
-											})]
-										}, region);
-									})
-								}),
-								signedIn ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-									className: "dsm-workbuddy-panels",
-									role: "tablist",
-									"aria-label": t("row.panelAria"),
-									children: [
-										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-											type: "button",
-											role: "tab",
-											id: "dsm-workbuddy-tab-accounts",
-											"aria-controls": "dsm-workbuddy-panel-accounts",
-											"aria-selected": panel === "accounts",
-											className: `dsm-workbuddy-panel-tab${panel === "accounts" ? " dsm-workbuddy-panel-tab-active" : ""}`,
-											onClick: () => {
-												setPanel("accounts");
-											},
-											children: t("row.panelAccounts")
-										}),
-										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-											type: "button",
-											role: "tab",
-											id: "dsm-workbuddy-tab-models",
-											"aria-controls": "dsm-workbuddy-panel-models",
-											"aria-selected": panel === "models",
-											className: `dsm-workbuddy-panel-tab${panel === "models" ? " dsm-workbuddy-panel-tab-active" : ""}`,
-											onClick: () => {
-												setPanel("models");
-											},
-											children: t("row.panelModels")
-										}),
-										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-											type: "button",
-											role: "tab",
-											id: "dsm-workbuddy-tab-capabilities",
-											"aria-controls": "dsm-workbuddy-panel-capabilities",
-											"aria-selected": panel === "capabilities",
-											className: `dsm-workbuddy-panel-tab${panel === "capabilities" ? " dsm-workbuddy-panel-tab-active" : ""}`,
-											onClick: () => {
-												setPanel("capabilities");
-											},
-											children: t("row.panelCapabilities")
-										}),
-										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-											type: "button",
-											role: "tab",
-											id: "dsm-workbuddy-tab-diag",
-											"aria-controls": "dsm-workbuddy-panel-diag",
-											"aria-selected": panel === "diag",
-											className: `dsm-workbuddy-panel-tab${panel === "diag" ? " dsm-workbuddy-panel-tab-active" : ""}`,
-											onClick: () => {
-												setPanel("diag");
-											},
-											children: t("row.panelDiag")
-										})
-									]
-								}) : null,
-								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-									className: "dsm-workbuddy-panel",
-									role: "tabpanel",
-									id: "dsm-workbuddy-panel-accounts",
-									"aria-labelledby": "dsm-workbuddy-tab-accounts",
-									hidden: signedIn && panel !== "accounts",
-									children: [
-										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-											className: "dsm-workbuddy-models-summary",
-											children: t("row.tabHint")
-										}),
-										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-											className: "dsm-workbuddy-models-summary dsm-workbuddy-free-quota-warn",
-											children: t("row.tabFreeQuotaWarn")
-										}),
-										!activeRegionOn ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-											className: "dsm-workbuddy-tab-off-notice",
-											children: t("row.tabOffNotice")
-										}) : null,
-										status.status === "error" || status.status === "signed-in" && status.creditsError !== void 0 ? status.status === "signed-in" && status.credentialRejected === true ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-											className: "dsm-workbuddy-usage-hint",
-											children: t("row.reloginHint")
-										}) : null,
-										accountError === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-											className: "dsm-workbuddy-account-error",
-											role: "alert",
-											children: accountError
-										}),
-										selectionLost ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-											className: "dsm-workbuddy-usage-hint",
-											children: t("row.selectionLostHint")
-										}) : null,
-										status.status === "signed-in" ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
-											status.credentialRejected === true ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("section", {
-												className: "dsm-workbuddy-usage-error",
-												role: "alert",
-												children: [
-													/* @__PURE__ */ (0, react_jsx_runtime.jsx)("strong", { children: t("row.credentialRejectedTitle") }),
-													/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", { children: t("row.credentialRejectedIntro", { accountName: nameOf(status.accountName) }) }),
-													status.recovery?.usableAccount !== void 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", { children: t("row.credentialRejectedSwitch", { accountName: nameOf(status.recovery.usableAccount.accountName) }) }) : status.recovery?.reloginRequired === true ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", { children: t("row.credentialRejectedRelogin") }) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", { children: t("row.credentialRejectedChoose") }),
-													status.recovery?.usableAccount === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-														type: "button",
-														className: "dsm-btn dsm-btn-outline",
-														disabled: switchingAccount || !canWrite,
-														onClick: () => {
-															const target = status.recovery?.usableAccount;
-															if (target !== void 0) switchAccount(target.accountId);
-														},
-														children: switchingAccount ? t("row.accountsScanning") : t("row.credentialRejectedSwitchAction", { accountName: nameOf(status.recovery.usableAccount.accountName) })
-													})
-												]
-											}) : null,
-											status.creditsError === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-												className: "dsm-workbuddy-usage-error",
-												children: t("row.creditsError", { message: status.creditsError })
-											}),
-											status.refreshError === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-												className: "dsm-workbuddy-usage-error",
-												role: "alert",
-												children: t("row.requestFailedHint", { message: status.refreshError })
-											}),
-											/* @__PURE__ */ (0, react_jsx_runtime.jsx)(AccountPool, {
-												t,
-												region: activeRegion,
-												...status.pool === void 0 ? {} : { pool: status.pool },
-												...settingsScope === void 0 ? {} : { settingsScope },
-												onRescan: () => {
-													rescanAccounts();
-												},
-												rescanning: busy,
-												onSelectAccount: (accountId) => {
-													switchAccount(accountId);
-												},
-												selectingAccount: switchingAccount,
-												accountTools,
-												siblingBusy: saving || togglingRegion !== void 0,
-												onBusyChange: setPoolBusy,
-												onSaved: async () => await refreshUsage(activeRegion) !== void 0,
-												onRefresh: () => refreshUsage(activeRegion)
-											})
-										] }) : null
-									]
-								}),
-								signedIn ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-									className: "dsm-workbuddy-panel",
-									role: "tabpanel",
-									id: "dsm-workbuddy-panel-models",
-									"aria-labelledby": "dsm-workbuddy-tab-models",
-									hidden: panel !== "models",
-									children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("section", {
-										className: "dsm-workbuddy-models",
-										"aria-label": t("row.modelsTitle"),
-										children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-											className: "dsm-workbuddy-models-fold",
-											children: [
-												/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-													className: "dsm-workbuddy-models-head",
-													children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-														className: "dsm-workbuddy-models-title-row",
-														children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("h3", {
-															className: "dsm-workbuddy-models-title",
-															children: [t("row.modelsTitle"), dirty ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-																className: "dsm-workbuddy-models-dirty",
-																children: t("row.modelsDirty")
-															}) : null]
-														})
-													}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-														className: "dsm-workbuddy-models-summary",
-														children: t("row.modelsSummary", { count: activeEnabledIds.size })
-													})] }), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-														className: "dsm-workbuddy-models-head-actions",
-														children: [
-															/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-																type: "button",
-																className: "dsm-btn dsm-btn-outline",
-																disabled: busy,
-																onClick: () => {
-																	refreshModels();
-																},
-																children: busy ? t("row.modelsRefreshing") : t("row.modelsRefresh")
-															}),
-															/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-																type: "button",
-																className: "dsm-btn dsm-btn-outline dsm-workbuddy-models-sweep",
-																disabled: busy || sweeping !== void 0 || activeEnabledIds.size === 0,
-																title: t("row.modelsTestEnabledHint"),
-																onClick: sweepEnabledModels,
-																children: sweeping === void 0 ? t("row.modelsTestEnabled") : t("row.modelsTesting", {
-																	done: sweeping.done,
-																	total: sweeping.total
-																})
-															}),
-															/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-																type: "button",
-																className: "dsm-btn dsm-btn-outline dsm-workbuddy-models-sweep",
-																disabled: busy || sweeping !== void 0 || visibleModels.length === 0,
-																title: t("row.modelsTestAllHint"),
-																onClick: sweepAllModels,
-																children: sweeping === void 0 ? t("row.modelsTestAll") : t("row.modelsTesting", {
-																	done: sweeping.done,
-																	total: sweeping.total
-																})
-															}),
-															/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-																type: "button",
-																className: "dsm-btn dsm-btn-outline dsm-workbuddy-models-sweep",
-																disabled: busy || tpsSweeping !== void 0 || tpsBusy || activeEnabledIds.size === 0,
-																title: t("row.tpsSweepEnabledHint"),
-																onClick: sweepTpsEnabledModels,
-																children: tpsSweeping === void 0 ? t("row.tpsSweepEnabled") : t("row.tpsTesting", {
-																	done: tpsSweeping.done,
-																	total: tpsSweeping.total
-																})
-															})
-														]
-													})]
-												}),
-												probeError === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-													className: "dsm-workbuddy-model-probe-result dsm-workbuddy-model-probe-result-bad",
-													role: "alert",
-													children: t("row.probeError", { message: probeError })
-												}),
-												sweepSummary === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-													className: "dsm-workbuddy-models-sweep-summary",
-													role: "status",
-													children: sweepSummary
-												}),
-												/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-													className: "dsm-workbuddy-model-list",
-													children: visibleModels.map((model) => /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-														className: `dsm-workbuddy-model${activeEnabledIds.has(model.id) ? "" : " dsm-workbuddy-model-disabled"}`,
-														children: [
-															/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-																className: "dsm-workbuddy-model-head",
-																children: [
-																	/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
-																		className: "dsm-workbuddy-model-enabled",
-																		children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
-																			type: "checkbox",
-																			checked: activeEnabledIds.has(model.id),
-																			disabled: !canWrite || saving,
-																			onChange: () => {
-																				toggleModel(model.id);
-																			}
-																		}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
-																			className: "dsm-workbuddy-model-copy",
-																			children: [
-																				/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
-																					className: "dsm-workbuddy-model-name",
-																					children: [model.name, effectiveRate(model) === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
-																						className: "dsm-workbuddy-model-name-rate",
-																						children: ["x", effectiveRate(model).toFixed(2)]
-																					})]
-																				}),
-																				promoChip(model),
-																				busyIcon(busyLevels[model.id], uiLanguage())
-																			]
-																		})]
-																	}),
-																	/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
-																		className: "dsm-workbuddy-model-image",
-																		title: imageCheckboxHint(model, t),
-																		children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
-																			type: "checkbox",
-																			checked: activeImageIds.has(model.id),
-																			disabled: !canWrite || saving,
-																			onChange: () => {
-																				toggleImage(model.id);
-																			}
-																		}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("row.modelImage") })]
-																	}),
-																	/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", {
-																		className: `dsm-workbuddy-model-off${offBlocked(model) ? " dsm-workbuddy-model-off-blocked" : ""}`,
-																		title: offBlocked(model) ? t("row.modelOffRefusedHint") : t("row.modelOffHint"),
-																		children: [
-																			/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
-																				type: "checkbox",
-																				checked: activeOffIds.has(model.id),
-																				disabled: !canWrite || saving || offBlocked(model),
-																				onChange: () => {
-																					toggleOff(model.id);
-																				}
-																			}),
-																			/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("row.modelOff") }),
-																			offBlocked(model) ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-																				className: "dsm-workbuddy-model-off-flag",
-																				children: t("row.modelOffRefused")
-																			}) : null
-																		]
-																	}),
-																	/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("fieldset", {
-																		className: "dsm-workbuddy-context-budget",
-																		"aria-label": t("row.contextBudget"),
-																		children: [
-																			model.nativeContextWindow > 2e5 ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
-																				type: "radio",
-																				name: `context-${model.id}`,
-																				checked: (activeContextBudgets[model.id] ?? 2e5) === 2e5,
-																				disabled: !canWrite || saving,
-																				onChange: () => {
-																					setContextBudget(model.id, 2e5);
-																				}
-																			}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: "200K" })] }) : null,
-																			model.nativeContextWindow > 5e5 ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
-																				type: "radio",
-																				name: `context-${model.id}`,
-																				checked: activeContextBudgets[model.id] === 5e5,
-																				disabled: !canWrite || saving,
-																				onChange: () => {
-																					setContextBudget(model.id, 5e5);
-																				}
-																			}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: "500K" })] }) : null,
-																			/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("label", { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("input", {
-																				type: "radio",
-																				name: `context-${model.id}`,
-																				checked: model.nativeContextWindow <= 2e5 || activeContextBudgets[model.id] === model.nativeContextWindow,
-																				disabled: model.nativeContextWindow <= 2e5 || !canWrite || saving,
-																				onChange: () => {
-																					setContextBudget(model.id, model.nativeContextWindow);
-																				}
-																			}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: formatCapacity(model.nativeContextWindow, t("row.modelUnknown")) })] })
-																		]
-																	}),
-																	/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-																		className: "dsm-workbuddy-model-actions-buttons",
-																		children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-																			type: "button",
-																			className: "dsm-btn dsm-btn-outline dsm-workbuddy-model-probe",
-																			disabled: probing[model.id] === true || status.status !== "signed-in",
-																			title: t("row.probeHint"),
-																			onClick: () => {
-																				probeModels([model.id]);
-																			},
-																			children: probing[model.id] === true ? t("row.probing") : t("row.probe")
-																		}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-																			type: "button",
-																			className: "dsm-btn dsm-btn-outline dsm-workbuddy-model-probe",
-																			disabled: tpsProbing[model.id] === true || status.status !== "signed-in",
-																			title: t("row.tpsHint"),
-																			onClick: () => {
-																				measureTpsFor([model.id]);
-																			},
-																			children: tpsProbing[model.id] === true ? t("row.tpsMeasuring") : t("row.tpsMeasure")
-																		})]
-																	})
-																]
-															}),
-															/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-																className: "dsm-workbuddy-model-details",
-																children: /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-																	className: "dsm-workbuddy-model-meta",
-																	children: [
-																		/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("row.modelContext", { context: formatCapacity(model.nativeContextWindow, t("row.modelUnknown")) }) }),
-																		/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("row.modelOutput", { output: formatCapacity(model.maxTokens, t("row.modelUnknown")) }) }),
-																		model.reasoning === void 0 || model.reasoning.supportedEfforts === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: t("row.modelReasoning", { efforts: model.reasoning.supportedEfforts.join(" / ") }) })
-																	]
-																})
-															}),
-															(() => {
-																const result = probes[activeRegion]?.[model.id];
-																if (result === void 0) return null;
-																const view = probeResultView(result, t);
-																const reason = inlineProbeReason(result.outcome, result.message);
-																return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("p", {
-																	className: `dsm-workbuddy-model-probe-result dsm-workbuddy-model-probe-result-${view.tone}`,
-																	role: "status",
-																	...result.message === void 0 ? {} : { title: result.message },
-																	children: [view.text, reason === void 0 ? null : " · " + reason]
-																});
-															})(),
-															(() => {
-																const measured = tpsResults[model.id];
-																if (measured === void 0) return null;
-																const view = tpsResultView(measured, t, tpsMeasuredAt[model.id]);
-																return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-																	className: `dsm-workbuddy-model-probe-result dsm-workbuddy-model-probe-result-${view.tone}`,
-																	role: "status",
-																	children: view.text
-																});
-															})()
-														]
-													}, model.id))
-												}),
-												/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-													className: "dsm-workbuddy-model-capability-note",
-													children: t("row.modelCapabilityPending")
-												}),
-												/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-													className: "dsm-workbuddy-model-actions",
-													children: [
-														/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("a", {
-															className: "dsm-workbuddy-usage-cheer",
-															href: WORKBUDDY_GITHUB_URL,
-															target: "_blank",
-															rel: "noopener noreferrer",
-															children: [t("row.cheer"), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-																className: "dsm-workbuddy-usage-cheer-star",
-																"aria-hidden": "true",
-																children: "★"
-															})]
-														}),
-														saveError === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-															className: "dsm-workbuddy-model-save-error",
-															children: t("row.saveError", { message: saveError })
-														}),
-														/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-															className: "dsm-workbuddy-model-actions-buttons",
-															children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-																type: "button",
-																className: "dsm-btn dsm-btn-outline",
-																disabled: !dirty || saving || poolBusy || togglingRegion !== void 0,
-																onClick: discardModels,
-																children: t("row.discard")
-															}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-																type: "button",
-																className: "dsm-btn dsm-btn-primary",
-																disabled: !dirty || saving || poolBusy || togglingRegion !== void 0 || activeEnabledIds.size === 0,
-																onClick: () => {
-																	saveModels();
-																},
-																children: saving ? t("row.saving") : t("row.save")
-															})]
-														})
-													]
-												})
-											]
-										})
-									})
-								}) : null,
-								/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-									className: "dsm-workbuddy-panel",
-									role: "tabpanel",
-									id: "dsm-workbuddy-panel-capabilities",
-									"aria-labelledby": "dsm-workbuddy-tab-capabilities",
-									hidden: signedIn && panel !== "capabilities",
-									children: [
-										/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-											className: "dsm-workbuddy-panel-note",
-											children: t("row.panelCapabilitiesHint")
-										}),
-										creditPreferences,
-										upstreamSwitches
-									]
-								}),
-								/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-									className: "dsm-workbuddy-panel",
-									role: "tabpanel",
-									id: "dsm-workbuddy-panel-diag",
-									"aria-labelledby": "dsm-workbuddy-tab-diag",
-									hidden: !signedIn || panel !== "diag",
-									children: status.status !== "signed-in" ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-										className: "dsm-workbuddy-diag",
-										children: [
-											/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-												className: "dsm-workbuddy-diag-row",
-												children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-													className: "dsm-workbuddy-diag-label",
-													children: t("row.diagRegion")
-												}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-													className: "dsm-workbuddy-diag-value",
-													children: status.region === "cn" ? t("row.tabCn") : t("row.tabGlobal")
-												})]
-											}),
-											/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-												className: "dsm-workbuddy-diag-row",
-												children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-													className: "dsm-workbuddy-diag-label",
-													children: t("row.diagDomain")
-												}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-													className: "dsm-workbuddy-diag-value dsm-workbuddy-diag-mono",
-													children: status.domain === void 0 || status.domain === "" ? t("row.modelUnknown") : status.domain
-												})]
-											}),
-											/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-												className: "dsm-workbuddy-diag-row",
-												children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-													className: "dsm-workbuddy-diag-label",
-													children: t("row.diagAccount")
-												}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-													className: "dsm-workbuddy-diag-value",
-													children: nameOf(status.accountName)
-												})]
-											}),
-											/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-												className: "dsm-workbuddy-diag-row",
-												children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-													className: "dsm-workbuddy-diag-label",
-													children: t("row.diagToken")
-												}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-													className: "dsm-workbuddy-diag-value dsm-workbuddy-diag-mono",
-													children: formatDate(status.tokenExpiresAtMs)
-												})]
-											}),
-											/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-												className: "dsm-workbuddy-diag-row",
-												children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-													className: "dsm-workbuddy-diag-label",
-													children: t("row.diagCatalog")
-												}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-													className: "dsm-workbuddy-diag-value",
-													children: formatNumber(status.models.length)
-												})]
-											}),
-											/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-												className: "dsm-workbuddy-diag-row",
-												children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-													className: "dsm-workbuddy-diag-label",
-													children: t("row.diagEnabled")
-												}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-													className: "dsm-workbuddy-diag-value",
-													children: formatNumber(status.enabledModelIds.length)
-												})]
-											}),
-											/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-												className: "dsm-workbuddy-diag-row",
-												children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-													className: "dsm-workbuddy-diag-label",
-													children: t("row.diagPool")
-												}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-													className: "dsm-workbuddy-diag-value",
-													children: status.pool?.enabled === true ? t("row.diagPoolOn", { count: status.pool.accounts.length }) : t("row.diagPoolOff")
-												})]
-											}),
-											/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("div", {
-												className: "dsm-workbuddy-diag-row",
-												children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-													className: "dsm-workbuddy-diag-label",
-													children: t("row.diagFailures")
-												}), (() => {
-													const failures = [];
-													if (status.credentialRejected === true) failures.push(t("row.credentialRejectedTitle"));
-													if (status.refreshError !== void 0) failures.push(status.refreshError);
-													if (status.creditsError !== void 0) failures.push(status.creditsError);
-													const unreadable = status.models.reduce((count, model) => count + (model.promos ?? []).filter((promo) => promo.schedule?.dailyUnusable === true).length, 0);
-													if (unreadable > 0) failures.push(t("row.diagPromoUnreadable", { count: unreadable }));
-													return failures.length === 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-														className: "dsm-workbuddy-diag-value",
-														children: t("row.diagNoFailures")
-													}) : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
-														className: "dsm-workbuddy-diag-value dsm-workbuddy-diag-bad dsm-workbuddy-diag-mono",
-														children: failures.join(" · ")
-													});
-												})()]
-											})
-										]
-									}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-										className: "dsm-workbuddy-diag-hint",
-										children: t("row.diagHint")
-									})] })
-								}),
-								status.status === "signed-out" && loading ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-									className: "dsm-workbuddy-usage-text",
-									role: "status",
-									children: t("row.accountsLoading")
-								}) : null,
-								status.status === "signed-out" && !loading ? /* @__PURE__ */ (0, react_jsx_runtime.jsxs)(react_jsx_runtime.Fragment, { children: [
-									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-										className: "dsm-workbuddy-usage-text",
-										children: signedOutText(notice, t)
-									}),
-									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-										className: "dsm-workbuddy-usage-account-actions",
-										children: /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-											type: "button",
-											className: "dsm-btn dsm-btn-outline",
-											disabled: busy,
-											onClick: () => {
-												rescanAccounts();
-											},
-											children: busy ? t("row.accountsScanning") : t("row.accountsRescan")
-										})
-									}),
-									/* @__PURE__ */ (0, react_jsx_runtime.jsx)("div", {
-										className: "dsm-workbuddy-pool-tools",
-										children: accountTools
-									}),
-									searched.length > 0 ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)(SearchedPaths, {
-										items: searched,
-										t
-									}) : null
-								] }) : null,
-								status.status === "error" ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
-									className: "dsm-workbuddy-usage-error",
-									children: status.message
-								}) : null
-							]
-						})
-					}) : null
+					children: open ? cardBody : null
 				})]
 			});
 		}
@@ -9173,7 +12810,8 @@ window.__ModuleLoader__.load({
 		//#endregion
 		//#region src/client/ComposerCredits.tsx
 		/**
-		* Credit readout for the composer tool row (`conversation.input.left`).
+		* Credit readout for the composer row (`conversation.input.right`, rendered
+		* immediately before the model picker).
 		*
 		* 参考：dingminhua/dsh-connect-trae（MIT，Copyright (c) 2026 LaoDing）
 		*   — 该项目的 `client/ComposerPoints.tsx`：读数形态（`<区域> · <余额>`）、
@@ -9228,28 +12866,6 @@ window.__ModuleLoader__.load({
 		* seconds, and each read is a read-only upstream call.
 		*/
 		const COMPOSER_CREDITS_REFRESH_INTERVAL_MS = 3e5;
-		/**
-		* Refresh period for the panel's per-account table, while it stays open.
-		*
-		* Deliberately NOT the readout's five minutes. The table carries two things,
-		* and the faster-moving one decides the cadence:
-		*
-		*  - the balance, which barely moves, and
-		*  - each account's `excludedBy` ("被限流" / "模型繁忙"), which is derived from
-		*    the pool's own cooldowns — and the SHORTEST of those is the model-scoped
-		*    two-minute throttle (`MODEL_BUSY_COOLDOWN_MS`).
-		*
-		* At five minutes the table could state an account is 模型繁忙 long after the
-		* upstream let it serve again, and the pool card — which polls every 60 s
-		* (`POLL_INTERVAL_MS` in `WorkBuddyCard.tsx`) — would say it is fine at the same
-		* moment. Two surfaces disagreeing about one account is exactly the complaint
-		* this constant answers, so the table now converges on the card's cadence
-		* instead of its own.
-		*
-		* The cost is bounded and paid only while the panel is open: one `fetchCredits`
-		* per account per minute, the same read the card already makes when it is open.
-		*/
-		const COMPOSER_ACCOUNT_REFRESH_INTERVAL_MS = 6e4;
 		/**
 		* Provider routes whose credit balance this readout can show, mapped to the
 		* region to read it from.
@@ -9308,8 +12924,36 @@ window.__ModuleLoader__.load({
 			const value = usage.showCreditsInMainUi;
 			return typeof value === "boolean" ? value : void 0;
 		}
+		/**
+		* Whether this region's usage document allows the "· N 新模型" segment.
+		*
+		* OPT-IN, so this is the mirror image of {@link hostCreditsShownOf}: absent
+		* means NO. "New" means first seen by this machine, not newly listed upstream,
+		* so on a fresh install it would announce the entire roster — a number that is
+		* true by construction and reads as a defect. See `showNewModelsInMainUi` in the
+		* schema for the full argument.
+		*
+		* The `error` variant answers `false` rather than `undefined`: with no document
+		* there is no roster, hence no new models, hence nothing to announce anyway.
+		*/
+		function hostNewModelsShownOf(usage) {
+			if (usage === void 0 || usage.status === "error") return false;
+			return usage.showNewModelsInMainUi === true;
+		}
+		/**
+		* A same-day instant, as the READER's locale writes it.
+		*
+		* The locale is `undefined` — the reader's, not a fixed one — so an English UI
+		* shows `11:59 PM` rather than the Chinese convention's `23:59`. It used to
+		* hardcode `'zh-CN'`, which meant the English interface printed a Chinese-style
+		* time. Ported from dsh-connect-trae (issue #71).
+		*
+		* Only for instants that are the same day as the reader: a bare clock time on
+		* a timestamp from another day is a different question (and a different
+		* design), which is why this is not reused for anything but "now".
+		*/
 		function formatClock(value) {
-			return new Date(value).toLocaleTimeString("zh-CN", {
+			return new Date(value).toLocaleTimeString(void 0, {
 				hour: "2-digit",
 				minute: "2-digit"
 			});
@@ -9366,26 +13010,49 @@ window.__ModuleLoader__.load({
 			return kept.length === 0 ? void 0 : kept.join(" · ");
 		}
 		function ComposerCredits(props) {
-			const { t, provider, region, settingsScope } = props;
+			const { t, provider, region, settingsScope, onOpenSettings } = props;
 			if (t === void 0) throw new Error("Composer credits readout requires its translation function");
 			const owned = provider === void 0 ? void 0 : WORKBUDDY_COMPOSER_PROVIDERS[provider];
 			const activeRegion = region ?? owned;
 			const [usage, setUsage] = (0, react.useState)(void 0);
+			/**
+			* The refresh cadence, taken from the SAME document the card polls.
+			*
+			* The panel used to hold its own 60s constant, and that was the whole reason
+			* the two surfaces could contradict each other about one account: the card
+			* re-ranked every minute while a panel opened at a different cadence drew a
+			* frozen verdict. Sharing the Host's value means there is one cadence to
+			* reason about, and changing it in the card changes it here too.
+			*
+			* An absent value (the panel opened before any document landed) falls back to
+			* the same default the Host uses, so the first timer is never armed at 0.
+			*/
+			const refreshIntervalMs = (() => {
+				const raw = usage !== void 0 && "pollIntervalMs" in usage ? usage.pollIntervalMs : void 0;
+				return typeof raw === "number" && WORKBUDDY_POLL_INTERVALS_MS.includes(raw) ? raw : WORKBUDDY_DEFAULT_POLL_INTERVAL_MS;
+			})();
 			const [accountCredits, setAccountCredits] = (0, react.useState)(void 0);
-			const [busy, setBusy] = (0, react.useState)(false);
+			const [switchingId, setSwitchingId] = (0, react.useState)(void 0);
 			/**
 			* A test batch is running.
 			*
-			* Separate from `busy`, which tracks a credits READ: the two take wildly
-			* different times (one round trip against one probe per account, serial with
-			* a gap), and sharing a flag would either freeze the readout for a minute or
+			* Its OWN flag, not shared with `failed`/`inFlight`: a batch is one serial
+			* probe per account (a minute for a big pool) while a credits read is one
+			* round trip. Sharing a flag would either freeze the readout for a minute or
 			* let a press be swallowed as "already refreshing".
 			*/
 			const [testing, setTesting] = (0, react.useState)(false);
 			/** The batch's failure, in the user's language; `failed` is for reads. */
 			const [testError, setTestError] = (0, react.useState)(void 0);
-			const [switchingId, setSwitchingId] = (0, react.useState)(void 0);
 			const [failed, setFailed] = (0, react.useState)(false);
+			/**
+			* The full-page button could not reach the page on this host.
+			*
+			* Its own flag, not `failed`, because the two render DIFFERENT sentences: this
+			* one says the host offers no route to the page, which is not the same claim as
+			* "the credits read failed", and sharing a flag would print one over the other.
+			*/
+			const [settingsFailed, setSettingsFailed] = (0, react.useState)(false);
 			const [lastRefresh, setLastRefresh] = (0, react.useState)(void 0);
 			const [open, setOpen] = (0, react.useState)(false);
 			const inFlight = (0, react.useRef)(false);
@@ -9446,7 +13113,6 @@ window.__ModuleLoader__.load({
 			const fetchUsage = (0, react.useCallback)(async (signal) => {
 				if (inFlight.current || activeRegion === void 0) return;
 				inFlight.current = true;
-				if (mounted.current) setBusy(true);
 				try {
 					const response = await fetch(withWorkBuddyRegion(WORKBUDDY_USAGE_PATH, activeRegion), {
 						headers: { accept: "application/json" },
@@ -9463,7 +13129,6 @@ window.__ModuleLoader__.load({
 					if (mounted.current && signal?.aborted !== true) setFailed(true);
 				} finally {
 					inFlight.current = false;
-					if (mounted.current) setBusy(false);
 				}
 			}, [activeRegion]);
 			/**
@@ -9560,7 +13225,7 @@ window.__ModuleLoader__.load({
 					if (cancelled) return;
 					timer = window.setInterval(() => {
 						fetchAccountCredits(controller.signal);
-					}, COMPOSER_ACCOUNT_REFRESH_INTERVAL_MS);
+					}, refreshIntervalMs);
 				});
 				return () => {
 					cancelled = true;
@@ -9570,7 +13235,8 @@ window.__ModuleLoader__.load({
 			}, [
 				open,
 				activeRegion,
-				fetchAccountCredits
+				fetchAccountCredits,
+				refreshIntervalMs
 			]);
 			(0, react.useEffect)(() => {
 				if (!open) return void 0;
@@ -9608,31 +13274,28 @@ window.__ModuleLoader__.load({
 				}
 			};
 			/**
-			* The header button: test EVERY account in this region, then re-read what the
-			* batch changed.
+			* The header's REFRESH control: probe every account in this region.
 			*
-			* It used to be a plain refresh. The owner asked for the other thing this
-			* panel's readers actually want — the same "一键测试所有账号" the pool card
-			* runs (`src/account-pool-run.ts testAllAccounts`, one account at a time with
-			* a gap, because hitting the whole pool at once is how the upstream's volume
-			* limit gets tripped).
+			* Named for the reader's outcome (this table, brought up to date) while the
+			* work underneath is a probe batch. The distinction is not cosmetic: "refresh"
+			* sounds like a free re-read of what the Host already knows, and what the Host
+			* already knows is exactly the stale measurement we are trying to replace. The
+			* hint says "probes each account" so the cost is not a surprise.
 			*
-			* Two reasons the batch, not a read, is the right control HERE. A mark in this
-			* table is a MEASUREMENT (`被限流 · 约 6 小时后` is a probe result), and
-			* re-reading the usage document cannot improve a stale measurement — only
-			* running it again can. And the rows are the pool's members, so the question
-			* "which of these can serve?" is answered by testing them, not by asking the
-			* credits endpoint again.
+			* THE ROW COLOURS ARE WHAT THIS PRODUCES. The dots and the "被限流 · 约 N 小时后"
+			* lines in the table are not read from the upstream on every poll — they are
+			* the last MEASUREMENT the Host persisted. Until something probes an account,
+			* there is nothing to report and every row looks usable. That is why this
+			* lives beside the settings control rather than in the pool card alone: this
+			* table is where the reader sees the state, so this is where the question "is
+			* this still true?" gets asked.
 			*
-			* The re-read afterwards is not a courtesy: the probes live in the USAGE
-			* document (`usage.pool.accounts[].probe`), so the dots and marks only move
-			* once that document is fetched again. Without it the button would leave the
-			* table showing the state it just measured away.
-			*
-			* The batch answers NDJSON (one line per account, streamed) on a current Host
-			* and one document on an older one, so both shapes are read; the stream is
-			* drained even after unmount, because dropping the reader leaves the Host
-			* writing into a socket nobody reads.
+			* The batch is SERIAL on the Host (one probe per account, with a gap), so it
+			* streams NDJSON and each row is folded in the moment it lands. Waiting for
+			* the whole stream would leave the row the user is watching wrong for as long
+			* as the SLOWEST account takes — the dead-looking panel the streamed shape
+			* exists to avoid. The re-read in `finally` then confirms the same facts from
+			* the Host's own store, so the fold is a shortcut, never the record.
 			*/
 			const testEveryAccount = (0, react.useCallback)(async () => {
 				if (activeRegion === void 0 || testingRef.current) return;
@@ -9675,7 +13338,7 @@ window.__ModuleLoader__.load({
 					}
 					if (mounted.current && failure !== void 0) setTestError(failure);
 				} catch {
-					if (mounted.current) setTestError(t("composer.testFailed"));
+					if (mounted.current) setTestError(t("composer.refreshAccountsFailed"));
 				} finally {
 					testingRef.current = false;
 					if (mounted.current) setTesting(false);
@@ -9687,6 +13350,29 @@ window.__ModuleLoader__.load({
 				fetchAccountCredits,
 				t
 			]);
+			/**
+			* The header's page control: open this plugin's full page, then close.
+			*
+			* CLOSING IS PART OF THE JOB. The panel is portaled to `document.body` and
+			* floats over the composer; navigating the centre column does not remove it, so
+			* leaving it open would park a credits table on top of the page the user just
+			* asked for. It is not reopened on return — a popover that comes back by itself
+			* after navigation is a popover the user cannot get rid of.
+			*
+			* `false` (no route on this host) sets the panel's own error line rather than
+			* doing nothing: a press that changes nothing on screen is indistinguishable
+			* from a broken button, and the honest answer here is "this host has no way
+			* there".
+			*/
+			const openSettings = () => {
+				if (!(onOpenSettings === void 0 ? false : onOpenSettings())) {
+					setFailed(false);
+					setSettingsFailed(true);
+					return;
+				}
+				setSettingsFailed(false);
+				setOpen(false);
+			};
 			if (owned === void 0) return null;
 			/**
 			* The Host's own answer for this region, when the document carries one.
@@ -9709,9 +13395,10 @@ window.__ModuleLoader__.load({
 			const signedOut = usage !== void 0 && usage.status === "signed-out";
 			const valueText = total === void 0 ? "—" : formatCredits(total);
 			const label = t(activeRegion === "cn" ? "composer.pointsCn" : "composer.pointsGlobal");
-			const newModelNames = newModelIdsOf(usage).map((id) => modelNameOf(signedIn?.models ?? [], id));
+			const newModelsShown = hostNewModelsShownOf(usage);
+			const newModelNames = (newModelsShown ? newModelIdsOf(usage) : []).map((id) => modelNameOf(signedIn?.models ?? [], id));
 			const newModelTooltip = newModelNames.length === 0 ? void 0 : `${t("composer.newModelsTitle")}${newModelNames.slice(0, 3).join(t("composer.newModelsSep"))}${newModelNames.length > 3 ? "…" : ""}`;
-			const rosterSeenNote = signedIn?.rosterSeenVersionNote;
+			const rosterSeenNote = newModelsShown ? signedIn?.rosterSeenVersionNote : void 0;
 			/**
 			* The table's rows: every account in this region, with its balance.
 			*
@@ -9787,16 +13474,81 @@ window.__ModuleLoader__.load({
 								children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
 									className: "dsm-workbuddy-composer-panel-title",
 									children: t(activeRegion === "cn" ? "composer.panelTitleCn" : "composer.panelTitleGlobal")
-								}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("button", {
-									type: "button",
-									className: "dsm-workbuddy-composer-panel-refresh",
-									disabled: busy || testing || switchingId !== void 0,
-									title: t("composer.testAllHint"),
-									onClick: () => {
-										testEveryAccount();
-									},
-									children: testing ? t("composer.testing") : t("composer.testAll")
+								}), /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+									className: "dsm-workbuddy-composer-panel-actions",
+									children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+										type: "button",
+										className: "dsm-workbuddy-composer-panel-refresh",
+										disabled: testing || switchingId !== void 0,
+										title: t("composer.refreshHint"),
+										"aria-label": t("composer.refreshHint"),
+										onClick: () => {
+											testEveryAccount();
+										},
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("svg", {
+											className: testing ? "dsm-workbuddy-composer-panel-refresh-icon dsm-workbuddy-composer-panel-refresh-icon-spin" : "dsm-workbuddy-composer-panel-refresh-icon",
+											viewBox: "0 0 16 16",
+											width: "12",
+											height: "12",
+											fill: "none",
+											"aria-hidden": "true",
+											focusable: "false",
+											children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("path", {
+												d: "M13.3 8a5.3 5.3 0 1 1-1.55-3.75",
+												stroke: "currentColor",
+												strokeWidth: "1.5",
+												strokeLinecap: "round"
+											}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("path", {
+												d: "M13.4 2.2v2.9h-2.9",
+												stroke: "currentColor",
+												strokeWidth: "1.5",
+												strokeLinecap: "round",
+												strokeLinejoin: "round"
+											})]
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-composer-panel-refresh-label",
+											children: testing ? t("composer.refreshing") : t("composer.refresh")
+										})]
+									}), onOpenSettings === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("button", {
+										type: "button",
+										className: "dsm-workbuddy-composer-panel-settings",
+										title: t("composer.openSettingsHint"),
+										onClick: openSettings,
+										children: [/* @__PURE__ */ (0, react_jsx_runtime.jsxs)("svg", {
+											className: "dsm-workbuddy-composer-panel-settings-icon",
+											viewBox: "0 0 16 16",
+											width: "12",
+											height: "12",
+											fill: "none",
+											"aria-hidden": "true",
+											focusable: "false",
+											children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("path", {
+												d: "M8 10.2a2.2 2.2 0 1 0 0-4.4 2.2 2.2 0 0 0 0 4.4Z",
+												stroke: "currentColor",
+												strokeWidth: "1.5"
+											}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("path", {
+												d: "M12.9 9.6a1.2 1.2 0 0 0 .24 1.32l.04.04a1.4 1.4 0 1 1-1.98 1.98l-.04-.04a1.2 1.2 0 0 0-1.32-.24 1.2 1.2 0 0 0-.72 1.1v.12a1.4 1.4 0 1 1-2.8 0v-.07a1.2 1.2 0 0 0-.78-1.1 1.2 1.2 0 0 0-1.32.24l-.04.04a1.4 1.4 0 1 1-1.98-1.98l.04-.04a1.2 1.2 0 0 0 .24-1.32 1.2 1.2 0 0 0-1.1-.72h-.12a1.4 1.4 0 1 1 0-2.8h.07a1.2 1.2 0 0 0 1.1-.78 1.2 1.2 0 0 0-.24-1.32l-.04-.04a1.4 1.4 0 1 1 1.98-1.98l.04.04a1.2 1.2 0 0 0 1.32.24h.05a1.2 1.2 0 0 0 .72-1.1v-.12a1.4 1.4 0 1 1 2.8 0v.07a1.2 1.2 0 0 0 .72 1.1 1.2 1.2 0 0 0 1.32-.24l.04-.04a1.4 1.4 0 1 1 1.98 1.98l-.04.04a1.2 1.2 0 0 0-.24 1.32v.05a1.2 1.2 0 0 0 1.1.72h.12a1.4 1.4 0 1 1 0 2.8h-.07a1.2 1.2 0 0 0-1.1.72Z",
+												stroke: "currentColor",
+												strokeWidth: "1.5",
+												strokeLinecap: "round",
+												strokeLinejoin: "round"
+											})]
+										}), /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+											className: "dsm-workbuddy-composer-panel-settings-label",
+											children: t("composer.openSettings")
+										})]
+									})]
 								})]
+							}),
+							settingsFailed ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+								className: "dsm-workbuddy-composer-panel-error",
+								role: "status",
+								children: t("composer.openSettingsFailed")
+							}) : null,
+							testError === void 0 ? null : /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
+								className: "dsm-workbuddy-composer-panel-error",
+								role: "status",
+								children: testError
 							}),
 							signedOut ? /* @__PURE__ */ (0, react_jsx_runtime.jsx)("p", {
 								className: "dsm-workbuddy-composer-panel-empty",
@@ -10005,7 +13757,7 @@ window.__ModuleLoader__.load({
 			return region;
 		}
 		function ComposerCreditsGate(props) {
-			const { t, position, settingsScope, useProjection } = props;
+			const { t, position, settingsScope, useProjection, onOpenSettings } = props;
 			const [, setRevision] = (0, react.useState)(0);
 			(0, react.useEffect)(() => settingsScope?.subscribe(() => {
 				setRevision((value) => value + 1);
@@ -10019,7 +13771,8 @@ window.__ModuleLoader__.load({
 				t,
 				provider,
 				region,
-				...settingsScope === void 0 ? {} : { settingsScope }
+				...settingsScope === void 0 ? {} : { settingsScope },
+				...onOpenSettings === void 0 ? {} : { onOpenSettings }
 			});
 		}
 		//#endregion
@@ -10065,19 +13818,38 @@ window.__ModuleLoader__.load({
 		* the text and render the addition beside it, so this component returns the
 		* name first and never replaces it.
 		*
-		* FOR A PROVIDER THAT IS NOT OURS IT RENDERS THE PLAIN CATALOG NAME — not
-		* nothing. The distinction is not cosmetic: this slot is `kind: "single"`, so
-		* whatever registers becomes the cell's only occupant, and an occupant that
-		* outputs plain text still occupies it. A previous version of this paragraph
-		* said the component "renders nothing at all" for a foreign provider, which
-		* made the lost-decoration cost look harmless; issue #138 is what that
-		* mis-description looks like from the outside (the host's own 1017 badge
-		* disappears on ITS rows while this plugin holds the cell). Returning `null`
-		* would not free the cell either — occupancy is decided by registration, never
-		* by what the component outputs.
+		* FOR A PROVIDER THAT IS NOT OURS IT RENDERS THE CATALOG NAME PLUS THAT MODEL'S
+		* OWN `badge` — never another plugin's component. The name half is not
+		* cosmetic: this slot is `kind: "single"`, so whatever registers becomes the
+		* cell's only occupant, and an occupant that outputs plain text still occupies
+		* it. A previous version of this paragraph said the component "renders nothing
+		* at all" for a foreign provider, which made the lost-decoration cost look
+		* harmless; issue #138 is what that mis-description looks like from the outside
+		* (the host's own 1017 badge disappears on ITS rows while this plugin holds the
+		* cell). Returning `null` would not free the cell either — occupancy is decided
+		* by registration, never by what the component outputs.
+		*
+		* THE `badge` HALF IS WHAT MAKES SIBLING CHIPS SURVIVE. The host runs its own
+		* badge fallback only when the cell has NO occupant, so once this plugin wins the
+		* cell it must draw a sibling's badge itself or that badge is never drawn
+		* anywhere. The data is `props.model.badge` — the host's catalog field, which
+		* arrives here regardless of who published it — so this is not the coordination
+		* `docs/DESIGN.md` §零 rules out: no ledger is read, no foreign component is
+		* rendered, and the output does not change based on which plugins are installed.
+		* See `HostBadgeChip` and `docs/MODEL-LABEL-SPEC.md`.
 		*/
 		/** The provider ids this plugin registers, and the region each one serves. */
 		const PROVIDER_REGIONS = /* @__PURE__ */ new Map([["workbuddy", "cn"], ["workbuddy-global", "global"]]);
+		/**
+		* Every provider id this plugin owns, as a list.
+		*
+		* Exported because on a `keyed` host the label seat is one registration PER
+		* provider id — the registration side needs the same list the component uses to
+		* decide "is this row mine", and two copies of it would drift. Order is
+		* irrelevant to the registry (each id is its own cell); it is stable so the
+		* diagnostics line reads the same on every boot.
+		*/
+		const WORKBUDDY_PROVIDER_IDS = [...PROVIDER_REGIONS.keys()];
 		/**
 		* The region a provider id serves, or `undefined` for a provider that is not
 		* this plugin's.
@@ -10112,6 +13884,7 @@ window.__ModuleLoader__.load({
 				});
 				if (!response.ok) return void 0;
 				const body = await response.json();
+				const showNewModels = body.showNewModelsInMainUi === true;
 				const promos = {};
 				const rates = {};
 				for (const model of body.models ?? []) {
@@ -10122,7 +13895,7 @@ window.__ModuleLoader__.load({
 					levels: body.busyLevels ?? {},
 					promos,
 					rates,
-					newModelIds: normalizeNewModelIds(body.newModelIds)
+					newModelIds: showNewModels ? normalizeNewModelIds(body.newModelIds) : []
 				};
 				caches.set(region, {
 					snapshot,
@@ -10212,6 +13985,120 @@ window.__ModuleLoader__.load({
 			});
 		}
 		/**
+		* The one line a foreign badge shows, in the reader's language.
+		*
+		* Mirrors the host's own resolver (`ctx.locale.resolveText`): a plain string is
+		* used verbatim; a table is looked up by the full lowercase tag, then its base
+		* tag (`de-DE` → `de`), then `en`, which the contract requires. The host treats
+		* an EMPTY string as a translation that exists, so this function deliberately
+		* goes one step further and treats it as absent — a blank chip is a decoration
+		* that says nothing, and this component would rather draw the bare name.
+		*
+		* @param text - The badge's literal or its translation table.
+		* @returns The line to draw, or `undefined` when nothing readable is left.
+		*/
+		function resolveHostBadgeText(text) {
+			if (typeof text === "string") return text.trim() === "" ? void 0 : text;
+			if (text === null || typeof text !== "object") return void 0;
+			const language = uiLanguage().toLowerCase();
+			const base = language.split("-")[0] ?? "";
+			const picked = text[language] ?? (base === "" ? void 0 : text[base]) ?? text.en;
+			if (typeof picked !== "string" || picked.trim() === "") return void 0;
+			return picked;
+		}
+		/**
+		* The tone palette, mapped onto the tokens the host's own `Tag` paints.
+		*
+		* WHY THESE EXACT TOKENS. They are read off the host's `Tag.module.css`
+		* (0.2.2-rc.1), not invented: `info` rides `state-business-primary` (NOT
+		* `brand-primary`) and `warning` rides `state-warn-primary` (NOT
+		* `state-warn-secondary`). Getting either wrong leaves two chips in one row
+		* that are supposed to look identical and do not.
+		*
+		* `neutral` is the fallback for an unknown tone: the host's `Tag` would render
+		* such a chip unstyled, which reads as a rendering bug next to a real one.
+		*/
+		const HOST_BADGE_TONES = {
+			neutral: {
+				color: "var(--dsw-alias-label-secondary)",
+				background: "var(--dsw-alias-bg-module-platform)"
+			},
+			info: {
+				color: "var(--dsw-alias-state-business-primary)",
+				background: "color-mix(in srgb, var(--dsw-alias-state-business-primary) 10%, transparent)"
+			},
+			success: {
+				color: "var(--dsw-alias-state-success-primary)",
+				background: "color-mix(in srgb, var(--dsw-alias-state-success-primary) 10%, transparent)"
+			},
+			warning: {
+				color: "var(--dsw-alias-state-warn-primary)",
+				background: "color-mix(in srgb, var(--dsw-alias-state-warn-primary) 12%, transparent)"
+			}
+		};
+		/**
+		* A badge another provider published for its own model, drawn where the host's
+		* own fallback would have drawn it.
+		*
+		* WHY THIS PLUGIN DRAWS IT AT ALL. `conversation.input.model.label` is a
+		* `single` slot, so this component is called for EVERY provider's rows, not just
+		* its own. The host only runs its own badge fallback when the cell has no
+		* occupant at all, so without this branch a sibling plugin's badge would never
+		* appear anywhere while this plugin holds the cell.
+		*
+		* WHY IT IS NOT INTER-PLUGIN COORDINATION (`docs/DESIGN.md` §零). The data is
+		* `props.model.badge` — the host's catalog field, handed to every occupant of
+		* the cell. This component does not know which plugin filled it, does not read
+		* the slot ledger, does not render another plugin's component, and its output is
+		* identical whether or not any sibling is installed. Data flows one way through
+		* the host; there is no channel between plugins. That is the difference between
+		* this and §零's rejected "copy the host's 1017 badge", which hard-codes one
+		* specific plugin's conditions and styles.
+		*
+		* NOT A FETCH, NOT A TIMER. A picker can show twenty foreign rows at once, so
+		* this must stay a pure function of its props.
+		*
+		* NO `placement` PARAMETER, DELIBERATELY. The chip is always drawn AFTER the
+		* name now, so where it goes is the caller's one-line decision, not something
+		* this function needs to know. It used to take `placement` and ignore it, which
+		* read as though a placement-dependent rule existed inside the chip.
+		*
+		* @param props - The badge to draw.
+		* @returns The chip, or `undefined` when there is nothing readable to draw.
+		*/
+		function HostBadgeChip(props) {
+			const badge = props.badge;
+			if (badge === null || typeof badge !== "object") return void 0;
+			const label = resolveHostBadgeText(badge.text);
+			if (label === void 0) return void 0;
+			const tone = Object.hasOwn(HOST_BADGE_TONES, badge.tone) ? HOST_BADGE_TONES[badge.tone] : HOST_BADGE_TONES.neutral;
+			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", {
+				className: "dsm-workbuddy-model-label-host-badge",
+				title: label,
+				style: {
+					color: tone.color,
+					background: tone.background
+				},
+				children: label
+			});
+		}
+		/**
+		* Whether a model's badge will actually draw something.
+		*
+		* The caller needs this BEFORE it decides on the separator: `<HostBadgeChip/>`
+		* is always an element, so rendering `{chip} {name}` and then finding the chip
+		* empty leaves a trailing space on the row. Deciding from the text is the only
+		* way to know, which is why the resolution is exported rather than duplicated.
+		*
+		* @param badge - The catalog badge, if any.
+		* @returns Whether a chip will be drawn.
+		*/
+		function hasDrawableBadge(badge) {
+			const candidate = badge;
+			if (candidate === null || typeof candidate !== "object") return false;
+			return resolveHostBadgeText(candidate.text) !== void 0;
+		}
+		/**
 		* The priority this plugin registers the model-label slot at.
 		*
 		* WHY A DISTINCT PRIORITY AT ALL. `conversation.input.model.label` is a
@@ -10231,24 +14118,83 @@ window.__ModuleLoader__.load({
 		* WHY NOT `-1`. That is `dsh-connect-qoder`'s slot priority, and two plugins on
 		* one priority collide for exactly the same reason `0` did.
 		*
-		* WHY `-0.5` IS SAFE AND SELF-CONTAINED. The value only has to be distinct from
-		* whatever else claims the cell; `-0.5` is legal, sorts without collision
-		* against both `-1` and `0`, and requires knowing nothing about the other
-		* plugins. See the "不做插件联动" invariant in `docs/DESIGN.md`.
+		* WHY `-0.5` WAS TOO HIGH — the measured defect. `-0.5` is legal and collides
+		* with nothing, but "distinct from everyone" is NOT the same as "wins", and this
+		* cell only renders its LOWEST priority. `-0.5` sits ABOVE two contributors that
+		* were present in the same profile:
+		*
+		*     dsh-connect-qoder   -1
+		*     dsh-connect-trae    -0.25
+		*     this plugin         -0.5   ← lost to qoder, so this component never ran
+		*
+		* Losing is silent by construction: the winner renders, the loser is simply not
+		* called. The symptom is exactly "the picker shows no badges", with correct
+		* data, a correct component and no error anywhere — which is what made this cost
+		* several rounds to find. The rows still showed `Hy4 · x0.00` because that
+		* string is the catalog `model.name` the WINNER drew, not our label.
+		*
+		* WHY `-105`. The value has to be BELOW every plausible claimant, not merely
+		* different from the ones visible today. That is the whole lesson: `-0.5` was
+		* chosen to be DISTINCT, was distinct, and still lost. Contributors already
+		* shipped at `-10` (`dsh-model-picker-brand`, a label decorator) and `-1`
+		* (`dsh-connect-qoder`), so anything in the single digits is a value someone
+		* else can step under. `-105` is an ordinary number to the sort (no range is
+		* reserved) and makes the ordering a decision of this plugin rather than a race
+		* it keeps losing.
+		*
+		* WHY NOT `-100` — MEASURED, TWICE. `-100` won for a while, then two other
+		* connectors moved underneath it in the same profile:
+		*
+		*     dsh-connect-qoder   -1   → -101
+		*     dsh-connect-trae    -0.25 → -102
+		*     this plugin         -100 → lost to both
+		*
+		* Both of them wrote THIS constant into their own source comments while doing
+		* it, which is the clearest evidence that the cell is a contest and not a
+		* composed surface: each new connector reads the others' shipped values and
+		* steps under the lowest one. `-105` keeps a small gap below `-102` rather than
+		* a huge one, so the next connector that wants the cell has to say so
+		* explicitly too.
+		*
+		* THE COST, STATED PLAINLY. Winning here is not free: in `single` semantics the
+		* winner draws EVERY row, so trae's and qoder's chips would disappear from the
+		* picker exactly as ours did. What closes that gap is NOT a priority choice — it
+		* is `HostBadgeChip` below: a sibling plugin publishes its badge in ITS
+		* `adapter.listModels()`, the host carries it in the catalog, and this component
+		* reproduces it on that plugin's rows. Every connector that adopts that channel
+		* keeps its chip whichever of them wins the cell (`docs/MODEL-LABEL-SPEC.md`).
+		* This value is still chosen so the users of THIS plugin see its full surface,
+		* not because the arrangement is fair.
+		*
+		* A low priority is also the CORRECT semantic here: this label shows more than
+		* any other contributor (name + price + promotion + load + new-model mark), so
+		* it should be the one that takes the cell when several want it.
+		*
+		* WHAT CHANGES WHEN THE HOST KEYS THE SLOT — and why the number stays. On a host
+		* that declares this slot `keyed`, the seat is registered once per provider id
+		* (see `modelLabelSeats` in `./model-label-seat.ts`), each `key` is its own
+		* cell, and priority stops deciding WHO IS VISIBLE: qoder's `-101` and trae's
+		* `-102` no longer share a cell with this `-105`, so none of the three can
+		* shadow another. Priority keeps exactly one meaning inside a cell — the
+		* tie-breaker between two registrations that claim the SAME provider id, where
+		* an equal value throws and the lowest renders. The value is therefore not
+		* lowered to keep winning an auction that no longer happens; it is kept because
+		* it is this plugin's rank for its own rows.
 		*
 		* WHAT THIS PLUGIN DELIBERATELY DOES NOT DO. It does not read the slot ledger,
 		* does not look for another plugin's registration, and does not render another
-		* plugin's component. Foreign rows get the plain catalog name, which is exactly
-		* the slot's documented minimum. Inter-plugin chaining is out of scope by
+		* plugin's component. Foreign rows get the plain catalog name PLUS the model's
+		* own `badge`, when the host's catalog carries one — that badge is host data
+		* (`props.model.badge`), not another plugin's component, and this component
+		* cannot tell which provider wrote it. Inter-plugin chaining is out of scope by
 		* project policy (`docs/DESIGN.md` §零) — and that policy is NOT stricter than
 		* the Host's own: the shipped `dsh-client-ui-deepseek-model-label-1017` README
 		* lists, under "Known Limitations and Deferred Work", that "another model-label
 		* plugin at the same priority conflicts; the two presentations do not compose
 		* automatically", and the remedy it documents is DISABLING it in the profile
-		* patch — a configuration decision, not a runtime negotiation. A consequence is
-		* that when this plugin wins the cell, another contributor's decoration on ITS
-		* rows is not composed; that is an accepted, documented trade-off rather than
-		* something to work around at runtime.
+		* patch — a configuration decision, not a runtime negotiation. Reproducing a
+		* catalog badge is neither of those: nothing here branches on another plugin
+		* being present.
 		*
 		* WHY WINNING IS THE RIGHT SIDE OF THAT TRADE. 1017 is a TEMPORARY marker
 		* (its own package description: "Temporary 1017 release badge …"; its README
@@ -10262,22 +14208,44 @@ window.__ModuleLoader__.load({
 		* Exported so the test asserts against the value that actually ships rather
 		* than a copy of it.
 		*/
-		const MODEL_LABEL_PRIORITY = -.5;
+		const MODEL_LABEL_PRIORITY = -105;
 		/**
 		* The label for one model row in the host's picker.
 		*
 		* Self-contained by design: a model this plugin owns gets the full label, and
-		* anything else gets the plain catalog name. There is no forwarding and no
-		* consultation of other plugins' registrations — see `MODEL_LABEL_PRIORITY`.
+		* anything else gets the catalog name plus that model's own `badge`, if its
+		* provider published one. There is no forwarding and no consultation of other
+		* plugins' registrations — see `MODEL_LABEL_PRIORITY`.
+		*
+		* WHY THE FOREIGN BRANCH STILL EXISTS ON A KEYED HOST. It is unreachable there —
+		* each seat is registered under one provider id, the owner dispatches with
+		* `entryKey: provider.id`, so a lookup only ever finds the entry whose key
+		* matches the row it is drawing. But ONE build serves both contracts
+		* (`./model-label-seat.ts` derives the seats from the host's declaration), and
+		* on a `single` host this branch is not just reachable, it is the whole row:
+		* that host renders one winner for every provider. Deleting it would fix the
+		* keyed case by breaking the single one.
+		*
+		* Its continued presence is therefore also the cheapest possible check that the
+		* seat keys are right: on a keyed host, reaching this branch with a WorkBuddy
+		* provider id means a seat was registered under the wrong key, and the row has
+		* silently degraded to the host's fallback — visible as a missing load badge on
+		* exactly those rows, nowhere else.
 		*
 		* @param props - The host's model identity and the placement of this label.
-		* @returns The catalog name, the promotion chip when one holds, and the load
-		*          badge when the probe reported one.
+		* @returns The catalog name, the promotion chip when one holds, the load badge
+		*          when the probe reported one, or a sibling's badge on a foreign row.
 		*/
 		function WorkBuddyModelLabel(props) {
 			const { provider, model, placement } = props;
 			const region = regionOfProvider(provider.id);
-			if (region === void 0) return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: model.name });
+			if (region === void 0) {
+				if (!hasDrawableBadge(model.badge)) return /* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: model.name });
+				return /* @__PURE__ */ (0, react_jsx_runtime.jsxs)("span", {
+					className: "dsm-workbuddy-model-label dsm-workbuddy-model-label-host-row",
+					children: [/* @__PURE__ */ (0, react_jsx_runtime.jsx)("span", { children: model.name }), /* @__PURE__ */ (0, react_jsx_runtime.jsx)(HostBadgeChip, { badge: model.badge })]
+				});
+			}
 			return /* @__PURE__ */ (0, react_jsx_runtime.jsx)(WorkBuddyModelLabelInner, {
 				modelId: model.id,
 				name: model.name,
@@ -10350,6 +14318,114 @@ window.__ModuleLoader__.load({
 			return {
 				base: match === null ? name : name.slice(0, match.index),
 				rate: discounted ?? fromName ?? baseRate
+			};
+		}
+		//#endregion
+		//#region src/client/model-label-seat.ts
+		/**
+		* Read the declared kind of a slot, or `undefined` when it is not declared yet.
+		*
+		* `spec()` is the documented read-only accessor (`SlotRegistry.spec`), present
+		* on 0.1.7 and on 0.2.2. It is also the only way to learn the kind: the
+		* declaration lives in the host package, and a plugin's own `SlotMap`
+		* augmentation says what this plugin HOPES the slot is, not what the running
+		* host declared.
+		*
+		* Anything unexpected — no `spec` method on an older line, a throw from a
+		* service that is not ready, a kind this build does not know — returns
+		* `undefined`, and the caller falls back to the single-cell shape. That is the
+		* conservative direction: it is what every released version of this plugin
+		* already does.
+		*
+		* @param slots - The `slots` service (typed loosely: the accessor is optional).
+		* @param key - The slot key to inspect.
+		* @returns The declared kind, or `undefined`.
+		*/
+		function declaredSlotKind(slots, key) {
+			const face = slots;
+			if (face === void 0 || typeof face.spec !== "function") return void 0;
+			let spec;
+			try {
+				spec = face.spec(key);
+			} catch {
+				return;
+			}
+			const kind = spec?.kind;
+			if (kind === "single" || kind === "list" || kind === "keyed" || kind === "chain") return kind;
+		}
+		/**
+		* The registrations this plugin should make for the model-label seat.
+		*
+		* `keyed` yields ONE seat per provider id: each is its own cell, each renders
+		* only the rows whose owner props carry that provider id, and a provider this
+		* plugin does not own falls through to the owner's own fallback (the catalog
+		* name, plus that model's `badge` on hosts that have one).
+		*
+		* Every other kind — including `undefined`, i.e. a host that cannot be
+		* inspected — yields the single historical seat. That is not a degraded mode:
+		* it is what `single` requires, and on a not-yet-declared slot it is what the
+		* inject callback is about to find.
+		*
+		* An empty provider list under `keyed` would silently disable the label, so it
+		* falls back to the single seat instead: a wrong-shaped registration that still
+		* draws something beats a correct-shaped registration that draws nothing.
+		*
+		* @param params - Slot key, declared kind, this plugin's provider ids, priority.
+		* @returns One or more `register()` option objects, in registration order.
+		*/
+		function modelLabelSeats(params) {
+			const { name, kind, providerIds, priority } = params;
+			if (kind === "list" || kind === "chain") return [];
+			if (kind === "keyed" && providerIds.length > 0) return providerIds.map((id) => ({
+				name,
+				key: id,
+				priority
+			}));
+			return [{
+				name,
+				priority
+			}];
+		}
+		/**
+		* Claim every planned seat, atomically, and hand back ONE disposer.
+		*
+		* WHY ATOMIC. The seat list is 2-3 entries on a `keyed` host, and `register()`
+		* can throw on any ONE of them — a rival plugin claiming the same provider id at
+		* the same priority, or the declaration collapsing mid-loop. A plain `.map()`
+		* would then leave the earlier seats landed on the ledger with their disposers
+		* unreachable (they were only ever held by the array that the throw discarded),
+		* which is worse than failing outright: the component stays mounted, the caller
+		* believes registration failed, and nothing will ever release those cells. On a
+		* `single` host it also means the identity keeps a live entry that the next
+		* `inject` re-run cannot displace without a priority clash.
+		*
+		* So a partial failure is rolled back in reverse order before the error is
+		* rethrown, exactly as if it had never been attempted. The rethrow is important:
+		* each caller already has a catch that logs, and swallowing here would hide the
+		* refusal from the diagnostics that exist to explain it.
+		*
+		* A disposal that itself throws must not mask the original error, hence the
+		* inner catch — the registry treats a second dispose as a no-op, and a broken
+		* one must not turn one failure into a crash.
+		*
+		* @param seats - The plan from {@link modelLabelSeats}, in registration order.
+		* @param register - Claims one seat and returns its disposer.
+		* @returns One disposer that releases every seat, in reverse registration order.
+		*/
+		function registerModelLabelSeats(seats, register) {
+			const claimed = [];
+			try {
+				for (const seat of seats) claimed.push(register(seat));
+			} catch (error) {
+				for (const dispose of [...claimed].reverse()) try {
+					dispose();
+				} catch {}
+				throw error;
+			}
+			return () => {
+				for (const dispose of [...claimed].reverse()) try {
+					dispose();
+				} catch {}
 			};
 		}
 		//#endregion
@@ -10696,6 +14772,14 @@ window.__ModuleLoader__.load({
 		* @module dsh-connect-workbuddy/client/locales
 		*/
 		const en = {
+			"nav.panel": "WorkBuddy",
+			"row.iconStyleLead": "Appearance — what the plugin looks like, not what it may do.",
+			"row.iconStyleLabel": "Icon style",
+			"row.iconStyleHint": "Takes effect on the click in the sidebar, the page header and the panel. The default is this plugin's own icon; the alternative skin follows the theme's text colour. The choice is stored in this browser only.",
+			"row.iconStyleClaude": "Claude style",
+			"row.iconStyleOriginal": "Default icon",
+			"row.iconStyleSaveFailed": "The icon choice could not be saved. Check browser storage permissions.",
+			"nav.back": "Back to conversation",
 			"row.title": "WorkBuddy credits & models (dsh-connect-workbuddy)",
 			"row.desc": "Use WorkBuddy models in DSH: each refresh reads every model's credit multiplier from the upstream catalog, image input is toggled per model, several accounts can be switched or failed over automatically, and daily check-in plus your remaining credits are one click away. The domestic and international sides are two independent providers, each with its own account — use both at the same time.",
 			"row.expand": "Expand",
@@ -10730,6 +14814,8 @@ window.__ModuleLoader__.load({
 			"row.credentialRejectedChoose": "Other local sign-ins exist but none of them answered the upstream just now. Try switching to one above; if none works, sign in again in the desktop app.",
 			"row.requestFailed": "Request failed",
 			"row.requestFailedHint": "Refresh failed — showing the last loaded data: {message}",
+			"row.usageErrorHint": "Could not read the account status: {message}. The local DSH service may have just restarted — retrying automatically.",
+			"row.usageRetry": "Retry",
 			"row.poolErrUnavailable": "The account pool is not available in this build (or its batch route is missing). Restart the app; if it persists, the plugin needs reinstalling.",
 			"row.poolErrFailed": "The batch failed on the host side: {message}",
 			"row.poolErrHttp": "The batch was refused (HTTP {status}). Check the plugin is up to date and try again.",
@@ -10750,10 +14836,11 @@ window.__ModuleLoader__.load({
 			"row.accountsWriteFailed": "The account change was not saved: {message} — the active profile's configuration file could not be updated (on Windows it may be locked by an antivirus scanner or a sync client). Your previous choice is still in effect; close whatever holds that file and try again (see docs/WINDOWS.md in the plugin repo for the exact path).",
 			"row.selectionLostHint": "The saved account no longer exists locally.",
 			"row.selectionLostMessage": "The account saved for this region is no longer among the local sign-ins (WorkBuddy replaced its login or cleaned up backups). Your other sign-ins are fine — pick a current one from the list above. Signing in again in the desktop app will not fix this.",
+			"row.vaultUnreadableHint": "The credential vault directory could not be read ({message}). This is usually a permissions problem, not a lost account: the saved accounts are still on disk. Run as administrator: takeown /F \"<vault dir>\" /R /D Y && icacls \"<vault dir>\" /reset /T, then restart DSH. The directory path is documented in docs/WINDOWS.md of the plugin repo.",
 			"row.panelAccounts": "Accounts",
 			"row.panelModels": "Models",
 			"row.panelCapabilities": "Capabilities",
-			"row.panelCapabilitiesHint": "What the plugin may do on your behalf. Each switch takes effect on the click — there is no Save button in this section.",
+			"row.panelCapabilitiesHint": "What the plugin may do on your behalf. The switches take effect on the click — there is no Save button for them. The one field at the top (the CN gateway) is a draft and saves on its own button, because a half-typed host must never become the live one.",
 			"row.panelDiag": "Diagnostics",
 			"row.panelAria": "Card sections",
 			"row.diagHint": "What this card actually read, so a report can quote it. Nothing here changes a setting.",
@@ -10772,7 +14859,6 @@ window.__ModuleLoader__.load({
 			"row.cardCrashed": "The configuration area failed to render.",
 			"row.cardCrashedHint": "The model provider itself is unaffected — chat and credits keep working. Quote the line above in a bug report.",
 			"row.modelsTitle": "Models",
-			"row.modelsSummary": "{count} enabled",
 			"row.modelsDirty": "unsaved changes",
 			"row.modelsRefresh": "Refresh from WorkBuddy",
 			"row.modelsRefreshing": "Refreshing models…",
@@ -10793,16 +14879,17 @@ window.__ModuleLoader__.load({
 			"row.modelOffHint": "Offer the “off” level for this model",
 			"row.modelOffRefused": "refuses off",
 			"row.modelOffRefusedHint": "Measured to reject the “off” level with HTTP 400 (code 11133) on both gateways. With this ticked, every request that carries no reasoning tier — compaction summaries above all — would fail, so it cannot be enabled here.",
-			"row.modelReasoning": "Reasoning: {efforts}",
+			"row.modelEffortLabel": "Default reasoning",
+			"row.modelEffortAria": "Default reasoning level for {model}",
+			"row.modelEffortHint": "The reasoning level this model uses when a request names none — new conversations, compaction summaries and session titles. Only the levels WorkBuddy itself declares for this model are offered; “Default (x)” names the level that will actually be used: your pick if you made one, otherwise the level WorkBuddy declares for this model, otherwise that model’s own middle tier (never its weakest one).",
+			"row.modelEffortFollow": "Default",
+			"row.modelEffortFollowNamed": "Default ({effort})",
 			"row.modelUnknown": "Unknown",
 			"row.modelCapabilityPending": "Only capabilities advertised by WorkBuddy are shown.",
 			"row.modelsTestEnabled": "Test enabled models",
-			"row.modelsTestAll": "Test all models",
 			"row.modelsTesting": "Testing {done}/{total}…",
 			"row.modelsTestEnabledHint": "Tests every model you have ENABLED, one request each — each probe sends a real-volume request, so this spends real credit (about 0.01 per model at the default 25000-token size). Rows show their verdict as it lands. Stops early if the credential is rejected.",
-			"row.modelsTestAllHint": "Tests EVERY model in this region's catalog, including the ones you have NOT enabled — so it costs noticeably more than \"test enabled models\". Same per-probe cost, same early stop on a rejected credential.",
 			"row.tpsSweepEnabled": "Measure speed (enabled)",
-			"row.tpsSweepAll": "Measure speed (all)",
 			"row.tpsSweepEnabledHint": "Measures OUTPUT SPEED for every model you have ENABLED: three runs each, taking the median. Unlike the availability probes above, this sends a tiny prompt and asks for 256 output tokens back, so it costs far less per model (measured 0.01–0.15 credit against 0.72), because this gateway prices by input. Speed matters because DSH dispatches models as parallel sub-agents, so a slow model costs wall-clock time across the whole run.",
 			"row.tpsTesting": "Measuring {done}/{total}…",
 			"row.tpsMeasure": "Speed",
@@ -10876,6 +14963,7 @@ window.__ModuleLoader__.load({
 			"row.transferNoToken": "no token in this record",
 			"row.transferCancel": "Cancel",
 			"row.transferError": "Transfer failed: {message}",
+			"row.transferNoService": "Could not reach the local plugin service ({size} KiB sent). The file may be too large, or the service may be restarting — try again, and if it keeps failing, trim the file and retry.",
 			"row.poolTitle": "Account pool",
 			"row.poolNoCandidate": "No account in this pool can be used right now.",
 			"row.poolNoCandidateHint": "Members are rate-limited, out of credits, rejected, or unreachable. Rate limits, drained quotas and transient failures return to the pool on their own — at the time the upstream states, or after a 30-minute fallback. Only a rejected credential needs a new sign-in.",
@@ -10920,7 +15008,6 @@ window.__ModuleLoader__.load({
 			"row.poolLogBenefitFailed": "{accountName} claim failed: {message}",
 			"row.poolBenefitHint": "Claim it on the plans page: {url}",
 			"row.poolCreditSoon": "{count} expiring within 3 days",
-			"row.poolCreditNearest": "Nearest package expires {at}",
 			"row.poolExcludedRateLimited": "Rate limited",
 			"row.poolExcludedModelBusy": "Model busy",
 			"row.poolExcludedOutOfCredit": "Out of credits",
@@ -10967,6 +15054,12 @@ window.__ModuleLoader__.load({
 			"row.poolSavedStaleRefresh": "Saved, but the panel could not re-read it. The value is stored; the next refresh will show it.",
 			"row.poolDiscard": "Discard changes",
 			"row.poolDirty": "● Unsaved changes",
+			"row.poolAutoCheckin": "Check in automatically each day",
+			"row.poolAutoCheckinHint": "On: the plugin claims the daily check-in for the accounts checked into this pool, once a day, in the background. It reads first and never re-claims an account already checked in, so a restart cannot double-claim. Off: nothing runs until you press the button. A missed day resets the streak.",
+			"row.poolAutoCheckinToday": "Today: {done} of {total} checked in",
+			"row.poolAutoCheckinDone": "Today: all {total} checked in",
+			"row.poolAutoCheckinPending": "{count} still to retry",
+			"row.poolAutoCheckinFailed": "Last attempt failed: {message}",
 			"row.poolManualUnlock": "Turn off rotation",
 			"row.poolLogTitle": "Activity",
 			"row.poolLogClear": "Clear",
@@ -11029,6 +15122,79 @@ window.__ModuleLoader__.load({
 			"row.poolRowRemoved": "{accountName}: hidden from the list. 「Detect accounts again」 re-adds it; the desktop app stays signed in.",
 			"row.poolRowRemoving": "Removing the account…",
 			"row.poolRowRemoveDesktopOnly": "{accountName}: hidden from the list — this account comes from the desktop app's own sign-in, which is left untouched. 「Detect accounts again」 re-adds it.",
+			"row.deviceModeTitle": "Device identity",
+			"row.deviceModeVirtual": "Virtual",
+			"row.deviceModeReal": "Real",
+			"row.deviceModeHintVirtual": "Every account presents a virtual device id derived from this machine. Use the gear on a row to set one by hand.",
+			"row.deviceModeHintReal": "Every account presents this machine's real device, signed by the WorkBuddy desktop SDK installed here. The gear is off — one real machine cannot be given two different ids. If the SDK is unavailable, no device header is sent at all (see 「SDK」).",
+			"row.deviceModeRealUnsupported": "Not available on this platform: the desktop SDK cannot hand out a device token here — on macOS it blocks on the main dispatch queue, which a background process never drains. Switching to Real would only fall back to Virtual, so the option is disabled. See the SDK section for the current reading.",
+			"row.deviceGearHint": "Edit this account's device id (X-Machine-ID / X-Session-ID)",
+			"row.deviceGearBlockedHint": "Only available in the Virtual tier",
+			"row.deviceGearAria": "Edit device parameters for {accountName}",
+			"row.deviceModeRealBlockedTitle": "Switch to Virtual first",
+			"row.deviceModeRealBlocked": "In the Real tier every account shares one real device, so there is nothing per-account to set. Switch the device identity to 「Virtual」 and open the gear again.",
+			"row.deviceDialogTitle": "Device parameters · {accountName}",
+			"row.deviceDialogIntro": "These two values are the X-Machine-ID / X-Session-ID this account presents upstream. Leave a field empty to keep deriving it from this machine's salt — the value that will be sent is shown under the field.",
+			"row.deviceMachineLabel": "Machine ID (X-Machine-ID)",
+			"row.deviceSessionLabel": "Session ID (X-Session-ID)",
+			"row.deviceFieldPlaceholder": "Empty = derived automatically",
+			"row.deviceDerivedNow": "Derived now:",
+			"row.deviceDerivedUnavailable": "No derived value to show — this machine has no device salt yet, so no X-Machine-ID / X-Session-ID is sent.",
+			"row.deviceDerivedNoUid": "This account has no uid, so nothing can be derived for it — it sends no X-Machine-ID / X-Session-ID.",
+			"row.deviceRandom": "Randomize",
+			"row.deviceRandomHint": "Fills both with random 36-character ids",
+			"row.deviceDialogP3": "Real device token",
+			"row.deviceDialogP3Hint": "Signed by the Turing Shield SDK of the WorkBuddy desktop app installed here. The Real tier uses it for every account; it is not editable here — see the 「SDK」 section.",
+			"row.deviceDialogCancel": "Cancel",
+			"row.deviceDialogSave": "Save",
+			"row.deviceDialogSaving": "Saving…",
+			"row.deviceInvalid": "Needs 36 lowercase hex characters (0-9a-f)",
+			"row.panelSdk": "SDK",
+			"sdk.hint": "The real device token this machine signs through the installed WorkBuddy desktop SDK. Every account sends this one value in the Real tier; the Virtual tier never sends it (the token is still kept warm so this page always shows the current one).",
+			"sdk.loading": "Asking the SDK…",
+			"sdk.unavailable": "This Host build has no SDK route — real device parameters are not available here. The Virtual tier still works.",
+			"sdk.state": "Connection",
+			"sdk.statusReady": "Working",
+			"sdk.statusStale": "Reachable, but the last fetch failed — serving the previous token",
+			"sdk.statusNoToken": "SDK loaded, no token yet — open 「Refresh」",
+			"sdk.statusMissing": "No installed WorkBuddy desktop SDK found on this machine",
+			"sdk.statusUnsupported": "The SDK refused this platform",
+			"sdk.statusError": "The SDK could not be loaded",
+			"sdk.statusDisabled": "Turned off in settings",
+			"sdk.masterLabel": "Use the real-device SDK",
+			"sdk.masterHint": "On: discover the installed desktop SDK, fetch its device token in a background child process and keep it fresh every 10 minutes. Off: none of that happens — no discovery, no child process, no prewarming — so the Real tier has no token to send. The Virtual tier is unaffected (its ids come from the local salt), so turning this off is safe if you only want virtual devices. The switch takes effect immediately: turning it on starts fetching at once and turning it off stops the timer, with no plugin reload.",
+			"sdk.bundle": "SDK",
+			"sdk.runtime": "Runtime",
+			"sdk.fetched": "Last fetched",
+			"sdk.tier": "Tier in use",
+			"sdk.tierReal": "Real — accounts send this token",
+			"sdk.tierVirtual": "Virtual — this token is not sent",
+			"sdk.valueLabel": "X-Device-Token",
+			"sdk.noValue": "No token available",
+			"sdk.length": "{count} chars",
+			"sdk.reveal": "Show",
+			"sdk.hide": "Hide",
+			"sdk.copy": "Copy",
+			"sdk.copied": "Copied",
+			"sdk.refresh": "Fetch again",
+			"sdk.refreshing": "Fetching…",
+			"sdk.never": "Never",
+			"sdk.unknown": "Unknown",
+			"sdk.ageJustNow": "just now",
+			"sdk.ageMinutes": "{count}m ago",
+			"sdk.ageHours": "{count}h {rest}m ago",
+			"sdk.dirLabel": "SDK directory",
+			"sdk.dirPlaceholder": "Empty = find the installed desktop app automatically",
+			"sdk.dirSave": "Save",
+			"sdk.dirSaving": "Saving…",
+			"sdk.dirSaved": "Saved.",
+			"sdk.dirClear": "Clear",
+			"sdk.dirHint": "Point this at the desktop app's native/turing-sdk folder, not the folder holding WorkBuddy.exe. Saving re-probes immediately; a wrong path turns the state above into \"not found\" with that path shown, never a silent fall back to discovery. WORKBUDDY_TURING_SDK_DIR still wins.",
+			"sdk.fallbackLabel": "Fall back to the virtual device when no real one is available",
+			"sdk.fallbackHint": "On: when the SDK is unavailable (no desktop app, wrong directory, no token) the plugin sends the salt-derived virtual device pair instead, and the tier shown changes to “Virtual” with it — it never claims to be real. Off: no device header is sent at all, which is what the Real tier did before this switch.",
+			"row.modelToolsHint": "These three decide what the model may DO on this tab: which commands it can run, and whether it can spend credits generating images or video. Each takes effect on the click.",
+			"row.channelRejectHint": "One switch, on its own because it is the only one here that spends a real request every time it fires. Read its description before turning it on.",
+			"row.sidebarPanelLead": "Where the card itself appears. This one only affects navigation — it changes no request and spends nothing.",
 			"row.upstreamHint": "These change what the gateway sees, not which provider serves the call. All of them are sampled when the plugin mounts, so reload the plugin (or restart DSH) after changing one.",
 			"row.usageIdentityLabel": "Make the usage page record these calls like the official client",
 			"row.usageIdentityHint": "Adds the X-IDE-* headers (which fill the 使用端 column, otherwise blank) and sends conversation ids as 32-hex UUIDv7. Display alignment only: the User-Agent and the request body never change. Off by default because the evidence comes from a reporter, not from this plugin.",
@@ -11038,8 +15204,36 @@ window.__ModuleLoader__.load({
 			"row.sessionTitleHint": "The host fires one title request per new session and bills it at the main model rate. This re-points that one request at a hidden lightweight model. The request still happens either way. Off by default.",
 			"row.sessionTitleModel": "Target model:",
 			"row.extraPrefixesCount": "Custom injected prefixes in effect:",
+			"row.channelRejectContinueLabel": "Resend 「继续」 after the gateway refuses the request",
+			"row.channelRejectContinueHint": "LAST RESORT, not a fix for 11128. When the gateway answers 400 with code 11128 (「被网关的渠道校验拦截」), the turn just fails: the plugin never retries it in place and never swaps accounts, because the gate matches the message contents and every account sends the same ones. Fixed system fingerprints are byte-identical every turn, so resending only pays for the same 400 again; since 5.13.1 `prepareChatBody` rewrites known phrases instead. The narrow case this can help is content that changes between turns. It sends the text below as a NEW turn and spends a real request each time. Stops after N CONSECUTIVE sends (default 1); one successful turn, or one message you type yourself, resets the count. Subagent sessions are never touched. Off by default. Takes effect immediately, no reload.",
+			"row.channelRejectContinueLimit": "Max consecutive sends:",
+			"row.channelRejectContinueText": "Text sent:",
+			"row.dropAllThinkingLead": "Reasoning redaction — when the gateway refuses what we send.",
+			"row.dropAllThinkingLabel": "Strip past thinking from requests (for 11128)",
+			"row.dropAllThinkingHint": "LAST RESORT for 「被网关的渠道校验拦截」(400 / code 11128), and not a fix. The gateway scans the text of every request, and this plugin sends the model its own earlier reasoning as `reasoning_content` whenever a thinking block carries a signature — so past reasoning is one of the things being scanned. On, ALL thinking blocks are removed from the request: your messages, the tool calls and the answers are untouched, but the model no longer sees its own earlier reasoning, and that loss is real (it is the model working memory, not decoration). Off by default. Turn it on when the openings named in a 11128 can be matched to reasoning text in that session, which is what issue #213 measured. Takes effect on the next turn, no reload.",
 			"row.cliBridgeLabel": "Let the local CodeBuddy CLI do the work",
 			"row.cliBridgeHint": "Adds the codebuddy_ask tool and the /codebuddy command. Each call spends CodeBuddy quota. injectResult only affects /codebuddy — its result is injected back into the session, costing one DSH turn when the session is idle; tool calls never read it. Rate-limited: 6 turns per session per hour, 20 per process per hour, one turn at a time. Off by default.",
+			"row.cnBaseLabel": "CN gateway host",
+			"row.cnBaseHint": "Leave empty to use copilot.tencent.com. Set it only if your network resets that host by TLS SNI (connection fails in milliseconds while the WorkBuddy desktop app still works) — the app itself falls back to wb.tencentbuddy.com. Accepted hosts: any subdomain of copilot.tencent.com, tencentbuddy.com, workbuddy.cn or codebuddy.cn, over https. Chat, billing, catalog and check-in all follow it; your account and region do not change.",
+			"row.cnBasePlaceholder": "https://wb.tencentbuddy.com",
+			"row.cnBaseInvalidMalformed": "That is not a full URL. Include https:// and the host, e.g. https://wb.tencentbuddy.com",
+			"row.cnBaseInvalidInsecure": "Only https is accepted — a plaintext host would send your token in the clear.",
+			"row.cnBaseInvalidHost": "That host is not one of the CN brands. Use a subdomain of copilot.tencent.com, tencentbuddy.com, workbuddy.cn or codebuddy.cn.",
+			"row.cnBaseSaved": "CN gateway saved. New requests use it; originals/CORS headers keep naming the CN web app.",
+			"row.cnBaseCleared": "Back to the built-in CN gateway.",
+			"row.diagCnBase": "CN gateway",
+			"row.diagCnBaseDefault": "built-in (copilot.tencent.com)",
+			"row.pollIntervalLead": "Refresh frequency",
+			"row.pollIntervalLabel": "Refresh the account table",
+			"row.pollIntervalHint": "How often the card re-reads credits and check-in state. One refresh costs a credits read plus a check-in read per pooled account, so this is the setting that decides the plugin's upstream request volume. The composer account panel follows this value, so the two never disagree about one account. Takes effect on the next poll — no Save needed.",
+			"row.pollIntervalAria": "Refresh frequency for the account table",
+			"row.pollInterval1m": "Every 1 minute",
+			"row.pollInterval5m": "Every 5 minutes (default)",
+			"row.pollInterval10m": "Every 10 minutes",
+			"row.pollInterval30m": "Every 30 minutes",
+			"row.pollInterval60m": "Every 60 minutes",
+			"row.sidebarPanelLabel": "Show WorkBuddy in the sidebar",
+			"row.sidebarPanelHint": "Adds a WorkBuddy row to the DSH sidebar that opens this card as a full page. Off by default: the row takes a global sidebar slot shared by every installed plugin, and the Plugins page already reaches the same content. Takes effect on the click — no Save needed — and switching it off while the page is open returns you to the conversation.",
 			"row.cliBridgeModelLabel": "CLI model",
 			"row.cliBridgeModelDefault": "CLI default",
 			"row.cliBridgeModelAria": "Model the local CodeBuddy CLI runs on",
@@ -11083,6 +15277,9 @@ window.__ModuleLoader__.load({
 			"row.creditPositionHintInline": "Where the readout sits. \"composer toolbar\" is the default — the row with the model picker.",
 			"row.creditPositionDisabledHint": "Unavailable while the switch above is off: tick \"Show credits in the composer toolbar\" first.",
 			"row.showCreditsHintInline": "The balance for the account currently serving this tab. Click for per-account balances; it also refreshes every 5 minutes.",
+			"row.showNewModels": "Show newly seen models",
+			"row.showNewModelsHint": "Adds a \"· N new models\" segment beside the credit readout, and a \"new\" mark on those rows in the model picker. \"New\" means this machine recorded the model id for the first time — it says nothing about when the upstream listed it. Off by default: on a new install the whole roster is \"new\".",
+			"row.showNewModelsHintInline": "First seen by this machine, not newly listed upstream. Off by default — on a new install the whole roster counts as new.",
 			"quotaNotice.fallbackHead": "The quota for this request is exhausted",
 			"quotaNotice.supplement": " (some models also have a daily limit that is unrelated to your credits)",
 			"row.creditPositionHint": "Where the credit readout sits. \"composer toolbar\" is the default (the row with the model picker). Choose \"below the input box\" — the row carrying the round / step / token statistics — if another plugin occupies the composer toolbar and the readout does not appear.",
@@ -11097,10 +15294,13 @@ window.__ModuleLoader__.load({
 			"composer.current": "In use",
 			"composer.noAccounts": "No account in this region",
 			"composer.signedOut": "Not signed in",
-			"composer.testAll": "Test all",
-			"composer.testing": "Testing…",
-			"composer.testAllHint": "Test every account in this region, one at a time",
-			"composer.testFailed": "Could not test the accounts",
+			"composer.openSettings": "Settings",
+			"composer.openSettingsHint": "Open this plugin's full page (accounts, models, switches)",
+			"composer.openSettingsFailed": "This host offers no route to the plugin page",
+			"composer.refresh": "Refresh",
+			"composer.refreshing": "Refreshing…",
+			"composer.refreshHint": "Refresh every account status in this region — probes each account once, one at a time (spends a small amount of credits, takes up to a minute)",
+			"composer.refreshAccountsFailed": "Could not refresh the account status",
 			"composer.refreshFailed": "Could not refresh credits",
 			"composer.lastRefresh": "Last refreshed",
 			"composer.panelTitle": "WorkBuddy credits",
@@ -11126,6 +15326,14 @@ window.__ModuleLoader__.load({
 			"cliLive.aria": "A CodeBuddy turn is running: {detail}"
 		};
 		const zh = {
+			"nav.panel": "WorkBuddy",
+			"row.iconStyleLead": "外观 —— 插件长什么样，不是它能做什么。",
+			"row.iconStyleLabel": "图标样式",
+			"row.iconStyleHint": "点一下立即应用到侧边栏、页头与面板。默认是本插件自己的图标；另一个皮肤跟随主题的文字颜色。选择只存在当前浏览器里。",
+			"row.iconStyleClaude": "Claude 风格",
+			"row.iconStyleOriginal": "默认图标",
+			"row.iconStyleSaveFailed": "图标选择保存失败，请检查浏览器存储权限。",
+			"nav.back": "返回会话",
 			"row.title": "接入使用 WorkBuddy 积分与模型（dsh-connect-workbuddy）",
 			"row.desc": "在 DSH 中使用 WorkBuddy 模型：每次刷新都按上游目录读取每个模型的积分倍率，图片输入可逐模型开关，多个账号可切换或由账号池自动换号，每日签到与剩余积分一键可查。国内版与国际版是两个独立供应商，各有自己的账号，可同时使用。",
 			"row.expand": "展开",
@@ -11160,6 +15368,8 @@ window.__ModuleLoader__.load({
 			"row.credentialRejectedChoose": "本机还有其他账号，但刚才都没能通过上游校验。可以在上方切换一个试试；如果都不行，请在桌面端重新登录。",
 			"row.requestFailed": "请求失败",
 			"row.requestFailedHint": "刷新失败——下方为上次加载的数据：{message}",
+			"row.usageErrorHint": "读取账号状态失败：{message}。本地 DSH 服务可能刚重启过，正在自动重试。",
+			"row.usageRetry": "重试",
 			"row.poolErrUnavailable": "本版本没有可用的账号池（或其批量接口缺失）。请重启应用；若仍不行，插件可能需要重新安装。",
 			"row.poolErrFailed": "批量操作在宿主侧失败：{message}",
 			"row.poolErrHttp": "批量操作被拒绝（HTTP {status}）。请确认插件是最新版本后重试。",
@@ -11180,10 +15390,11 @@ window.__ModuleLoader__.load({
 			"row.accountsWriteFailed": "账号改动未保存：{message} —— 当前 profile 的配置文件写入失败（Windows 上可能被杀毒软件或同步盘占用）。当前仍是原来保存的选择，请先关闭占用该文件的程序再重试（文件的确切路径见插件仓库的 docs/WINDOWS.md）。",
 			"row.selectionLostHint": "已保存的账号在本机已不存在。",
 			"row.selectionLostMessage": "该区域保存的账号已不在本机登录列表中（WorkBuddy 更换了登录或清理了备份文件）。本机其他登录仍然可用——请在上方列表中重新选择一个当前账号。重新登录桌面端 App 无法修复此问题。",
+			"row.vaultUnreadableHint": "凭据保险库目录无法读取（{message}）。这通常是权限问题而不是账号丢失：已保存的账号其实还在磁盘上。请以管理员身份运行：takeown /F \"<vault 目录>\" /R /D Y && icacls \"<vault 目录>\" /reset /T，然后重启 DSH。目录路径见插件仓库 docs/WINDOWS.md 的 vault 说明。",
 			"row.panelAccounts": "账号",
 			"row.panelModels": "模型",
 			"row.panelCapabilities": "能力",
-			"row.panelCapabilitiesHint": "插件可以替你做什么。这些开关点一下立即生效 —— 这一区里没有保存按钮。",
+			"row.panelCapabilitiesHint": "插件可以替你做什么。这些开关点一下立即生效 —— 开关没有保存按钮。顶上那个「CN 网关主机」是草稿，由它自己的按钮保存：一个打到一半的主机名绝不该成为生效值。",
 			"row.panelDiag": "诊断",
 			"row.panelAria": "卡片分区",
 			"row.diagHint": "这张卡片实际读到了什么，方便贴进问题反馈。这里没有任何会改动设置的控件。",
@@ -11202,7 +15413,6 @@ window.__ModuleLoader__.load({
 			"row.cardCrashed": "配置区渲染失败。",
 			"row.cardCrashedHint": "模型服务本身未受影响，对话与积分仍可用。反馈问题时请附上上面这行。",
 			"row.modelsTitle": "模型",
-			"row.modelsSummary": "已启用 {count} 个",
 			"row.modelsDirty": "有未保存的修改",
 			"row.modelsRefresh": "从 WorkBuddy 刷新",
 			"row.modelsRefreshing": "正在刷新模型…",
@@ -11223,16 +15433,17 @@ window.__ModuleLoader__.load({
 			"row.modelOffHint": "为这个模型提供「关闭思考」档位",
 			"row.modelOffRefused": "拒绝 off",
 			"row.modelOffRefusedHint": "实测在两个网关上都拒绝「关闭思考」档位（HTTP 400 / code 11133）。勾选后，所有未指定推理档位的请求（尤其是压缩摘要）都会失败，因此这里不能启用。",
-			"row.modelReasoning": "推理强度：{efforts}",
+			"row.modelEffortLabel": "默认推理强度",
+			"row.modelEffortAria": "{model} 的默认推理强度",
+			"row.modelEffortHint": "请求未指定档位时这个模型使用的推理强度——新对话、压缩摘要、会话标题都属于这类请求。这里只列出 WorkBuddy 为该模型声明的档位；「默认（x）」里的 x 就是真正会用的那一档：你选过就是你的选择，否则是 WorkBuddy 为这个模型声明的默认档，再否则是这个模型自己声明的**中档**（永远不是最弱的那一档）。",
+			"row.modelEffortFollow": "默认",
+			"row.modelEffortFollowNamed": "默认（{effort}）",
 			"row.modelUnknown": "未知",
 			"row.modelCapabilityPending": "仅展示 WorkBuddy 接口明确公布的模型能力。",
-			"row.modelsTestEnabled": "一键测试启用模型",
-			"row.modelsTestAll": "一键测试所有模型",
+			"row.modelsTestEnabled": "测试启用模型",
 			"row.modelsTesting": "测试中 {done}/{total}…",
 			"row.modelsTestEnabledHint": "逐个测试你**已启用**的模型，一个模型一次请求 —— 每次探测都发真实体积的请求，真花积分（默认 25000 token 体积下约 0.01/个）。每行的结果一出来就显示。凭据被拒时提前停止。",
-			"row.modelsTestAllHint": "测试本区域目录里的**每一个**模型，含**未启用**的 —— 所以比「仅测试启用模型」明显更贵。单次探测成本相同，凭据被拒时同样提前停止。",
-			"row.tpsSweepEnabled": "一键测速启用模型",
-			"row.tpsSweepAll": "一键测速所有模型",
+			"row.tpsSweepEnabled": "测速启用模型",
 			"row.tpsSweepEnabledHint": "测**已启用**模型的**输出速度**：每个模型跑 3 次取中位数。和上面的可用性探测不同，它只发一个极小的提示、要求返回 256 个输出 token —— 这个网关按**输入**计价，所以单模型成本低得多（实测 0.01–0.15 积分，可用性探测是 0.72）。速度之所以重要：DSH 会把模型当子代理并行派发，慢模型拖的是整个任务的实际耗时。",
 			"row.tpsTesting": "测速中 {done}/{total}…",
 			"row.tpsMeasure": "测速",
@@ -11306,6 +15517,7 @@ window.__ModuleLoader__.load({
 			"row.transferNoToken": "此记录没有 token",
 			"row.transferCancel": "取消",
 			"row.transferError": "传输失败：{message}",
+			"row.transferNoService": "与本地插件服务通信失败（本次发送 {size} KiB）。可能是文件过大，或服务正在重启——请重试；若持续失败，请精简文件后再导入。",
 			"row.poolTitle": "账号池",
 			"row.poolNoCandidate": "账号池里目前没有可用的账号。",
 			"row.poolNoCandidateHint": "成员要么在限流冷却中、要么积分耗尽、要么凭据被拒、要么上游无响应。限流、积分耗尽与瞬时故障都会自动回池——按上游给出的恢复时间，没给时间就按 30 分钟兜底，不需要你操作；只有「凭据被拒」需要重新登录。",
@@ -11350,7 +15562,6 @@ window.__ModuleLoader__.load({
 			"row.poolLogBenefitFailed": "{accountName} 领取失败：{message}",
 			"row.poolBenefitHint": "去套餐与积分页领取：{url}",
 			"row.poolCreditSoon": "{count} 积分 3 天内过期",
-			"row.poolCreditNearest": "最近积分包 {at} 过期",
 			"row.poolExcludedRateLimited": "被限流",
 			"row.poolExcludedModelBusy": "模型繁忙",
 			"row.poolExcludedOutOfCredit": "积分耗尽",
@@ -11397,6 +15608,12 @@ window.__ModuleLoader__.load({
 			"row.poolSavedStaleRefresh": "已保存，但面板未能重新读取。设置已写入；下次刷新后会显示。",
 			"row.poolDiscard": "放弃修改",
 			"row.poolDirty": "● 有未保存的修改",
+			"row.poolAutoCheckin": "每天自动签到",
+			"row.poolAutoCheckinHint": "开启：插件在后台为勾选进池的账号领取每日签到，一天一次。它先读状态、已签到的不重复领取，所以重启也不会多领。关闭：不点按钮就什么都不会发生。漏一天会断连签。",
+			"row.poolAutoCheckinToday": "今日：已签 {done} / {total}",
+			"row.poolAutoCheckinDone": "今日：{total} 个全部已签",
+			"row.poolAutoCheckinPending": "待重试 {count} 个",
+			"row.poolAutoCheckinFailed": "上次尝试失败：{message}",
 			"row.poolManualUnlock": "关闭自动轮换",
 			"row.poolLogTitle": "活动记录",
 			"row.poolLogClear": "清空",
@@ -11459,6 +15676,79 @@ window.__ModuleLoader__.load({
 			"row.poolRowRemoved": "{accountName}：已从列表中隐藏。点「重新检测账号」会重新加入，桌面 App 的登录不受影响。",
 			"row.poolRowRemoving": "正在删除账号…",
 			"row.poolRowRemoveDesktopOnly": "{accountName}：已从列表中隐藏——这个账号来自桌面 App 自己的登录，该登录未被改动。点「重新检测账号」会重新加入。",
+			"row.deviceModeTitle": "设备头",
+			"row.deviceModeVirtual": "虚拟值",
+			"row.deviceModeReal": "真实值",
+			"row.deviceModeHintVirtual": "每个账号使用一台按本机盐派生的虚拟设备。点某行右侧的齿轮可以手工指定它的值。",
+			"row.deviceModeHintReal": "所有账号共用这台机器真实的设备，由本机安装的 WorkBuddy 桌面端 SDK 签发。齿轮已关闭——一台真机不能有两个不同的 id。SDK 不可用时一个设备头都不发（见「SDK」分区）。",
+			"row.deviceModeRealUnsupported": "本平台用不了：桌面端 SDK 在这里取不到设备 token——macOS 上它会阻塞在 dispatch 主队列，而后台进程永不排空那个队列。切过去也只会降级回虚拟值，所以这一档已禁用。当前读数见「SDK」分区。",
+			"row.deviceGearHint": "编辑这个账号的设备标识（X-Machine-ID / X-Session-ID）",
+			"row.deviceGearBlockedHint": "只在「虚拟值」档下可用",
+			"row.deviceGearAria": "编辑 {accountName} 的设备参数",
+			"row.deviceModeRealBlockedTitle": "请先切回「虚拟值」",
+			"row.deviceModeRealBlocked": "「真实值」档下所有账号共用这台机器的真实设备，没有\"这个账号\"的参数可改。把设备头切回「虚拟值」后再点齿轮。",
+			"row.deviceDialogTitle": "设备参数 · {accountName}",
+			"row.deviceDialogIntro": "这两个值就是该账号发给上游的 X-Machine-ID / X-Session-ID。留空表示继续按本机盐自动派生，字段下方会显示真正会发出去的那个值。",
+			"row.deviceMachineLabel": "机器 ID（X-Machine-ID）",
+			"row.deviceSessionLabel": "会话 ID（X-Session-ID）",
+			"row.deviceFieldPlaceholder": "留空 = 自动派生",
+			"row.deviceDerivedNow": "当前派生值：",
+			"row.deviceDerivedUnavailable": "没有可显示的派生值——本机还没有设备盐，因此不会发送 X-Machine-ID / X-Session-ID。",
+			"row.deviceDerivedNoUid": "这个账号没有 uid，算不出派生值，因此不会发送 X-Machine-ID / X-Session-ID。",
+			"row.deviceRandom": "一键随机",
+			"row.deviceRandomHint": "一次给两项各填一个 36 位随机 id",
+			"row.deviceDialogP3": "真实设备 Token",
+			"row.deviceDialogP3Hint": "由本机安装的桌面端 Turing Shield SDK 签发。「真实值」档下所有账号用它；它不在这里编辑——见「SDK」分区。",
+			"row.deviceDialogCancel": "取消",
+			"row.deviceDialogSave": "保存",
+			"row.deviceDialogSaving": "保存中…",
+			"row.deviceInvalid": "需要 36 个十六进制字符（0-9a-f）",
+			"row.panelSdk": "SDK",
+			"sdk.hint": "这台机器通过本机安装的桌面端 SDK 签发的真实设备 token。「真实值」档下所有账号都发这一个值；「虚拟值」档不发送它（仍会后台预热，所以这一页随时能看到当前值）。",
+			"sdk.loading": "正在询问 SDK…",
+			"sdk.unavailable": "这个 Host 版本没有 SDK 路由——这里拿不到真实设备参数。「虚拟值」档不受影响。",
+			"sdk.state": "连接状态",
+			"sdk.statusReady": "正常",
+			"sdk.statusStale": "能连上，但最近一次取数失败——仍在使用上一枚 token",
+			"sdk.statusNoToken": "SDK 已加载，还没取到 token——点「重新获取」",
+			"sdk.statusMissing": "未在本机找到已安装的 WorkBuddy 桌面端 SDK",
+			"sdk.statusUnsupported": "SDK 拒绝了这个平台",
+			"sdk.statusError": "SDK 加载失败",
+			"sdk.statusDisabled": "已在设置里关闭",
+			"sdk.masterLabel": "启用真实设备 SDK",
+			"sdk.masterHint": "开启时：查找本机安装的桌面端 SDK、在后台子进程里取设备 token，并每 10 分钟换新一次。关闭时这些事一件都不做——不查找、不起子进程、不预热——「真实值」档因此没有 token 可发。「虚拟值」档不受影响（它的 id 由本机盐派生），只想用虚拟设备的话关掉是安全的。开关即时生效：打开后立刻开始取，关掉即停掉定时器，都不用重载插件。",
+			"sdk.bundle": "SDK",
+			"sdk.runtime": "运行时",
+			"sdk.fetched": "最近取到",
+			"sdk.tier": "当前档位",
+			"sdk.tierReal": "真实值——账号发的就是它",
+			"sdk.tierVirtual": "虚拟值——这枚 token 不发出去",
+			"sdk.valueLabel": "X-Device-Token",
+			"sdk.noValue": "还没有可用的 token",
+			"sdk.length": "{count} 字符",
+			"sdk.reveal": "显示",
+			"sdk.hide": "隐藏",
+			"sdk.copy": "复制",
+			"sdk.copied": "已复制",
+			"sdk.refresh": "重新获取",
+			"sdk.refreshing": "获取中…",
+			"sdk.never": "从未",
+			"sdk.unknown": "未知",
+			"sdk.ageJustNow": "刚刚",
+			"sdk.ageMinutes": "{count} 分钟前",
+			"sdk.ageHours": "{count} 小时 {rest} 分前",
+			"sdk.dirLabel": "SDK 目录",
+			"sdk.dirPlaceholder": "留空 = 自动查找本机安装的桌面端",
+			"sdk.dirSave": "保存",
+			"sdk.dirSaving": "保存中…",
+			"sdk.dirSaved": "已保存。",
+			"sdk.dirClear": "清除",
+			"sdk.dirHint": "填的是桌面端里 native/turing-sdk 那一层目录，不是 WorkBuddy.exe 所在目录。保存后会立刻重新检测；填错时上面的状态会变成「未找到」并带上这个路径，不会静默回退到自动查找。环境变量 WORKBUDDY_TURING_SDK_DIR 优先级更高。",
+			"sdk.fallbackLabel": "取不到真实设备时退回虚拟值",
+			"sdk.fallbackHint": "开启时：SDK 不可用（没装桌面端、目录填错、token 取不到）就改发按本机盐派生的虚拟设备对，档位显示也会跟着变成「虚拟值」——不静默冒充。关闭时：一个设备头都不发，那是「真实值」档原本的行为。",
+			"row.modelToolsHint": "这三项决定模型在这个 tab 上能「做」什么：能跑哪些命令，以及能不能花积分生图、生视频。点一下即生效。",
+			"row.channelRejectHint": "单独一项，因为这里是唯一「每触发一次就真花一次请求」的开关。开启前请读完它的说明。",
+			"row.sidebarPanelLead": "卡片本身出现在哪。这一项只管导航，不改任何请求、不花任何额度。",
 			"row.upstreamHint": "这一组改的是网关看到什么，不是由哪个 provider 提供服务。四项都在插件挂载时采样，改完需重载插件或重启 DSH。",
 			"row.usageIdentityLabel": "让用量页把调用记成官方客户端的样子",
 			"row.usageIdentityHint": "补上 X-IDE-* 头（「使用端」那一列就不会空白），并把会话 id 改成 32 位十六进制 UUIDv7。只影响显示：User-Agent 与请求正文永不变。默认关闭——证据来自报告者，本插件未在真机复现。",
@@ -11468,8 +15758,36 @@ window.__ModuleLoader__.load({
 			"row.sessionTitleHint": "宿主每个新会话都会发一次标题请求，并按主模型费率计费；开启后这一次改投隐藏的轻量模型。请求无论开不开都会发出。默认关闭。",
 			"row.sessionTitleModel": "目标模型：",
 			"row.extraPrefixesCount": "生效的自定义注入前缀：",
+			"row.channelRejectContinueLabel": "被网关渠道校验拦截后，自动再发一次「继续」",
+			"row.channelRejectContinueHint": "最后兜底，不是 11128 的修复。上游用 400 + code 11128（「被网关的渠道校验拦截」）拒绝时，这一轮就直接失败了：插件不会在原地重试，也不会换号——网关匹配的是消息内容，每个账号发出去都一样。固定 system 指纹每一轮逐字节相同，重发只会再付一次同一个 400；5.13.1 起由 `prepareChatBody` 按句改词处理。只有被拒内容刚好随轮次变化的窄情况才可能靠新回合碰过去。它会把下面这句作为新回合发出，每次真实消耗一次请求；默认只发 1 次、默认关闭；连续计数，成功一轮或你自己发一条消息即清零。子代理会话一律不碰，改完立即生效，不必重载插件。",
+			"row.channelRejectContinueLimit": "连续发送上限：",
+			"row.channelRejectContinueText": "发送的文本：",
+			"row.dropAllThinkingLead": "思考剥离 —— 网关拒收我们发出去的内容时。",
+			"row.dropAllThinkingLabel": "把历史思考从请求里剥掉（针对 11128）",
+			"row.dropAllThinkingHint": "「被网关的渠道校验拦截」（400 + code 11128）的最后兜底，不是修复。网关会扫描每一份请求的文本，而本插件会把模型过去的思考作为 reasoning_content 发出去（thinking 块带 signature 时就会），所以历史思考也是被扫的内容之一。开启后请求里的 thinking 块会被全部移除——你的消息、工具调用和回答不受影响，但模型看不到自己之前的思考，而这个代价是真的（那是它的工作记忆，不是装饰）。默认关闭。适用情形：这次 11128 报出的那几个开头，能与该会话里的 reasoning 文本逐字对上——#213 里被证实的就是这种情况。改完下一轮生效，不必重载插件。",
 			"row.cliBridgeLabel": "允许调用本机 CodeBuddy CLI 干活",
 			"row.cliBridgeHint": "开启后多出 codebuddy_ask 工具与 /codebuddy 指令；每次调用花 CodeBuddy 配额。injectResult 只影响 /codebuddy：其结果回注会话，会话空闲时多花一次 DSH 回合；工具调用不读它。限流：每会话每小时 6 回合、每进程每小时 20 回合、同时只跑一个回合。默认关闭。",
+			"row.cnBaseLabel": "CN 网关主机",
+			"row.cnBaseHint": "留空即用 copilot.tencent.com。只有当你的网络按 TLS SNI 重置这个域名时才需要填（连接在毫秒级就失败，而同一台机器上的 WorkBuddy 桌面端正常——客户端自己会退回 wb.tencentbuddy.com）。可填 copilot.tencent.com、tencentbuddy.com、workbuddy.cn、codebuddy.cn 任一域名下的子域，且必须是 https。聊天、计费、模型目录、签到都会跟着走；账号与区域不会变。",
+			"row.cnBasePlaceholder": "https://wb.tencentbuddy.com",
+			"row.cnBaseInvalidMalformed": "这不是一个完整 URL。请带上 https:// 与主机名，例如 https://wb.tencentbuddy.com",
+			"row.cnBaseInvalidInsecure": "只接受 https——明文主机会把你的 token 裸发出去。",
+			"row.cnBaseInvalidHost": "这个主机不在 CN 品牌里。请用 copilot.tencent.com、tencentbuddy.com、workbuddy.cn、codebuddy.cn 下的子域。",
+			"row.cnBaseSaved": "CN 网关已保存，新请求即刻使用它；Origin/Referer 仍然自称 CN 网页端。",
+			"row.cnBaseCleared": "已回到内置 CN 网关。",
+			"row.diagCnBase": "CN 网关",
+			"row.diagCnBaseDefault": "内置（copilot.tencent.com）",
+			"row.pollIntervalLead": "刷新频率",
+			"row.pollIntervalLabel": "刷新账号表",
+			"row.pollIntervalHint": "卡片多久重读一次积分与签到状态。每次刷新要为池内每个账号各读一次积分和一次签到状态，所以这一项决定插件的上游请求量。输入框的账号面板跟随同一个值，两处不会对同一个账号给出不同说法。下一次轮询即生效，不用保存。",
+			"row.pollIntervalAria": "账号表的刷新频率",
+			"row.pollInterval1m": "每 1 分钟",
+			"row.pollInterval5m": "每 5 分钟（默认）",
+			"row.pollInterval10m": "每 10 分钟",
+			"row.pollInterval30m": "每 30 分钟",
+			"row.pollInterval60m": "每 60 分钟",
+			"row.sidebarPanelLabel": "在侧边栏显示 WorkBuddy",
+			"row.sidebarPanelHint": "在 DSH 侧边栏加一个 WorkBuddy 行，点开就是这张卡片的整页版。默认关闭：这一行占的是所有插件共用的全局侧边栏座位，而「插件」页本来就能看到同样的内容。点一下即生效，不用保存；页面开着时关掉它，会直接回到对话。",
 			"row.cliBridgeModelLabel": "CLI 模型",
 			"row.cliBridgeModelDefault": "CLI 默认",
 			"row.cliBridgeModelAria": "本地 CodeBuddy CLI 运行所用的模型",
@@ -11513,6 +15831,9 @@ window.__ModuleLoader__.load({
 			"row.creditPositionHintInline": "读数显示在哪里。「输入框工具栏」是默认位置，与模型选择同一行。",
 			"row.creditPositionDisabledHint": "主开关关闭时不可调整：先勾选上方「在输入框工具栏显示积分读数」。",
 			"row.showCreditsHintInline": "当前为本 tab 服务的那个账号的余额。点一下能看各账号明细，另外每 5 分钟自动刷新一次。",
+			"row.showNewModels": "显示新出现的模型",
+			"row.showNewModelsHint": "在积分读数旁多加一段「· N 新模型」，并在模型选择器里给这些行标一个「新」。这里的「新」指**本机首次记到这个模型 id**，与上游何时上架无关。默认关闭：全新安装时整个目录都算「新」，那个数字说明不了任何事。",
+			"row.showNewModelsHintInline": "指本机首次见到，不是上游新上架。默认关闭——全新安装时整个目录都算新。",
 			"quotaNotice.fallbackHead": "当前请求的额度已用尽",
 			"quotaNotice.supplement": "（部分模型另有每日额度，与积分无关）",
 			"row.creditPositionHint": "积分显示在哪里。「输入框工具栏」是默认位置（与模型选择同一行）。如果装了别的插件后读数不显示，改成「输入框下方」—— 那是「轮次 / 步数 / token」统计所在的那一行。",
@@ -11527,10 +15848,13 @@ window.__ModuleLoader__.load({
 			"composer.current": "当前选用",
 			"composer.noAccounts": "该区域暂无账号",
 			"composer.signedOut": "未登录",
-			"composer.testAll": "一键测试",
-			"composer.testing": "正在测试…",
-			"composer.testAllHint": "逐个测试本区所有账号（一次一个，避免触发上游限流）",
-			"composer.testFailed": "测试失败",
+			"composer.openSettings": "设置",
+			"composer.openSettingsHint": "打开本插件的完整页面（账号、模型、各项开关）",
+			"composer.openSettingsFailed": "这台宿主没有通往插件页面的入口",
+			"composer.refresh": "刷新",
+			"composer.refreshing": "正在刷新…",
+			"composer.refreshHint": "刷新本区所有账号的状态——逐个探测每个账号（会消耗少量积分，最长约一分钟）",
+			"composer.refreshAccountsFailed": "账号状态刷新失败",
 			"composer.refreshFailed": "积分刷新失败",
 			"composer.lastRefresh": "最近刷新",
 			"composer.panelTitle": "WorkBuddy 积分",
@@ -11555,6 +15879,230 @@ window.__ModuleLoader__.load({
 			"cliLive.chars": "{count} 字",
 			"cliLive.aria": "有一个 CodeBuddy 回合正在跑：{detail}"
 		};
+		//#endregion
+		//#region src/client/settings-jump.ts
+		/**
+		* The route from this plugin's UI to its **Settings section** (设置 → WorkBuddy).
+		*
+		* ## Two routes, best first
+		*
+		* 1. **The settings shell's store seat** — one call, exact, no timing:
+		*    `slots.entries('sidebar.settings')[0].store.create().actions.openSection(id)`.
+		* 2. **Driving the chrome** — click the sidebar's settings trigger, wait for the
+		*    panel, click this plugin's nav row by label.
+		*
+		* Route 1 is what the owner asked for ("clicking the button should open Settings
+		* already on this plugin") and it is available on the shell this plugin targets;
+		* route 2 stays as the fallback for a host whose shell predates the seat. Route 1
+		* is strictly better where it exists: `openSection(id)` sets `activeId` AND
+		* `open` in one action, so there is no retry window in which the dialog is open
+		* on the wrong section, and no dependency on the nav row's localized label.
+		*
+		* ## Why the seat is legitimately public (verified, not assumed)
+		*
+		* Read from the shipped host (0.1.7-rc.1), not from a sibling README:
+		*
+		*     ctx.remoteAccess.whenAccess('settings/describe', () => ctx.slots.inject('sidebar.settings', () => {
+		*       const shellHandle = createSettingsShellStore()
+		*       const shellInstance = shellHandle.create()
+		*       const shellStore = { ...shellHandle, create: () => shellInstance }
+		*       …
+		*       ctx.slots.register({ name: 'sidebar.settings', store: shellStore, … })
+		*     }))
+		*
+		* and the store itself:
+		*
+		*     defineStore({
+		*       init: () => ({ open: false, activeId: void 0 }),
+		*       actions: {
+		*         open:          (d) => { d.open = true },
+		*         close:         (d) => { d.open = false; d.activeId = void 0 },
+		*         select:        (d, id) => { d.activeId = id },
+		*         openSection:   (d, id) => { d.activeId = id; d.open = true },
+		*       },
+		*     })
+		*
+		* Three things follow, and all three are load-bearing:
+		*
+		*  - `create: () => shellInstance` PINS the seat to the shell's one live
+		*    instance. A bare handle would mint a fresh private copy per `create()`,
+		*    and `openSection` on that copy would move a dialog nobody renders.
+		*  - `store` is a declared registration field ("Declared store seat; instance
+		*    resolution and lifecycle live with the host machinery"), and
+		*    `slots.entries(key)` is a public service method — the harness's own client
+		*    tests read this exact seat the same way.
+		*  - **Only `openSection` answers this need.** The published contract gives a
+		*    `settings.section` registrant just `close`; `settings.launcher` gets
+		*    `openSettings` with no id; `openSection(id)` is otherwise handed only to
+		*    `settings.onboarding` steps. Registering a fake first-run step to reach it
+		*    would be far more intrusive than reading a seat the shell published.
+		*
+		* ## Why the probe happens per PRESS, not during `apply`
+		*
+		* The seat belongs to ANOTHER bundle whose apply order is not ours to assume.
+		* Probing once during `apply` would capture `undefined` on a host whose sidebar
+		* applied later, leaving the button dead for the whole session. `entries()`
+		* answers `[]` for an undeclared slot, so a per-press probe is stateless and
+		* always current — the same reason the popover button is built around `softGet`.
+		*
+		* ## Route 2, and why it is kept rather than deleted
+		*
+		* The host range this plugin declares spans shell lines that may predate the
+		* seat. When the seat is absent, the old route still lands the user on this
+		* plugin's page, so deleting it would trade a working fallback for nothing. It
+		* is now the SECOND choice, which also means its known weakness (the nav row is
+		* found by its localized label, so a language we did not ship cannot match) can
+		* no longer affect a host that has the seat.
+		*
+		*   1. click the shell's settings trigger (`aria-haspopup="dialog"` +
+		*      `aria-expanded`) — unless the panel is already open, in which case
+		*      clicking it would CLOSE it and the jump would turn into a disappearing
+		*      act;
+		*   2. wait for the panel to mount (it renders on demand into `body`);
+		*   3. find this plugin's nav row by its LABEL and click it.
+		*
+		* ## Why it never throws
+		*
+		* Every step runs from a RENDER path (a click handler in the credits popover). A
+		* throw here would take out the whole readout rather than one button, so each
+		* stage swallows its own failure and the whole jump degrades to a silent no-op
+		* when the shell has a different shape.
+		*
+		* @module dsh-connect-workbuddy/client/settings-jump
+		*/
+		/**
+		* The settings panel container.
+		*
+		* `data-shortcut-modal="settings"` is the shell's OWN attribute — its shortcut
+		* router keys off it to decide whether the open modal is the settings one — so
+		* it is far more stable than any class name, which is a CSS-module hash.
+		*/
+		const SETTINGS_PANEL_SELECTOR = "[data-shortcut-modal=\"settings\"]";
+		/** The sidebar's settings trigger: dialog semantics plus an expanded state. */
+		const TRIGGER_SELECTOR = "button[aria-haspopup=\"dialog\"][aria-expanded]";
+		/** The shipped slot whose store seat is the settings shell's state handle. */
+		const SETTINGS_SLOT = "sidebar.settings";
+		/**
+		* Budget for "panel mounted + nav row rendered".
+		*
+		* The panel mounts SYNCHRONOUSLY on the click, but the nav rows' labels wait for
+		* a locale snapshot, so a same-frame query is often one tick too early. Five
+		* attempts over ~300ms covers one layout pass while staying under the threshold
+		* where a user starts to think the click did nothing.
+		*/
+		const RETRY_DELAYS_MS = [
+			0,
+			60,
+			70,
+			80,
+			90
+		];
+		function defaultSchedule(run, ms) {
+			try {
+				window.setTimeout(run, ms);
+			} catch {
+				run();
+			}
+		}
+		function buttonsIn(scope) {
+			return Array.from(scope.querySelectorAll("button"));
+		}
+		/** Find the nav-row button whose label is this plugin's. */
+		function findSectionRow(scope, label) {
+			const want = label.trim();
+			if (want === "") return void 0;
+			return buttonsIn(scope).find((button) => (button.textContent ?? "").trim() === want);
+		}
+		/**
+		* Open Settings on this plugin's section through the shell's store seat.
+		*
+		* @returns `'opened'` when the dialog is on the right section (done), `'shell'`
+		*   when the dialog was opened but not preselected (route 2 can still click the
+		*   row), and `undefined` when the seat is absent or unusable.
+		*/
+		function openThroughStoreSeat(get, sectionId) {
+			let slots;
+			try {
+				slots = get("slots");
+			} catch {
+				return;
+			}
+			if (slots === void 0 || typeof slots.entries !== "function") return void 0;
+			let seat;
+			try {
+				seat = slots.entries(SETTINGS_SLOT)[0]?.store;
+			} catch {
+				return;
+			}
+			if (seat === null || typeof seat !== "object") return void 0;
+			const handle = seat;
+			if (typeof handle.create !== "function") return void 0;
+			try {
+				const instance = handle.create();
+				const openSection = instance?.actions?.openSection;
+				if (typeof openSection === "function") {
+					openSection(sectionId);
+					return "opened";
+				}
+				const open = instance?.actions?.open;
+				if (typeof open === "function") {
+					open();
+					return "shell";
+				}
+			} catch {}
+		}
+		/**
+		* Open the settings panel and select this plugin's section.
+		*
+		* @returns whether any route was taken (`false` = no route could be attempted,
+		*   so the shell is unrecognisable and `onGiveUp` already ran).
+		*/
+		function openWorkBuddySettingsSection(options) {
+			const { doc = document, label } = options;
+			const schedule = options.schedule ?? defaultSchedule;
+			const sectionId = options.sectionId ?? "dsh-connect-workbuddy";
+			if (options.get !== void 0) {
+				let seatResult;
+				try {
+					seatResult = openThroughStoreSeat(options.get, sectionId);
+				} catch {
+					seatResult = void 0;
+				}
+				if (seatResult === "opened") return true;
+			}
+			try {
+				if (doc.querySelector(SETTINGS_PANEL_SELECTOR) === null) {
+					const collapsed = Array.from(doc.querySelectorAll(TRIGGER_SELECTOR)).find((button) => button.getAttribute("aria-expanded") !== "true");
+					if (collapsed === void 0) {
+						try {
+							options.onGiveUp?.();
+						} catch {}
+						return false;
+					}
+					collapsed.click();
+				}
+				let clicked = false;
+				let remaining = RETRY_DELAYS_MS.length;
+				for (const delay of RETRY_DELAYS_MS) schedule(() => {
+					if (clicked) return;
+					remaining -= 1;
+					try {
+						const row = findSectionRow(doc.querySelector(SETTINGS_PANEL_SELECTOR) ?? doc, label());
+						if (row !== void 0) {
+							clicked = true;
+							row.click();
+							return;
+						}
+					} catch {}
+					if (remaining === 0) try {
+						options.onGiveUp?.();
+					} catch {}
+				}, delay);
+				return true;
+			} catch {
+				return false;
+			}
+		}
 		//#endregion
 		//#region src/client/index.tsx
 		/**
@@ -11594,6 +16142,95 @@ window.__ModuleLoader__.load({
 		*/
 		const inject = ["slots", "locale"];
 		/** Register card copy and the WorkBuddy card under Plugin configuration. */
+		/**
+		* Report whether the model-picker label slot landed.
+		*
+		* The slot is a `single` cell declared as a CHILD of `conversation.input.model`,
+		* so the host calls our inject callback only once that parent entry mounts. Two
+		* failures follow, and neither is visible on the page:
+		*
+		*   1. `register()` threw — another claim at the same priority.
+		*   2. The callback never ran — the parent never mounted. Nothing throws, the
+		*      disposer list is simply one shorter, and the picker shows no badges.
+		*
+		* Case 2 is why this exists: it produced NO trace of any kind. The state is
+		* published on `window` (so a person can inspect it without reproducing the
+		* symptom) and a failure is warned about exactly once per rebind. A healthy
+		* load stays silent — a warning that fires when nothing is wrong stops being
+		* read.
+		*
+		* Exported for the test. Called from `rebindSlots` (once, before the inject
+		* callback exists) and again from inside the inject callback (the only place
+		* that can observe a DEFERRED refusal or a late-arriving `slotKind`). Two
+		* callers, one state object: the later call always supersedes the earlier, and
+		* the warning is deduplicated so one failure still produces one line.
+		*
+		* @param state - What the registration path recorded.
+		* @param target - Where to publish; defaults to the global object.
+		* @returns The published view, or `undefined` when there is no global to
+		*          publish onto (server rendering, a bare test).
+		*/
+		/**
+		* One word for the state of the model-label registration.
+		*
+		* The four outcomes need DIFFERENT fixes, and three of them look identical from
+		* the picker (no badges):
+		*
+		*   not-reached       the client half never reached registration — a boot or
+		*                     composition problem, nothing to do with the slot.
+		*   parent-not-mounted  we asked, the host never called back: the parent entry
+		*                     (`conversation.input.model`) is not mounted, so the child
+		*                     cell does not exist yet.
+		*   failed            `register()` threw (a same-priority claim).
+		*   claimed           it landed; if badges are still missing the cause is
+		*                     downstream (render or CSS), not here.
+		*
+		* @param state - What the registration path recorded.
+		* @returns The verdict word.
+		*/
+		function modelLabelVerdictOf(state) {
+			if (state.failure !== void 0) return "failed";
+			if (state.injectRanAt !== void 0) return "claimed";
+			if (state.askedAt === void 0) return "not-reached";
+			return "parent-not-mounted";
+		}
+		function publishModelLabelState(state, target = globalThis) {
+			const view = {
+				verdict: modelLabelVerdictOf(state),
+				injectRanAt: state.injectRanAt,
+				askedAt: state.askedAt,
+				rebinds: state.rebinds,
+				failure: state.failure,
+				claimed: state.dispose !== void 0,
+				/**
+				* Which shape the host's declaration allowed, and how many seats were
+				* claimed for it.
+				*
+				* Without these two the picker has ONE symptom ("no badges") for two very
+				* different situations: a `single` host where an equal-priority rival won
+				* the cell, and a `keyed` host where a provider id was missed. `slotKind`
+				* says which contract was in force; `seats` says what this plugin did with
+				* it. `<provider count>` on a keyed host and `1` on a single host are the
+				* only healthy pairs.
+				*/
+				slotKind: state.slotKind,
+				seats: state.seats,
+				at: Date.now()
+			};
+			try {
+				target["__dshWorkBuddyModelLabel__"] = view;
+			} catch {
+				return;
+			}
+			if (state.failure !== void 0) {
+				const warned = target;
+				if (warned.__dshWorkBuddyModelLabelWarned__ !== state.failure) try {
+					target.warn?.("[dsh-connect-workbuddy] the model-picker badges could not be registered: " + state.failure);
+					warned.__dshWorkBuddyModelLabelWarned__ = state.failure;
+				} catch {}
+			}
+			return view;
+		}
 		function apply(ctx) {
 			try {
 				const namespace = "settings.workbuddy";
@@ -11603,36 +16240,129 @@ window.__ModuleLoader__.load({
 				}), "dsh-connect-workbuddy: settings copy");
 				const t = ctx.locale.bind(namespace);
 				const softGet = (name) => ctx.get(name);
+				/**
+				* The credits popover's header button: open 设置 → WorkBuddy.
+				*
+				* ALWAYS A FUNCTION, never `undefined`, and it takes no route value at
+				* creation time: it reads the store seat per press and otherwise drives the
+				* shell's real chrome (see `settings-jump.ts`). That matters because the
+				* readout only renders the button when this is present, and the first
+				* `registerAllSlots()` happens before most of `apply` has finished — a
+				* route captured from `ctx.get('layout')` at that moment is `undefined` on
+				* a host whose layout plugin applies later, and the renderer caches
+				* `inject()` results by entry identity, so nothing would ever correct it.
+				*
+				* The `onGiveUp` fallback asks the plugin manager for this bundle's page,
+				* so an unrecognisable shell still lands somewhere useful.
+				*/
+				const openSettingsSection = () => openWorkBuddySettingsSection({
+					label: () => t("nav.panel"),
+					get: softGet,
+					onGiveUp: () => {
+						const navigation = softGet("pluginNavigation");
+						if (navigation !== void 0 && typeof navigation.openBundle === "function") try {
+							navigation.openBundle("dsh-connect-workbuddy");
+						} catch {}
+					}
+				});
 				let settingsScope;
 				const forms = softGet("configForms");
 				/**
-				* Register one card slot; returns its disposer, or undefined if it failed.
+				* Register this plugin's page — and its nav glyph — in the Settings panel.
 				*
-				* `ctx.slots.inject(name, …)` resolves as soon as the slot is DECLARED (the
-				* Plugins page declares all three ledgers — `plugins.item`,
-				* `plugins.bundle.config`, `plugins.row.config` — as children of its own
-				* registration), and is otherwise queued until a later declaration. So a
-				* registration here is not lost just because the page has not mounted yet.
+				* ## Why one callback rather than two
+				*
+				* `settings.section` drives the nav row; `settings.section.icon` is rendered
+				* by the shell as `renderSlot('settings.section.icon', …, { only: row.id })`,
+				* so the glyph's cell is only meaningful while the page's id exists.
+				* Registering both from the same `inject` callback makes the pairing
+				* structural: the page's declaration is what makes the glyph addressable at
+				* all, and Cordis disposes both with this fiber.
+				*
+				* ## Why there is NO capability probe
+				*
+				* `ctx.slots.inject(name, …)` already IS the probe. It waits for the
+				* declaration and runs its callback once the slot exists; on a host that
+				* never declares `settings.section` it does nothing at all — no throw, no
+				* queued-forever registration. A probe built on anything else (a version
+				* string, an accessor the service may not expose) turns "not supported
+				* here" into "never registers anywhere", which is how a page nobody can see
+				* ships with no error at all. Let the host answer.
+				*
+				* `WorkBuddyCard` is registered with `surface: 'settings'`: the shell owns
+				* the panel chrome (title, close), so the card drops its own collapse and
+				* back affordances and keeps only its content.
 				*/
-				const registerCard = (slotName, key) => {
+				const registerSettingsSection = () => {
 					try {
-						return ctx.slots.inject(slotName, () => ctx.slots.register({
-							name: slotName,
-							key,
-							priority: 30,
-							inject: () => settingsScope === void 0 ? { t } : {
+						return ctx.slots.inject("settings.section", () => {
+							const disposers = [];
+							const injected = () => settingsScope === void 0 ? {
 								t,
-								settingsScope
+								surface: "settings"
+							} : {
+								t,
+								settingsScope,
+								surface: "settings"
+							};
+							disposers.push(ctx.slots.register({
+								name: "settings.section",
+								id: WORKBUDDY_SETTINGS_SECTION_ID,
+								order: 35,
+								label: () => t("nav.panel"),
+								locale: namespace,
+								inject: injected
+							}, WorkBuddyCard));
+							try {
+								const iconInject = ctx.slots.inject("settings.section.icon", () => {
+									const iconDisposer = ctx.slots.register({
+										name: "settings.section.icon",
+										id: WORKBUDDY_SETTINGS_SECTION_ID,
+										locale: namespace
+									}, (iconProps) => {
+										const edge = typeof iconProps?.size === "number" ? iconProps.size : 16;
+										return (0, react.createElement)(PluginIcon, {
+											size: edge,
+											className: "dsm-workbuddy-nav-icon",
+											style: {
+												borderRadius: "4px",
+												display: "block",
+												opacity: iconProps?.active === false ? .75 : 1
+											}
+										});
+									});
+									disposers.push(iconDisposer);
+									return iconDisposer;
+								});
+								if (typeof iconInject === "function") disposers.push(iconInject);
+							} catch (error) {
+								console.error("[dsh-connect-workbuddy] settings nav icon failed to register (page unaffected):", error);
 							}
-						}, WorkBuddyCard));
+							return () => {
+								for (const dispose of disposers) try {
+									dispose();
+								} catch {}
+							};
+						});
 					} catch (error) {
-						console.error(`[dsh-connect-workbuddy] card slot "${slotName}" failed to register (host provider unaffected):`, error);
+						console.error("[dsh-connect-workbuddy] settings section failed to register (host provider unaffected):", error);
 						return;
 					}
 				};
 				/**
-				* Credit readout in the composer tool row (`conversation.input.left`, a
-				* session-scope list slot).
+				* Credit readout in the composer row (`conversation.input.right`, a
+				* session-scope list slot rendered immediately before the model picker).
+				*
+				* `input.right` rather than `input.left` (ported from dsh-connect-trae's
+				* issue #71): the host renders `input.right` inside `div.trailing`'s
+				* `standardControls`, i.e. IMMEDIATELY BEFORE the model picker, while
+				* `input.left` sits at the very end of `div.tools` — 8px from the
+				* permission selector. Both are clickable, so reaching for "完全权限"
+				* landed on the readout and opened the credit popover. A readout is not an
+				* action; next to the model picker it stops competing with a control the
+				* user is actually aiming at. The `composer` SETTING value keeps its
+				* meaning ("the row that carries the model picker"), so saved profiles
+				* need no migration.
 				*
 				* 参考：dingminhua/dsh-connect-trae（MIT，Copyright (c) 2026 LaoDing）
 				*   — 该项目的 `registerComposerPoints`：无条件注册插槽、由 gate 读
@@ -11650,19 +16380,17 @@ window.__ModuleLoader__.load({
 				*/
 				const registerComposerCredits = () => {
 					try {
-						return ctx.slots.inject("conversation.input.left", () => ctx.slots.register({
-							name: "conversation.input.left",
+						return ctx.slots.inject("conversation.input.right", () => ctx.slots.register({
+							name: "conversation.input.right",
 							id: "dsh-connect-workbuddy-composer-credits",
 							order: 4,
 							locale: namespace,
-							inject: () => settingsScope === void 0 ? {
-								t,
-								position: "composer"
-							} : {
+							inject: () => ({
 								t,
 								position: "composer",
-								settingsScope
-							}
+								...settingsScope === void 0 ? {} : { settingsScope },
+								onOpenSettings: openSettingsSection
+							})
 						}, ComposerCreditsGate));
 					} catch (error) {
 						console.error("[dsh-connect-workbuddy] composer credits slot failed to register (host provider unaffected):", error);
@@ -11699,6 +16427,18 @@ window.__ModuleLoader__.load({
 				* ordering, the measured evidence, and the deliberate absence of any
 				* inter-plugin coordination (project invariant, `docs/DESIGN.md` §零).
 				*
+				* HOW MANY SEATS, AND WHY THAT IS READ AT MOUNT. `single` holds one cell, so
+				* exactly one registration is legal there. A `keyed` host gives each
+				* `options.key` its own cell, and one cell per provider id is what this
+				* plugin actually wants: it then draws its OWN rows and nothing else, qoder
+				* and trae stop sharing a cell with it, and a provider with no contribution
+				* falls through to the host's own fallback. Which of the two shapes is
+				* legal is the HOST's declaration, not this plugin's choice, so the kind is
+				* read from `ctx.slots.spec(...)` at mount and the seat list is derived from
+				* it (`./model-label-seat.ts`). One build therefore serves both lines — and
+				* a host that cannot be inspected gets the single seat, which is what every
+				* released version of this plugin already does.
+				*
 				* THE COST IS PAID ON ANOTHER PLUGIN'S ROWS, and it is worth stating where
 				* the registration happens: holding this cell means the host's own
 				* `dsh-client-ui-deepseek-model-label-1017` badge is NOT rendered on the
@@ -11706,18 +16446,208 @@ window.__ModuleLoader__.load({
 				* to fix by inspecting the slot ledger — it is the price of §零, recorded in
 				* `docs/DESIGN.md` and argued in the 5.8.2 CHANGELOG. Issue #138 is a user
 				* meeting that price for the first time; the disposition is to state it
-				* plainly rather than to coordinate at runtime.
+				* plainly rather than to coordinate at runtime. On a `keyed` host that price
+				* is not paid at all: each provider keeps its own cell, so 1017's badge
+				* returns to the DeepSeek rows without anyone negotiating.
 				*/
+				/**
+				* WHY THIS RECORDS AN OUTCOME, not just a disposer.
+				*
+				* Claiming the cell can fail in two DIFFERENT ways and both are silent:
+				*
+				*  1. `register()` throws — a `single` slot with another claim at the same
+				*     priority. The catch logs, the page looks fine, the badges are gone.
+				*  2. `inject()` never runs — the slot is declared as a child of
+				*     `conversation.input.model`, so the host only calls back once THAT
+				*     entry mounts. If it never mounts (a session-less surface, an older
+				*     host, a renamed parent), nothing throws at all: the callback simply
+				*     does not happen and the disposer list stays one shorter.
+				*
+				* Case 2 left no trace of any kind, which is why this plugin could look
+				* healthy while the picker showed no badges. Recording the timestamp of the
+				* callback and the reason for a failure turns "did it land?" from a guess
+				* into a fact the diagnostics row can print.
+				*/
+				const modelLabelState = {};
+				/** The verdict for the console line (see `modelLabelVerdictOf`). */
+				const modelLabelVerdict = () => modelLabelVerdictOf(modelLabelState);
 				const registerModelLabel = () => {
-					try {
-						return ctx.slots.inject("conversation.input.model.label", () => ctx.slots.register({
-							name: "conversation.input.model.label",
-							priority: MODEL_LABEL_PRIORITY
-						}, WorkBuddyModelLabel));
-					} catch (error) {
+					modelLabelState.askedAt = Date.now();
+					/**
+					* The refusal path, shared by the eager and the deferred call.
+					*
+					* REPUBLISHES, and that is not cosmetic. `rebindSlots` publishes once, and
+					* on the normal boot it publishes BEFORE this callback exists: `inject()`
+					* defers the callback until `conversation.input.model` mounts, so the
+					* published view is a snapshot of a registration that has not happened
+					* yet. Without this line the failure lands in a state object that nothing
+					* reads again, and `window.__dshWorkBuddyModelLabel__` keeps
+					* `failure: undefined` with verdict `parent-not-mounted` — the exact
+					* opposite of the truth, in the surface built to state it.
+					*/
+					const refuse = (error) => {
+						const message = error instanceof Error ? error.message : String(error);
+						modelLabelState.failure = message;
 						console.error("[dsh-connect-workbuddy] model label slot failed to register (host provider unaffected):", error);
+						publishModelLabelState(modelLabelState);
+					};
+					try {
+						return ctx.slots.inject("conversation.input.model.label", () => {
+							modelLabelState.injectRanAt = Date.now();
+							const kind = declaredSlotKind(ctx.slots, "conversation.input.model.label");
+							const seats = modelLabelSeats({
+								name: "conversation.input.model.label",
+								kind,
+								providerIds: WORKBUDDY_PROVIDER_IDS,
+								priority: MODEL_LABEL_PRIORITY
+							});
+							const registry = ctx.slots;
+							try {
+								const dispose = registerModelLabelSeats(seats, (seat) => registry.register(seat, WorkBuddyModelLabel));
+								modelLabelState.slotKind = kind ?? "unknown";
+								modelLabelState.seats = seats.length;
+								publishModelLabelState(modelLabelState);
+								return dispose;
+							} catch (error) {
+								refuse(error);
+								return () => {};
+							}
+						});
+					} catch (error) {
+						return refuse(error);
+					}
+				};
+				/**
+				* The sidebar glyph for the WorkBuddy panel row.
+				*
+				* The sidebar renders `sidebar.panellist` registrants with `{ size, active }`
+				* inside a `currentColor`-themed glyph cell, so the brand mark is drawn as a
+				* small `<img>` — the PNG's own colours read as the plugin's identity, and
+				* the row's selection state is the host's to paint around it.
+				*/
+				function WorkBuddyPanelIcon(props) {
+					const edge = typeof props.size === "number" && props.size > 0 ? props.size : 16;
+					return (0, react.createElement)(PluginIcon, {
+						className: "dsm-workbuddy-panel-icon",
+						size: edge
+					});
+				}
+				/**
+				* The WorkBuddy panel in the sidebar (`sidebar.panellist` row + `main` keyed
+				* page), mirroring how the host's own Plugins row and dsh-skill-mcp-panel
+				* put a full page in the centre column.
+				*
+				* OPT-IN (`Config.sidebarPanel`, default false). Registering it is NOT the
+				* same as showing it: `ui-sidebar` builds the nav row from the slot's ENTRY
+				* METADATA (`usePanels` → `PanelRow` with `options.label` and
+				* `renderSlot(...)` as the glyph), so a component returning `null` leaves a
+				* blank but still-clickable button rather than no button. The row therefore
+				* has to be registered only while the switch is on, which is what
+				* {@link syncPanelRegistration} owns. See `panel-switch.ts` for the store
+				* that decision rides on.
+				*
+				* Back navigation reuses the host's layout service: `selectPanel(null)`
+				* hands the main area back to the conversation. It is soft-probed, so a
+				* host that never declares `layout` simply renders the page without the back
+				* affordance instead of blocking the whole plugin (the same degradation the
+				* card already promises for a missing settings form).
+				*/
+				/**
+				* The `main` key this plugin's full page is registered under.
+				*
+				* Also the id the composer readout asks `layout.selectPanel` for, so the two
+				* cannot drift: a rename here that missed `openFullPage` below would leave a
+				* button that throws "main panel is not registered".
+				*/
+				const PANEL_ID = "dsh-connect-workbuddy";
+				/** Hand the centre column back to the conversation. */
+				const backToConversation = () => {
+					const layout = softGet("layout");
+					if (layout !== void 0 && typeof layout.selectPanel === "function") layout.selectPanel(null);
+				};
+				/**
+				* The full page: a `main` panel keyed by {@link PANEL_ID}.
+				*
+				* Registered ALWAYS, independently of the sidebar row. They used to share one
+				* lifetime, which made the page reachable only while the optional nav row was
+				* switched on — and the nav row is a global seat, off by default, that most
+				* users never turn on. The page is what the composer readout's button opens,
+				* so tying the two together meant that button could not exist.
+				*/
+				const registerMainPage = () => {
+					try {
+						return ctx.slots.inject("main", () => ctx.slots.register({
+							name: "main",
+							key: PANEL_ID,
+							locale: namespace,
+							inject: () => settingsScope === void 0 ? {
+								t,
+								surface: "page",
+								backToConversation
+							} : {
+								t,
+								settingsScope,
+								surface: "page",
+								backToConversation
+							}
+						}, WorkBuddyCard));
+					} catch (error) {
+						console.error("[dsh-connect-workbuddy] full page failed to register (host provider unaffected):", error);
 						return;
 					}
+				};
+				/**
+				* The OPTIONAL sidebar nav row that points at {@link registerMainPage}'s page.
+				*
+				* Separate from the page for the reason above: `sidebar.panellist` builds its
+				* rows from ENTRY METADATA (`usePanels`), so this is the only half that has to
+				* come and go with the switch. Registering the row is what makes the page
+				* reachable from the sidebar; the page itself exists either way.
+				*/
+				const registerPanelRow = () => {
+					const disposers = [];
+					try {
+						disposers.push(ctx.slots.inject("sidebar.panellist", () => ctx.slots.register({
+							name: "sidebar.panellist",
+							id: PANEL_ID,
+							order: 2,
+							label: () => t("nav.panel"),
+							locale: namespace
+						}, WorkBuddyPanelIcon)));
+					} catch (error) {
+						console.error("[dsh-connect-workbuddy] sidebar panel row failed to register (host provider unaffected):", error);
+					}
+					return disposers;
+				};
+				/**
+				* The live panel registrations, kept SEPARATE from {@link liveDisposers}.
+				*
+				* They are the only slots in this plugin that come and go while the page is
+				* open (the opt-in switch), so owning them apart from the rest means
+				* flipping the switch does not dispose and re-create the card, the composer
+				* readout and the five other seats — which would be a visible flicker on the
+				* Plugins page for a change that has nothing to do with it.
+				*/
+				let panelDisposers = [];
+				/**
+				* Bring the panel registrations in line with the opt-in switch.
+				*
+				* Dispose FIRST, then register, for the reason spelled out on
+				* {@link rebindSlots}: a live `key` / `id` cannot be registered twice, and
+				* the throw would be swallowed into "no entry at all".
+				*
+				* Re-registering (rather than only unregistering) is what keeps the entry
+				* fresh after a settings-scope rebind: the renderer caches each entry's
+				* `inject` result by object identity, so an entry created before the scope
+				* landed would keep serving props without it forever.
+				*/
+				const syncPanelRegistration = () => {
+					for (const dispose of panelDisposers) try {
+						dispose();
+					} catch {}
+					panelDisposers = [];
+					if (!sidebarPanelWanted()) return;
+					panelDisposers = registerPanelRow();
 				};
 				/**
 				* The SAME readout in the ambient dock below the composer card (issue #62).
@@ -11745,14 +16675,12 @@ window.__ModuleLoader__.load({
 							id: "dsh-connect-workbuddy-stats-credits",
 							order: 10,
 							locale: namespace,
-							inject: () => settingsScope === void 0 ? {
-								t,
-								position: "stats"
-							} : {
+							inject: () => ({
 								t,
 								position: "stats",
-								settingsScope
-							}
+								...settingsScope === void 0 ? {} : { settingsScope },
+								onOpenSettings: openSettingsSection
+							})
 						}, ComposerCreditsGate));
 					} catch (error) {
 						console.error("[dsh-connect-workbuddy] stats credits slot failed to register (host provider unaffected):", error);
@@ -11847,21 +16775,24 @@ window.__ModuleLoader__.load({
 				* late-arriving namespace has to produce fresh registrations rather than a
 				* mutated closure.
 				*
-				* The card registers under EVERY spelling of its package name (see
-				* {@link WORKBUDDY_CARD_KEYS}): the Plugins page looks a
-				* configuration up by exact `key` equality against the inventory's package
-				* name, and a deployment is free to name the install row whatever it likes
-				* — issue #55 is exactly that mismatch, which renders an empty page and
-				* reports nothing at all.
+				* The configuration page is `settings.section` — ONE registration under an
+				* id this plugin owns, so there is no inventory name to match and no
+				* spelling to get wrong (see {@link WORKBUDDY_SETTINGS_SECTION_ID}). The
+				* former `plugins.bundle.config` / `plugins.row.config` pair is GONE with
+				* 5.19.0: the same configuration must not have two editing entries.
 				*/
 				const registerAllSlots = () => [
-					...WORKBUDDY_CARD_KEYS.map((key) => registerCard("plugins.bundle.config", key)),
-					...WORKBUDDY_CARD_KEYS.map((key) => registerCard("plugins.row.config", `${key}#${key}`)),
+					registerSettingsSection(),
 					registerComposerCredits(),
 					registerStatsCredits(),
 					registerCliLive(),
 					registerQuotaNotice(),
-					registerModelLabel()
+					(() => {
+						const dispose = registerModelLabel();
+						modelLabelState.dispose = dispose;
+						return dispose;
+					})(),
+					registerMainPage()
 				].filter((disposer) => disposer !== void 0);
 				/**
 				* Disposers of the slots registered for the CURRENT binding.
@@ -11891,10 +16822,13 @@ window.__ModuleLoader__.load({
 						dispose();
 					} catch {}
 					liveDisposers = [];
+					modelLabelState.rebinds = (modelLabelState.rebinds ?? 0) + 1;
 					liveDisposers = registerAllSlots();
+					publishModelLabelState(modelLabelState);
 					try {
-						console.info(`[dsh-connect-workbuddy] registered ${String(liveDisposers.length)} slots (settings form: ${settingsScope === void 0 ? "none — card is read-only" : "bound"})`);
+						console.info(`[dsh-connect-workbuddy] registered ${String(liveDisposers.length)} slots (settings form: ${settingsScope === void 0 ? "none — page is read-only" : "bound"}, sidebar panel: ${sidebarPanelWanted() ? "on" : "off"}, model label: ${modelLabelVerdict()}${modelLabelState.failure === void 0 ? "" : ` (${modelLabelState.failure})`})`);
 					} catch {}
+					syncPanelRegistration();
 				};
 				/**
 				* Bind `settingsScope` to whichever namespace the Host really serves, and
@@ -11931,6 +16865,7 @@ window.__ModuleLoader__.load({
 					if (forms === void 0 || typeof forms.whileServed !== "function") {
 						settingsScope = forms?.get(WORKBUDDY_SETTINGS_NS);
 						liveDisposers = registerAllSlots();
+						syncPanelRegistration();
 						return;
 					}
 					ctx.effect(() => forms.whileServed(WORKBUDDY_SETTINGS_NAMESPACE_CANDIDATES, (served) => {
@@ -11942,11 +16877,44 @@ window.__ModuleLoader__.load({
 								dispose();
 							} catch {}
 							liveDisposers = [];
+							for (const dispose of panelDisposers) try {
+								dispose();
+							} catch {}
+							panelDisposers = [];
 						};
 					}), "dsh-connect-workbuddy: settings namespace binding");
 					rebindSlots();
 				};
 				bindSettingsScope();
+				/**
+				* Follow the opt-in switch, and SEED it from the Host.
+				*
+				* The seed is a status read rather than the settings scope on purpose. This
+				* namespace's browser mirror is documented as stale on the affected 0.1.7
+				* deployments, and here a stale `false` would mean the row never appears —
+				* with no later event to correct it, because `whileServed` only fires on a
+				* namespace edge, not on a value change. The Host's own answer is the
+				* authority (`sidebarPanelEnabled` on the usage document), exactly as it is
+				* for the other Host-carried switches.
+				*
+				* A failed read is NOT an error to show: OFF is a legitimate and, in fact,
+				* the default answer, so a plugin whose status route is unreachable simply
+				* gets no row. There is nothing the user could do about it from here.
+				*
+				* The SUBSCRIPTION is what makes the switch live: the card calls
+				* `setSidebarPanelWanted` after a verified write, so the row appears and
+				* disappears without a reload. `ui-layout` drops an `activePanelId` whose
+				* `main` key has gone, so switching off while the page is open returns the
+				* centre column to the conversation on its own.
+				*/
+				ctx.effect(() => subscribeSidebarPanelWanted(syncPanelRegistration), "dsh-connect-workbuddy: sidebar panel opt-in");
+				(async () => {
+					try {
+						const response = await fetch(withWorkBuddyRegion(WORKBUDDY_USAGE_PATH, "cn"), { headers: { accept: "application/json" } });
+						if (!response.ok) return;
+						if ((await response.json()).sidebarPanelEnabled === true) setSidebarPanelWanted(true);
+					} catch {}
+				})();
 			} catch (error) {
 				console.error("[dsh-connect-workbuddy] client card failed to load (host provider unaffected):", error);
 			}
@@ -11954,7 +16922,9 @@ window.__ModuleLoader__.load({
 		//#endregion
 		exports.apply = apply;
 		exports.inject = inject;
+		exports.modelLabelVerdictOf = modelLabelVerdictOf;
 		exports.name = name;
+		exports.publishModelLabelState = publishModelLabelState;
 		return module.exports;
 	}
 });

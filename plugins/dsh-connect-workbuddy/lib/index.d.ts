@@ -197,6 +197,15 @@ declare function workbuddyOwnAuthPath(region: WorkBuddyRegion): string;
  */
 declare function legacyWorkbuddyOwnAuthPath(): string;
 /**
+ * 平台名，**比 `NodeJS.Platform` 宽**。
+ *
+ * DSHM（端侧形态）内嵌的 Node 在鸿蒙上把 `process.platform` 报成
+ * `'openharmony'`，而 @types/node 的 `NodeJS.Platform` 里没有这个字面量
+ * （issue #190）。用 `| (string & {})` 而不是 `| string`：前者保留联合类型的
+ * 自动补全，同时允许这些运行时才出现的值。
+ */
+type DesktopAuthPlatform = NodeJS.Platform | (string & {});
+/**
  * Platform-default directories holding the WorkBuddy desktop app's auth file.
  *
  * Windows and Linux prefer the OS-issued env location and fall back to the
@@ -204,11 +213,20 @@ declare function legacyWorkbuddyOwnAuthPath(): string;
  * folder backup, enterprise policy) still resolves. macOS has no equivalent
  * env variable; the single Application Support path is used as-is.
  *
+ * 鸿蒙（issue #190）没有 `homedir()` 可用——它返回应用沙箱，所以那条分支用
+ * 系统固定挂载点。Linux 会同时看 XDG 的 data 与 config 两套目录。
+ *
  * `platform`, `home`, and `env` are injectable so the platform branches are
  * testable on any host without touching a real machine.
  */
-declare function defaultDesktopAuthDirs(platform?: NodeJS.Platform, home?: string, env?: NodeJS.ProcessEnv): string[];
-/** The live auth file's platform candidates, in probe order. */
+declare function defaultDesktopAuthDirs(platform?: DesktopAuthPlatform, home?: string, env?: NodeJS.ProcessEnv): string[];
+/**
+ * The live auth file's platform candidates, in probe order.
+ *
+ * Every known basename for every platform directory: a machine can hold the old
+ * and the new spelling side by side during an app upgrade, and probing only the
+ * canonical one is the defect issue #174 reports.
+ */
 declare function defaultDesktopAuthCandidates(): string[];
 /** First platform-default candidate; see {@link defaultDesktopAuthCandidates}. */
 declare function defaultDesktopAuthPath(): string | undefined;
@@ -461,6 +479,26 @@ declare class WorkBuddyCredentialStore {
    * available at all, that hint IS accurate and this returns false.
    */
   selectionLost(): Promise<boolean>;
+  /**
+   * Why the vault could not be read, when it could not (issue #199).
+   *
+   * `syncVault` deliberately swallows a failed `readVaultEntries` so account
+   * discovery stays up — the right call for availability, the wrong call for
+   * honesty: the user then sees the SAVED account reported as "no longer on
+   * this machine" when the truth is "this process may not read the directory".
+   * The issue #199 lockout (foreign owner + `/inheritance:r`) produces exactly
+   * that shape: readdir EPERM while per-path readFile still works, so nothing
+   * else in the diagnostics reports the directory either.
+   *
+   * A dedicated readdir probe rather than a field recorded during the scan:
+   * the scan is shared/cached (`scanInflight`), its failure is transient by
+   * design, and a probe here is one cheap readdir on a path that is already
+   * failing — the error string is the fact the card needs.
+   *
+   * Returns the raw error message, or `undefined` when the directory reads
+   * (including the absent case, which is normal before the first OAuth add).
+   */
+  vaultReadError(): Promise<string | undefined>;
   /** The freshest stored credential for the current selection, no refresh. */
   current(): Promise<WorkBuddyCredential | undefined>;
   /**
@@ -607,6 +645,221 @@ declare class WorkBuddyCredentialStore {
     tried: string[];
     failures: WorkBuddyCandidateFailure[];
   }>;
+}
+//#endregion
+//#region src/device-profile.d.ts
+/**
+ * 每账号的"虚拟设备"参数（设置里的「虚拟值」档）。
+ *
+ * ## 它解决什么
+ *
+ * P1 的设备对（`X-Machine-ID` / `X-Session-ID`）是从 `sha256(命名空间 + 本机盐 +
+ * 用途 + uid)` 算出来的：稳定、按号隔离，但**不可调**。用户往往需要手上一台
+ * "指定"的设备——排查某个账号为什么被判异常时，第一件事就是把它的设备标识换成
+ * 一个已知值；或者反过来，怀疑两个账号被关联时，把其中一个改成明显不同的值。
+ * 这个文件就是那些"指定值"的落点。
+ *
+ * ## 与盐的关系
+ *
+ * 盐是**派生输入**，这里是**覆盖结果**。两者不冲突：某个账号没有覆盖时照常派生，
+ * 有覆盖时逐字段用覆盖值（只改 machine、session 仍派生是完全合法的操作）。
+ * 盐不因为这里的存在而改变——覆盖只影响发出去的头。
+ *
+ * ## 「真实值（P3）」在这里只是被记住
+ *
+ * `mode` 会落盘、会被读出来、会决定界面上齿轮是否可用，但**不改变任何出站字节**：
+ * 真 token 的取法与档位互斥规则都在 P3。写在这里而不是留一个前端 state，是因为
+ * 一个只在浏览器内存里的切档，刷新一次就回到默认值——那不叫预留入口，那叫没做。
+ *
+ * @module dsh-connect-workbuddy/device-profile
+ */
+/** 设备头档位。「真实值」目前只是占位，不改变出站字节（P3）。 */
+type WorkBuddyDeviceMode = 'virtual' | 'real';
+/** 一个账号的覆盖值；空字段表示"这一项仍然派生"。 */
+interface WorkBuddyDeviceProfile {
+  machineId?: string;
+  sessionId?: string;
+}
+/**
+ * 一个账号**留空时真正会发出去**的那一对 id。
+ *
+ * 它由 `sha256(命名空间 + 本机盐 + 用途 + uid)` 算出（见 `device-id.ts`），
+ * 因此同一台机器上不同账号必然不同、同一账号跨重启必然相同——前者是隔离，
+ * 后者是设备稳定性。UI 把它显示出来，是为了让"留空"这件事有一个可核对的结果，
+ * 而不是一句"自动派生"。
+ */
+interface WorkBuddyDeviceDerived {
+  machineId: string;
+  sessionId: string;
+}
+/** What the card and the resolver both read. */
+interface WorkBuddyDeviceSettings {
+  mode: WorkBuddyDeviceMode;
+  /** accountId（sha256 前 24 位）→ 覆盖值。**不含 uid**：这份文档会发给浏览器。 */
+  accounts: Readonly<Record<string, WorkBuddyDeviceProfile>>;
+  /**
+   * accountId → 该账号当前自动派生的值。
+   *
+   * 缺席（而不是 `{}`）表示"这次没有算"——盐不可用、或调用方没有传账号列表。
+   * 空对象则表示"算过，但这个池子里没有一个能算"。两者在界面上要说不同的话：
+   * 前者是"本机没有设备盐"，后者是"这些账号没有 uid"。
+   */
+  derived?: Readonly<Record<string, WorkBuddyDeviceDerived>>;
+  /**
+   * 「真实值」档在这台机器上到底能不能用（由 Host 判定，界面不猜平台）。
+   *
+   * 见 `index.ts` 的 `REAL_TIER_AVAILABILITY`：macOS 上 SDK 能被发现、`probe` 也答
+   * `ready`，但取 token 那一环会 `dispatch_sync` 死锁，所以那一档永远只能降级。
+   * 界面据此禁用档位按钮并说明原因——一个"能点、点了没用、只能靠降级兜底"的选项
+   * 比不提供更差。
+   */
+  realTier?: {
+    state: 'available' | 'broken' | 'unavailable';
+    platform: string;
+  };
+  /**
+   * 用户在「SDK」分区手填的 SDK 目录；空串 = 走自动发现链。
+   *
+   * 优先级：`WORKBUDDY_TURING_SDK_DIR` > 这一项 > 自动发现。环境变量压过它，因为
+   * 那个变量是「配置项够不着的场景」的旁路（`doctor` 与插件读同一个值），反过来
+   * 会让一个排障时设的变量在下一次点「保存」后静默失效，而那正是排障的人最不希望
+   * 发生的事。
+   */
+  sdkDir: string;
+  /**
+   * 真实值档取不到 token 时是否退回虚拟值。**默认开**（作者意见 #2）。
+   *
+   * 这个默认值与 P3 原先的取舍相反，而原先那个取舍有理由：静默退回会让界面写着
+   * 「真实值」、线上跑着虚拟值。所以退回必须**说出来**——`wireIdentity` 退回时把
+   * 档位降成 `virtual`，卡片与 `doctor` 因此都照实显示"现在发的是虚拟值"。
+   * 用户要的是「有总比没有好」，不是「别告诉我」。
+   */
+  sdkFallbackToVirtual: boolean;
+}
+/**
+ * Host 侧给卡片路由用的接口。
+ *
+ * `saveAccount` 只要 accountId：uid 由 Host 自己从凭据库解出来——**浏览器端永远
+ * 不该把 uid 传上来**，那是账号在网关侧的身份，不是它需要知道的东西。
+ */
+interface WorkBuddyDeviceSettingsPort {
+  read(): Promise<WorkBuddyDeviceSettings>;
+  setMode(mode: WorkBuddyDeviceMode): Promise<WorkBuddyDeviceSettings>;
+  saveAccount(accountId: string, values: {
+    machineId?: string;
+    sessionId?: string;
+  }): Promise<WorkBuddyDeviceSettings>;
+  /** 保存 SDK 目录与回退开关（作者意见 #1 / #2）。`undefined` = 不动这一项。 */
+  saveSdk(values: {
+    sdkDir?: string;
+    sdkFallbackToVirtual?: boolean;
+  }): Promise<WorkBuddyDeviceSettings>;
+}
+/**
+ * The request-path view: uid → overrides.
+ *
+ * 按 uid 索引而不是 accountId，是因为构头时手上只有 credential（`uid` 就在里面，
+ * 而 accountId 要算哈希；`upstream.ts` 也不能反向 import `auth.ts` 的取值函数，
+ * 那会成环）。文件里同时存 uid，正是为了让这一步不需要再查一次凭据库。
+ */
+interface WorkBuddyDeviceProfileLookup {
+  forUid(uid: string): Promise<WorkBuddyDeviceProfile | undefined>;
+  /**
+   * 当前档位。真实值档下 `forUid` 的结果会被忽略（所有账号共用这台机器的真实
+   * 设备），但仍然要能读出来——构头时必须先知道自己在哪一档。
+   */
+  mode(): Promise<WorkBuddyDeviceMode>;
+  /**
+   * 真实值档取不到 token 时是否退回虚拟值（作者意见 #2）。
+   *
+   * 与 {@link mode} 分开读而不是并进一个对象：请求路径上两者都要，而它们的失效
+   * 时机相同（同一份 5 秒缓存）。分开的返回值让"档位"与"回退"在调用点各有一个
+   * 名字，`wireIdentity` 里那条分叉才读得出来。
+   */
+  fallbackToVirtual(): Promise<boolean>;
+  /** 手填的 SDK 目录；空串 = 走自动发现链。 */
+  sdkDir(): Promise<string>;
+}
+//#endregion
+//#region src/turing-sdk.d.ts
+/** What one `probe` established about the SDK on THIS machine. */
+interface TuringSdkInfo {
+  /**
+   * `ready` = 能加载且自称支持；`unsupported` = 平台不支持；`missing` = 没发现本机
+   * 装有桌面端 SDK；`error` = 目录在但加载不了；
+   * `disabled` = 用户把总开关关了（`deviceSdkEnabled: false`）。
+   *
+   * `disabled` 与 `missing` 必须分开：前者是"我不要"，后者是"这台机器上没有"。
+   * 合并成一个会让关掉开关的用户每次打开面板都看到一条"装个桌面端就好"的建议，
+   * 而那正是他明确拒绝去做的事。
+   */
+  state: 'ready' | 'unsupported' | 'missing' | 'error' | 'disabled';
+  /** `win32-x64` 之类的主机三元组；只用于展示与排障，不再决定目录。 */
+  bundle: string;
+  /** 本机桌面端里的 SDK 目录（或 `WORKBUDDY_TURING_SDK_DIR` 指向的目录）；空串 = 没找到。 */
+  path: string;
+  platform: string;
+  arch: string;
+  /** 子进程用的运行时版本，例如 `22.22.2` 或 `electron 30.0.0`。 */
+  runtime: string;
+  /** 仅在非 `ready` 时出现；面向排障，不含任何 secret。 */
+  reason?: string;
+}
+/** The token as the card sees it: never the value itself. */
+interface TuringTokenReadout {
+  /** `ok` = 新鲜；`stale` = 取不到新的、还在宽限期内；`unavailable` = 没有可用的值。 */
+  state: 'ok' | 'stale' | 'unavailable' | 'idle';
+  /** 掩码，可以直接进 UI。 */
+  masked: string;
+  /** token 的字符数（0 表示没有）。长度本身不是秘密，且是判断"拿对了没有"的唯一线索。 */
+  length: number;
+  /** 这一枚 token 是什么时候取到的。 */
+  fetchedAtMs?: number;
+  /** 上一次**尝试**的时间，成功失败都记——"刚试过但失败了"与"还没试过"必须能分开。 */
+  lastAttemptMs?: number;
+  /** `stale` / `unavailable` 的原因，结构化短语，不含 secret。 */
+  reason?: string;
+}
+/** The token source the request path and the card share. */
+interface TuringTokenSource {
+  /** 当前可用的 token；取不到就是 `undefined`（**不会**退回派生值，那是另一档）。 */
+  current(): Promise<string | undefined>;
+  /** Force a refetch; returns the readout afterwards. */
+  refresh(): Promise<TuringTokenReadout>;
+  /** The masked snapshot, safe to render and to log. */
+  readout(): TuringTokenReadout;
+  /** 用户显式点击后才给的一次完整值。 */
+  reveal(): Promise<string | undefined>;
+}
+/**
+ * 卡片「SDK」分区读到的那一份快照。
+ *
+ * `tier` 与 `token` 必须在同一份对象里：分开取会让界面出现"档位已切换、状态还是
+ * 上一档"的中间态，而这两个值恰好是用户用来判断"我现在到底发的是什么"的。
+ */
+interface WorkBuddyDeviceSdkReport {
+  tier: WorkBuddyDeviceMode;
+  sdk: TuringSdkInfo;
+  token: TuringTokenReadout;
+}
+/** Host → 卡片路由的端口。 */
+interface WorkBuddyDeviceSdkPort {
+  read(): Promise<WorkBuddyDeviceSdkReport>;
+  refresh(): Promise<WorkBuddyDeviceSdkReport>;
+  /** 完整 token；没有可用值时为 `undefined`。只在显式点击后调用。 */
+  reveal(): Promise<string | undefined>;
+  /**
+   * SDK 总开关（`Config.deviceSdkEnabled`）的读写。
+   *
+   * 与 `read` 分开两个方法，而不是并进上面那份快照：开关是**配置**，快照是
+   * **测量**。混在一起会让"读一次快照"变成一次可能失败的配置读，而这一页最该
+   * 做到的事就是"打不开也能告诉你是谁坏了"。
+   *
+   * `write` 返回 `false` 表示这个宿主没有 settings 服务（老宿主），卡片据此把
+   * 开关置灰，而不是显示一个点了没反应的勾选框。
+   */
+  readEnabled(): Promise<boolean | undefined>;
+  writeEnabled(enabled: boolean): Promise<boolean>;
 }
 //#endregion
 //#region src/image-gen.d.ts
@@ -1368,29 +1621,94 @@ declare function regionOf(domain: string): WorkBuddyRegion;
  */
 declare function knownRegionOf(domain: string): WorkBuddyRegion | undefined;
 /**
+ * 出站身份档位（`docs/DEVICE-IDENTITY-AUDIT.md` 的 P1）。
+ *
+ * 两档而不是三档：`conservative` 逐字节还原 5.16.0，`balanced` 是 P1 的完整形态。
+ * 审计里预留的 `max`（B3 / Trace 链路族）刻意没有实现——那几项只影响上游侧的
+ * 可观测性与聚合，不影响放行，而伪造一棵并不存在的 trace 树比不发更可疑。
+ *
+ * 为什么需要档位而不是直接改：这一次改动动的是**每一条出站请求**的头。P0.5 的
+ * 对照实验证明收益存在，但它证明的是"这组头",不是"这组头的每一条"；留一个
+ * 逐字节回退档，是让"换回来"成为一个配置项而不是一次回滚发版。
+ */
+type WorkBuddyWireProfile = 'conservative' | 'balanced';
+/**
  * How the plugin should identify itself where the upstream only RECORDS the
- * request (issue #132). One switch, because the two halves are one decision.
+ * request (issue #132), plus the two P1 axes.
  */
 interface WorkBuddyWireIdentity {
   /**
    * Adopt the official client's usage-page identity on chat requests.
    *
-   * ON adds `X-IDE-Type` / `X-IDE-Name` / `X-IDE-Version` and switches the
-   * conversation-identity triple to the 32-hex UUIDv7 shape the official client
-   * uses (plus `X-Request-ID`, which mirrors the message id there).
+   * ON switches the conversation-identity triple to the 32-hex UUIDv7 shape the
+   * official client uses and adds `X-Request-ID`, which mirrors the message id
+   * there.
+   *
+   * 2026-10-31 (P1): `X-IDE-*` 从这条开关上摘出去了。它们现在是
+   * {@link WorkBuddyWireProfile} 的 `balanced` 档的一部分，因为"用量页那一列
+   * 写着谁"属于客户端身份，而客户端身份现在整体统一（见
+   * {@link attributionHeaders}）。这条开关剩下的唯一职责是**id 的格式**。
    *
    * OFF by default, and the reason is the evidence tier, not the mechanism: the
    * reporter measured HTTP 200 on their own build of this PLUGIN at 5.3.1
    * (the WorkBuddy client itself was 5.8.3), and this plugin has not
-   * reproduced that against the live gateway. Nothing in either gate is documented
-   * as reading these headers — `11128`'s three doors are the message openings,
-   * the missing conversation id and a non-system first message, none of which a
-   * header can change — but this gateway has repeatedly refused requests for
-   * reasons visible only in the answer, so a display-only alignment ships behind a
-   * switch rather than as a silent upgrade for every account. `User-Agent` and the
-   * request BODY are untouched either way.
+   * reproduced that against the live gateway. `User-Agent` and the request BODY
+   * are untouched either way.
    */
   usageIdentity?: boolean;
+  /**
+   * 出站头档位，缺省 {@link DEFAULT_WIRE_PROFILE}。
+   *
+   * `conservative` 必须逐字节还原 5.16.0 —— 不是"少发几个新头"，而是连
+   * `X-Product: SaaS` 这种被改名前的值也要还原，否则它就不是回退档。
+   */
+  profile?: WorkBuddyWireProfile;
+  /**
+   * 本机设备盐，由客户端解析一次后传入（见 `WorkBuddyUpstreamClient.ready`）。
+   *
+   * 缺席 = 不发设备头。**绝不现场生成一个临时盐**：那会让每次进程启动都是一台
+   * 新设备，比不发更糟。构造器保持纯函数，盐是调用方的事实。
+   */
+  deviceSalt?: string;
+  /**
+   * 外部供给的真设备 token（P2），由 `deviceToken.file` 指向的文件读出。
+   *
+   * 它每 5 分钟重读一次（token 分钟级过期，进程却是小时级），所以这条不是构造期
+   * 的事实，而是**每条请求现取**——见 `WorkBuddyUpstreamClient.wireIdentity()`。
+   *
+   * 与 {@link deviceSalt} 同时存在时两者都会发出去。这个组合（审计 §5.3 的
+   * `mixed` 档）是 P2 的过渡形态：档位互斥规则留到 P3 决定，这里不做静默取舍
+   * ——悄悄关掉一半，等于替使用者做了一个他还没做的决定。
+   */
+  deviceToken?: string;
+  /**
+   * 这个账号的**覆盖值**（设置里「虚拟值」档的齿轮改的就是它）。
+   *
+   * 逐字段生效：只设了 machine 的账号，session 仍按盐派生。没有覆盖时两者都派生，
+   * 与 P1 完全一致。
+   */
+  deviceProfile?: WorkBuddyDeviceProfile;
+  /**
+   * 设备头档位（设置里的「虚拟值 / 真实值」）。
+   *
+   * 它必须**显式**存在，不能靠"有没有 token"推断：真实值档取不到 token 时是
+   * "一个设备头都不发"，而虚拟值档在同样情况下发派生对——两种沉默的原因不同，
+   * 输出也不同。少一个字段就无法表达"我在真实值档，但这次没有值"。
+   */
+  deviceTier?: 'virtual' | 'real';
+  /**
+   * 本机真实设备 token（P3，由 SDK 签发）。`deviceTier === 'real'` 时才有意义。
+   *
+   * 一旦有值，{@link deviceHeaders} 只发这一个头，`X-Machine-ID` /
+   * `X-Session-ID` 一个都不发。这是审计 §5.3 的结论落到代码上——真 token 内含
+   * 设备信息，旁边再挂一对按 uid 算出来的 id 是自证不一致；而一个真实客户端也
+   * 不会同时带这两种标识。
+   *
+   * 它与 {@link deviceToken}（P2 的文件源）不在同一档：真实值档由 SDK 供数，文件源
+   * 只在虚拟值档起作用。两者同时配置时 SDK 优先——"真实值"这个选项的语义就是
+   * "这台机器真的装着的那套东西"，换成别人写的文件就不再是了。
+   */
+  deviceReal?: string;
 }
 /**
  * The model id a prepared body asks for, when it carries one (issue #61).
@@ -1514,7 +1832,6 @@ declare function parseUpstreamModel(value: unknown): WorkBuddyUpstreamModel | un
  */
 declare class WorkBuddyUpstreamClient {
   private readonly onFallback?;
-  private readonly identity;
   /**
    * Reports an anomaly the reader or classifier had to tolerate.
    *
@@ -1524,7 +1841,52 @@ declare class WorkBuddyUpstreamClient {
    * `ctx.logger.warn` in; without a host the event is dropped, which is the
    * same silence the previous single-source reader had.
    */
-  constructor(onFallback?: ((message: string) => void) | undefined, identity?: WorkBuddyWireIdentity);
+  /**
+   * 解析一次的底座：设备盐（P1）。真 token 不在这里——它分钟级过期，
+   * 必须每条请求现取，见 {@link wireIdentity}。
+   */
+  private readonly baseIdentity;
+  /** 外部 device token 的 TTL 读取器；未配置时为 undefined。 */
+  private readonly deviceTokens;
+  /** 每账号覆盖值的读取器（设置里齿轮保存的那些）；未接线时为 undefined。 */
+  private readonly deviceProfiles;
+  /** 真实值档的 token 源（本机安装的桌面端 SDK）；未接线时为 undefined。 */
+  private readonly realDevice;
+  /**
+   * CN 网关 base（issue #220）。空 = 用内置常量，即 #220 之前的行为逐字节不变。
+   *
+   * 只影响 CN 区域：国际版仍然跟随凭据自己的域（`workbuddy.ai` /
+   * `codebuddy.ai`），因为国际 token 跨品牌互不通用，那里没有"换一个同构主机"
+   * 这回事。返回值必须已由 `resolveCnGateway` 的允许清单校验过，这个类不重新校验。
+   */
+  private readonly cnBaseOf;
+  constructor(onFallback?: ((message: string) => void) | undefined, identity?: WorkBuddyWireIdentity, options?: {
+    /** `deviceToken.file`：裸值或 A 的 `{token,ts}` 信封都可。 */
+    deviceTokenFile?: string;
+    /** 重读周期，默认 5 分钟。 */
+    deviceTokenTtlMs?: number;
+    /** uid → 覆盖值 + 当前档位（`src/device-profile.ts`）。 */
+    deviceProfiles?: WorkBuddyDeviceProfileLookup;
+    /** 真实值档的 token 源（`src/turing-sdk.ts`）。 */
+    realDevice?: TuringTokenSource;
+    /**
+     * CN 网关 base 覆盖（issue #220）的**读取器**，不是值。
+     *
+     * 为什么是函数：`regions` 是 volatile 字段，用户改完不必重启插件。若这里收
+     * 一个字符串，改设置在进程生命周期内不会生效——用户会认为「填了没反应」，
+     * 而这恰好是本设置唯一的用途。每次请求现问一次，与 `regionEnabled` 读活值
+     * 同一条规则。返回空串表示用内置网关。
+     */
+    cnBase?: () => string;
+  });
+  /**
+   * 本次请求的完整身份：底座（盐）+ 当前有效的真 token + 这个账号的覆盖值。
+   *
+   * 为什么不是"构造时算一次"：盐是本机常量，token 是分钟级过期的东西，覆盖值是
+   * 用户随时会改的设置。三者里只有盐是常量，把另外两个钉在构造期，一个跑了几小时
+   * 的进程会一直发过期 token、也永远看不到刚保存的覆盖值。
+   */
+  private wireIdentity;
   /** POST the chat endpoint; a successful answer is the raw SSE response. */
   chatStream(credential: WorkBuddyCredential, bodyJson: string, signal?: AbortSignal): Promise<WorkBuddyChatResult>;
   /**
@@ -1552,6 +1914,12 @@ declare class WorkBuddyUpstreamClient {
    * model on the same clock as a dead endpoint, and the whole point of the
    * period is to answer "did the upstream answer at all". A probe asks for a
    * single token, so the body that follows is one SSE line.
+   *
+   * It likewise does not cover building the headers. That step became slow in P3
+   * (the device-token path is a subprocess with a 20 s budget), and starting the
+   * clock first made a healthy gateway answer `status 0` on a cold start — which
+   * the pool reads as "unreachable" and acts on by benching the account. Hence
+   * the deliberate order below: resolve identity, THEN arm the timer.
    */
   probeChat(credential: WorkBuddyCredential, bodyJson: string, signal?: AbortSignal): Promise<WorkBuddyProbeAnswer>;
   /** POST the token-refresh endpoint; the caller merges the outcome. */
@@ -1790,7 +2158,28 @@ declare const FALLBACK_WORKBUDDY_MODELS: readonly WorkBuddyModelInfo[];
  * expose different rosters — the CN list has no `gpt-*`/`gemini-*` entries —
  * so a global account must never be seeded with the CN list. Like the CN
  * fallback this is replaced by the live refresh; it only keeps the provider
- * usable before the first fetch lands. Order and rates mirror the upstream.
+ * usable before the first fetch lands. Order mirrors the upstream.
+ *
+ * ⚠️ IT CARRIES NO `creditMultiplier`, AND THAT IS THE FIX FOR ISSUE #214.
+ * This list used to hardcode one rate per model, captured on 2026-09-11. The
+ * upstream moves those rates — the reporter measured `glm-5.3` at x0.69 and
+ * `hy4-preview` at x0.29 on 2026-11-04 against the x0.79 / x0.00 written
+ * here — so every captured rate aged into a WRONG PRICE. Worse, the overlay
+ * rule (`overlayLiveCapabilities`: the live side owns `creditMultiplier`)
+ * meant this table WON over the user's saved directory whenever the catalog
+ * still held it, which is exactly the reported symptom: the card showed the
+ * built-in table's figures, not the saved ones and not the upstream's.
+ *
+ * A price is a FACT ABOUT NOW, and this module never learns "now": it is the
+ * offline placeholder, written once and never refreshed. So it must not
+ * assert a price at all. An absent multiplier renders as "no rate" — the
+ * honest answer — and `pickFreeModel` deliberately treats absence as NOT
+ * free, so the account pool can never probe a paid model by mistake. The CN
+ * table has always been shaped this way for the same reason.
+ *
+ * The ROSTER (ids, names, windows) stays: that is what keeps the provider
+ * non-empty while the first fetch is in flight, and an id list ages far
+ * more slowly than a price list.
  */
 declare const FALLBACK_WORKBUDDY_MODELS_GLOBAL: readonly WorkBuddyModelInfo[];
 /**
@@ -1835,6 +2224,13 @@ declare function deriveCatalog(catalog: readonly WorkBuddyModelInfo[], enabled: 
 declare class WorkBuddyCatalog {
   private models;
   /**
+   * Whether {@link models} came from the upstream at least once.
+   *
+   * Starts `false`: the constructor seeds the static fallback, and that list
+   * must never be mistaken for a live answer (see {@link hasLiveRoster}).
+   */
+  private live;
+  /**
    * Whether this region has any local sign-in. Defaults to `true` — the
    * permissive direction — so a scan that has not run yet (or failed) keeps
    * serving the fallback rather than blanking a region that may be fine.
@@ -1870,6 +2266,26 @@ declare class WorkBuddyCatalog {
    * "no account" gate (issue #12), `enabled` is the user's explicit on/off.
    */
   current(): readonly WorkBuddyModelInfo[];
+  /**
+   * Whether {@link current} is an UPSTREAM answer rather than the built-in
+   * fallback it was constructed with.
+   *
+   * This distinction is what keeps issue #32 fixed. `applySelection` passes
+   * `current()` into `configuredModels` as the live roster to fall back to, so
+   * a partial saved slot demotes to the live directory instead of the static
+   * list. But before the first refresh lands, `current()` IS the static list
+   * (the constructor seeds it), and `resolveRoster` cannot tell the two apart
+   * because it only sees a non-empty array. The result was the exact bug #32
+   * describes, reached from the other direction: a settings write arriving
+   * before the first catalog refresh let the STATIC roster masquerade as live,
+   * and `set()` then committed it — so a model that only exists upstream
+   * (`space-bunny`) vanished from the picker while the runtime still served it.
+   *
+   * Callers that use `current()` as a *live* answer must check this first. A
+   * caller that only wants "what would we advertise right now" does not need
+   * to: the fallback is the honest answer to that question.
+   */
+  hasLiveRoster(): boolean;
   /** Whether this region currently advertises any model. */
   isRegionUsable(): boolean;
   /** Whether the user has this region's provider switched on. */
@@ -1896,8 +2312,19 @@ declare class WorkBuddyCatalog {
    * disagree. Returns whether the value changed.
    */
   setRegionEnabled(enabled: boolean): boolean;
-  /** Replace the list; callers invalidate their adapter snapshot after this. */
-  set(models: readonly WorkBuddyModelInfo[]): void;
+  /**
+   * Replace the list; callers invalidate their adapter snapshot after this.
+   *
+   * `origin` says where the list came from, and it is not cosmetic: only an
+   * `upstream` answer may mark the catalog live. `applySelection` also calls
+   * this on every settings write — including before the first refresh has
+   * landed — and the list it passes then is the static fallback. Letting that
+   * count as live is what re-opened issue #32 (see {@link hasLiveRoster}).
+   *
+   * The default is `'upstream'` so every pre-existing call site keeps meaning
+   * what it meant; only the re-derivation path opts into `'derived'`.
+   */
+  set(models: readonly WorkBuddyModelInfo[], origin?: 'upstream' | 'derived'): void;
 }
 //#endregion
 //#region src/cli-bridge/mount.d.ts
@@ -2289,6 +2716,7 @@ interface ContextRescue {
 }
 //#endregion
 //#region src/adapter.d.ts
+/** Provider route this bundle owns for the domestic (CN) gateway. */
 declare const WORKBUDDY_PROVIDER = "workbuddy";
 /** Provider route this bundle owns for the international gateway. */
 declare const WORKBUDDY_GLOBAL_PROVIDER = "workbuddy-global";
@@ -2334,14 +2762,35 @@ interface WorkBuddyAdapterOptions {
    */
   piAiGeneration?: PiAiGeneration;
   /**
-   * Drop foreign thinking blocks pi-ai would publish as prose (issue #147).
+   * Drop SAME-ROUTE foreign thinking blocks pi-ai would publish as prose
+   * (issue #147).
    *
-   * OFF by default, and read LIVE (a getter, not a boolean) so the switch takes
-   * effect on the next request without reloading the plugin: turning it on
-   * mid-session is the whole point — the user sees the working-notes turn,
-   * flips the switch, and the next turn is answered normally.
+   * CROSS-PROVIDER turns are dropped unconditionally: after a provider switch
+   * the host rebuilds the other provider's assistant turns as `dsh-foreign`,
+   * their unsigned thinking blocks can never be replayed, and pi-ai would
+   * otherwise flatten them into assistant prose that the WorkBuddy gateway
+   * refuses with 11128 (issue #163's measured scene). This switch only widens
+   * the repair to a model switch INSIDE one of this bundle's own routes.
+   *
+   * OFF by default for that same-route leg, and read LIVE (a getter, not a
+   * boolean) so the switch takes effect on the next request without reloading
+   * the plugin: turning it on mid-session is the whole point — the user sees
+   * the working-notes turn, flips the switch, and the next turn is answered
+   * normally.
    */
   dropForeignThinking?: () => boolean;
+  /**
+   * Strip EVERY historical thinking block before the request goes out (issue #213).
+   *
+   * OFF by default, and this one is not a styling choice: the model loses its own
+   * earlier reasoning from context, which is exactly what it was doing, so a user
+   * should turn this on deliberately — typically AFTER seeing a 11128 they can match
+   * to reasoning text. The reporter's evidence for that match is in #213.
+   *
+   * Read LIVE for the same reason `dropForeignThinking` is: the switch has to work
+   * on the next turn of the session that just failed, without a reload.
+   */
+  dropAllThinking?: () => boolean;
   /**
    * Told which foreign thinking blocks a request dropped, so the reply can name
    * the condition instead of leaving the user to conclude the model broke
@@ -2349,6 +2798,20 @@ interface WorkBuddyAdapterOptions {
    * request; failures are swallowed.
    */
   onForeignThinking?: (blocks: readonly ForeignThinkingBlock[]) => void;
+  /**
+   * The per-model default thinking tier the user saved (issue #179), keyed by
+   * model id.
+   *
+   * A GETTER, not a captured map: the choice is a setting the user can change
+   * mid-session, and a captured copy would keep dispatching the old tier until
+   * a reload. Production reads the live region slot; tests pass a literal.
+   *
+   * An absent key means "follow the upstream's own `defaultEffort`" — see
+   * `src/default-effort.ts` for how that is resolved against the model's real
+   * vocabulary, which is what keeps a stale saved tier from ever reaching the
+   * wire as an `UNSUPPORTED_REASONING_EFFORT`.
+   */
+  defaultThinkingEfforts?: () => Readonly<Record<string, string | undefined>>;
 }
 /** What {@link createWorkBuddyAdapter} hands back. */
 interface WorkBuddyAdapter {
@@ -2445,9 +2908,11 @@ declare function createWorkBuddyAdapter(options: WorkBuddyAdapterOptions): WorkB
  * the same defect and fixed it the same way — a reviewed table keyed by exact
  * model id, with a source and a review date per entry.
  *
- * This snapshot is copied from that project's
- * `server/services/native_modalities.json` (all entries reviewed 2026-09-25).
- * The provenance — per-id source URL and evidence — is kept in
+ * This snapshot BEGAN as a copy of that project's
+ * `server/services/native_modalities.json` (all entries reviewed 2026-09-25) and
+ * has since grown by two ids whose evidence is a second, weaker class: the
+ * upstream catalog's own description for that id (see the table's second
+ * section). Provenance — per-id source URL and evidence — is kept in
  * `docs/DESIGN.md` rather than here, because the build ships this module's
  * comments verbatim into the browser bundle. Keep the two in sync when either
  * side is updated; this is a maintained snapshot, NOT a live read.
@@ -2731,17 +3196,31 @@ declare function resolveCredentialRecovery(options: {
  */
 /** Basename of the host heartbeat file inside the Harness home. */
 declare const WORKBUDDY_HOST_HEARTBEAT_FILENAME = ".workbuddy-host-heartbeat.json";
-/** Current on-disk heartbeat format; readers reject others. */
-declare const HEARTBEAT_FORMAT_VERSION = 1;
+declare const READABLE_HEARTBEAT_VERSIONS: readonly number[];
 /** On-disk shape of the heartbeat. */
 interface WorkBuddyHostHeartbeat {
-  version: typeof HEARTBEAT_FORMAT_VERSION;
+  /** The format actually on disk; this build writes {@link HEARTBEAT_FORMAT_VERSION}. */
+  version: (typeof READABLE_HEARTBEAT_VERSIONS)[number];
   package: 'dsh-connect-workbuddy';
   pluginVersion: string;
   /** Epoch milliseconds when the host registered the provider. */
   registeredAt: number;
   /** Host process PID, to distinguish a stale heartbeat after a crash. */
   pid: number;
+  /**
+   * Epoch milliseconds when THIS process started (issue #174).
+   *
+   * The staleness check needs to recognise a REUSED PID: `process.kill(pid, 0)`
+   * only says "some process has this number", so after a crash the heartbeat
+   * can describe a process that died while the number now belongs to something
+   * else. The way to tell is to compare the live process's start time against
+   * the one recorded HERE.
+   *
+   * Absent on heartbeats written by older builds (`version: 1`): the reader
+   * then falls back to {@link WorkBuddyHostHeartbeat.registeredAt}, which is
+   * what those builds wrote, and is only a last-resort approximation.
+   */
+  hostStartedAt?: number;
 }
 /** Absolute path of the host heartbeat file. */
 declare function workbuddyHostHeartbeatPath(): string;
@@ -2759,11 +3238,29 @@ declare function processStartTimeMs(pid: number): number | undefined;
  *
  * A PID can be reused after a crash, so the recorded start time is compared
  * against the live process: a different start time means a different process.
+ *
+ * ISSUE #174 — the reference used to be `registeredAt`, the moment the plugin
+ * WROTE the heartbeat, and the comparison was `|startedAt − registeredAt| < 60s`.
+ * Those are two different quantities: `registeredAt` is when the host finished
+ * booting and mounted this plugin, which on a real machine is minutes after the
+ * process started. Measured by the reporter on Windows 11: process start
+ * 19:47:20, heartbeat written 19:58:45 — 684,817 ms apart — so `doctor` and
+ * `status` reported `hostBundle: "stale"` for a host that was alive and had
+ * just written the file. The `hostStartedAt` field exists so the comparison has
+ * the right reference; `registeredAt` is only read for heartbeats written by an
+ * older build, where it is the sole (and merely near) signal available.
  */
 declare function isHeartbeatProcessAlive(heartbeat: WorkBuddyHostHeartbeat): boolean;
 /** Read the heartbeat; absent or unparsable files report undefined. */
 declare function readHostHeartbeat(): Promise<WorkBuddyHostHeartbeat | undefined>;
-/** Write the heartbeat for the current process. */
+/**
+ * Write the heartbeat for the current process.
+ *
+ * `hostStartedAt` is captured HERE, from this process, so the later staleness
+ * check compares like with like (issue #174). Sampled on every write rather
+ * than cached: the value is cheap, and a module-level cache would be wrong the
+ * moment this function is exercised from a child process.
+ */
 declare function writeHostHeartbeat(): Promise<void>;
 /** Remove the heartbeat; called when the plugin is disposed. */
 declare function clearHostHeartbeat(): Promise<void>;
@@ -3394,7 +3891,8 @@ declare function nextRegionEnabled(value: unknown, region: WorkBuddyWebRegion, e
 /**
  * The two seats the credit readout can occupy (issue #62).
  *
- * `composer` is the composer tool row (`conversation.input.left`); `stats` is
+ * `composer` is the composer row (`conversation.input.right`, rendered just
+ * before the model picker); `stats` is
  * the ambient dock below the composer card (`conversation.composer.dock`),
  * beside the shell's own round/step/token pills. Named as a union rather than a
  * boolean because a third seat is plausible and `showAtTop: boolean` would have
@@ -3644,6 +4142,7 @@ type WorkBuddyWebUsage =
    * "关闭不了" report.
    */
   showCreditsInMainUi?: boolean;
+  showNewModelsInMainUi?: boolean;
   /**
    * Whether the model may call the image-generation tool here (opt-in).
    *
@@ -3680,6 +4179,25 @@ type WorkBuddyWebUsage =
    * must not be read as consent.
    */
   cliBridgeEnabled?: boolean;
+  /**
+   * Whether the OPTIONAL DSH sidebar panel is switched on (PR #188).
+   *
+   * GLOBAL, not per region — one nav row, one page, no region axis — so the
+   * same value rides on every region's answer and the card reads it off the
+   * active tab. Absent reads as OFF, matching the schema's `default(false)`:
+   * the row claims a `sidebar.panellist` seat every bundle shares, so a Host
+   * that cannot answer must not be read as consent.
+   */
+  sidebarPanelEnabled?: boolean;
+  /**
+   * How often the card should re-read this document, in milliseconds.
+   *
+   * GLOBAL like `sidebarPanelEnabled`, and carried on the Host's answer for
+   * the same measured reason: on the stale-mirror 0.1.7 deployment an
+   * interval read from the settings mirror could be a value the Host never
+   * stored. Absent reads as {@link WORKBUDDY_DEFAULT_POLL_INTERVAL_MS}.
+   */
+  pollIntervalMs?: number;
   /**
    * The model the OPTIONAL CodeBuddy CLI route runs on, or `''` for
    * "nothing is pinned, the CLI uses its own default".
@@ -3742,6 +4260,20 @@ type WorkBuddyWebUsage =
   message?: string;
   /** The persisted account id matches no local account. */
   selectionLost?: boolean;
+  /**
+   * The vault directory exists but could not be READ (issue #199).
+   *
+   * A directory whose DACL excludes the current user (the issue #199 lockout:
+   * owner = Administrators + `/inheritance:r`) makes every vault entry
+   * invisible while the desktop scan still finds its own accounts — the card
+   * then reports the SAVED choice as "no longer on this machine", which sends
+   * the user re-signing-in when the tokens are fine on disk. Carrying the raw
+   * readdir error lets the card say "the vault is unreadable" — a statement
+   * about PERMISSIONS, with a takeown recovery — instead of a false claim
+   * about the accounts. Absent means the vault read either succeeded or the
+   * directory is genuinely absent (nothing added yet).
+   */
+  vaultUnreadable?: string;
   /** A saved per-region choice is in effect (false = following the app). */
   selectionExplicit: boolean;
   /**
@@ -3774,6 +4306,12 @@ type WorkBuddyWebUsage =
    */
   showCreditsInMainUi?: boolean;
   /**
+   * Whether this region's composer pill shows its "· N 新模型" segment
+   * (opt-IN; absent means off). See the signed-out variant above for why
+   * this travels on the Host's answer rather than the settings mirror.
+   */
+  showNewModelsInMainUi?: boolean;
+  /**
    * Whether the model may call the image-generation tool here (opt-in).
    *
    * Travels on the Host's answer for the same reason as the fields around it,
@@ -3803,6 +4341,25 @@ type WorkBuddyWebUsage =
    * must not be read as consent.
    */
   cliBridgeEnabled?: boolean;
+  /**
+   * Whether the OPTIONAL DSH sidebar panel is switched on (PR #188).
+   *
+   * GLOBAL, not per region — one nav row, one page, no region axis — so the
+   * same value rides on every region's answer and the card reads it off the
+   * active tab. Absent reads as OFF, matching the schema's `default(false)`:
+   * the row claims a `sidebar.panellist` seat every bundle shares, so a Host
+   * that cannot answer must not be read as consent.
+   */
+  sidebarPanelEnabled?: boolean;
+  /**
+   * How often the card should re-read this document, in milliseconds.
+   *
+   * GLOBAL like `sidebarPanelEnabled`, and carried on the Host's answer for
+   * the same measured reason: on the stale-mirror 0.1.7 deployment an
+   * interval read from the settings mirror could be a value the Host never
+   * stored. Absent reads as {@link WORKBUDDY_DEFAULT_POLL_INTERVAL_MS}.
+   */
+  pollIntervalMs?: number;
   /**
    * The model the OPTIONAL CodeBuddy CLI route runs on, or `''` for
    * "nothing is pinned, the CLI uses its own default".
@@ -3940,6 +4497,20 @@ type WorkBuddyWebUsage =
     accounts: boolean;
     authFile: boolean;
   };
+  /**
+   * The per-model default thinking tiers the user saved (issue #179), keyed by
+   * model id.
+   *
+   * Carried here for the same measured reason as {@link contextBudgets}: on the
+   * affected 0.1.7 deployment the browser settings mirror never picks up a
+   * write made through the Host save endpoint, so rendering this from a
+   * snapshot made a successful choice look like it reverted.
+   *
+   * An absent key is not "no opinion": it means "follow this model's own
+   * upstream `defaultEffort`", which is exactly what the card's first option
+   * says out loud.
+   */
+  defaultThinkingEfforts?: Record<string, string>;
   /**
    * The persisted per-region context budgets as the Host reads them. The
    * browser settings mirror can lag a write made through the Host save
@@ -4190,6 +4761,24 @@ interface WorkBuddyWebPoolAccount {
  * card must render it as "no free model" rather than silently substituting a
  * paid one.
  */
+/**
+ * What the automatic check-in has settled today (issue #191).
+ *
+ * Deliberately COUNTS rather than a sentence: both locales render it, and the
+ * card decides where it goes. `pending` is the number of accounts still owed an
+ * attempt, which is what distinguishes "done for today" (0) from "retrying" —
+ * the two states a user watching a background job actually cares about.
+ */
+interface WorkBuddyWebAutoCheckinToday {
+  /** Accounts confirmed claimed or already-checked-in today. */
+  done: number;
+  /** Accounts in scope today (pool members minus enterprise members). */
+  total: number;
+  /** Accounts still owed an attempt; 0 means the day is finished. */
+  pending: number;
+  /** Why the last attempt failed, when it did. */
+  lastError?: string;
+}
 interface WorkBuddyWebPool {
   enabled: boolean;
   /**
@@ -4199,6 +4788,25 @@ interface WorkBuddyWebPool {
    * button whose only outcome is a refusal.
    */
   checkinSupported: boolean;
+  /**
+   * Whether the user asked the plugin to claim the daily check-in by itself
+   * (issue #191). Absent means OFF.
+   *
+   * The SAVED value, not the running one: the card's switch edits this field,
+   * and a draft-and-save cycle must show what is stored rather than what the
+   * runner happens to be doing with the previous value.
+   */
+  autoCheckin?: boolean;
+  /**
+   * What the automatic check-in has done today, when it is switched on.
+   *
+   * Absent when the switch is off or the runner has not started — never an
+   * object full of zeroes, so the card can tell "nothing has run" apart from
+   * "ran and found nothing to do". Read from the runner's own memory rather
+   * than recomputed: the card cannot know which accounts the batch already
+   * settled, and asking it to guess is how the count would drift from the truth.
+   */
+  autoCheckinToday?: WorkBuddyWebAutoCheckinToday;
   /** The model a test would use right now; absent when none can be resolved. */
   targetModelId?: string;
   /**
@@ -4350,8 +4958,41 @@ interface WorkBuddyStatusRouteOptions {
   offModelIds(region: WorkBuddyRegion): readonly string[];
   /** Saved local DSH context budgets by model id, for the requested region. */
   contextBudgets(region: WorkBuddyRegion): Readonly<Record<string, number | undefined>>;
+  /**
+   * The saved per-model default thinking tiers (issue #179), keyed by model id.
+   *
+   * Optional so a Host built before the feature keeps serving: the card then
+   * treats every model as "follow the upstream default" and offers the picker
+   * with only that option.
+   */
+  defaultThinkingEfforts?(region: WorkBuddyRegion): Readonly<Record<string, string | undefined>>;
   /** Re-read the live catalog of one region from the upstream. */
   discoverModels?(region: WorkBuddyRegion, signal?: AbortSignal): Promise<readonly WorkBuddyModelInfo[]>;
+  /**
+   * Record what a refresh just read, so the directory — and therefore every
+   * price on it — stops being a snapshot of an older day (issue #214).
+   *
+   * WHY THE REFRESH ROUTE NEEDS THIS. The button used to answer with the fresh
+   * rows and write nothing, so the same press produced two different answers on
+   * one host: `POST /models/refresh` said `glm-5.3` is x0.69 while `GET /usage`
+   * kept saying x0.79 and `cordis.patch.yml` never changed. The reporter's
+   * words: 「对用户来说『刷新』是个无效按钮」. A refresh whose answer is
+   * discarded is not a refresh.
+   *
+   * WHAT IT WRITES, AND WHAT IT MUST NOT. Only the DIRECTORY (`lastCatalog`)
+   * and only through the Host's merge (`writeRegionCatalog`), which preserves
+   * every sibling field of the region slot. It does NOT write the user's
+   * selection: `enabledModelIds` / `imageModelIds` / `contextBudgets` are the
+   * card's DRAFT until the user presses Save, and the reporter's own card shows
+   * unticked models in that draft. Writing them here would silently commit
+   * edits the user was still making.
+   *
+   * Optional: the route answers 503 for a Host that cannot persist, rather than
+   * half-performing the operation. The card relies on this — `refreshModels`
+   * paints its draft from the ANSWER, so a 503 leaves the draft untouched and
+   * the user sees a real error instead of a stale list that looks refreshed.
+   */
+  persistModels?(region: WorkBuddyRegion, models: readonly WorkBuddyModelInfo[]): Promise<void>;
   /**
    * Which ids of the requested region's roster THIS machine first saw inside the
    * new-model window (the "· N 新模型" segment), plus a note when the on-disk
@@ -4399,6 +5040,14 @@ interface WorkBuddyStatusRouteOptions {
    */
   showCreditsInMainUi?(region: WorkBuddyRegion): boolean;
   /**
+   * Whether the composer pill shows its "· N 新模型" segment (opt-IN).
+   *
+   * Optional, and ABSENT reads as OFF — the opposite of the two switches above,
+   * and deliberately so: this one is opt-in, so a Host too old to answer must
+   * not be read as consent. Same reasoning as `imageToolEnabled`.
+   */
+  showNewModelsInMainUi?(region: WorkBuddyRegion): boolean;
+  /**
    * WHERE this region's credit readout sits (issue #62).
    *
    * Optional, and absent reads as `composer` — the only seat before the setting
@@ -4443,6 +5092,31 @@ interface WorkBuddyStatusRouteOptions {
    */
   cliBridgeEnabled?(): boolean;
   /**
+   * Whether the OPTIONAL DSH sidebar panel is switched on (PR #188).
+   *
+   * GLOBAL rather than per region — one nav row and one page, no region axis —
+   * so it takes no argument. Optional, and absent reads as OFF, matching the
+   * schema's `default(false)`: the row claims a `sidebar.panellist` seat and a
+   * `main` page that every installed bundle shares, and an upgrade must never
+   * re-arrange a sidebar nobody asked to change. Carried on the Host's answer
+   * for the same measured reason as `cliBridgeEnabled`: the browser's settings
+   * mirror is stale for this namespace on the affected 0.1.7 deployments, and a
+   * stale `true` here would draw a row the Host does not honour.
+   */
+  sidebarPanelEnabled?(): boolean;
+  /**
+   * How often the card should re-read this document, in milliseconds.
+   *
+   * Carried on the Host's answer rather than read from the browser's settings
+   * mirror, for the same measured reason as the two flags above: that mirror is
+   * stale for this namespace on the affected 0.1.7 deployments, and a stale
+   * interval would make the card poll at a cadence the Host never stored.
+   *
+   * Optional, and absent reads as the 5-minute default — which is what an older
+   * Host (and any build before the setting existed) should do.
+   */
+  pollIntervalMs?(): number;
+  /**
    * The model the OPTIONAL CodeBuddy CLI route runs on, or `''` for "the CLI's
    * own default".
    *
@@ -4474,6 +5148,14 @@ interface WorkBuddyStatusRouteOptions {
    * so a Host that cannot answer must not be read as consent.
    */
   dropForeignThinking?(): boolean;
+  /**
+   * Whether the request path redacts EVERY historical thinking block (issue #213).
+   *
+   * Optional, absent reads as OFF for the same reason as the switch above: this
+   * removes text the model would otherwise see about its own earlier work, so a
+   * Host that cannot answer must not be read as consent.
+   */
+  dropAllThinking?(): boolean;
   /**
    * What the LAST request had to drop, for the card's explanation of a turn that
    * arrived looking like working notes (issue #147).
@@ -4566,6 +5248,22 @@ interface WorkBuddyStatusRouteOptions {
    * the chip renders as nothing at all.
    */
   cliLive?(): unknown;
+  /**
+   * 设备头设置（「虚拟值 / 真实值」+ 每账号覆盖参数）的读写口。
+   *
+   * Optional like the other ports: a Host mounted without it answers 503, and the
+   * card hides the toggle and the row gears entirely rather than showing controls
+   * that cannot do anything.
+   */
+  deviceSettings?: WorkBuddyDeviceSettingsPort;
+  /**
+   * 真实设备参数（本机安装的桌面端 SDK）的状态与取值口。
+   *
+   * Optional like the rest: 一个没有接 SDK 的宿主（别的平台、或构建时裁掉了
+   * `native/`）答 503，卡片就把「SDK」这一页藏起来——比渲染一页永远"不可用"的
+   * 红字诚实。
+   */
+  deviceSdk?: WorkBuddyDeviceSdkPort;
   /**
    * Why each of the region's accounts cannot serve right now, keyed by account
    * id. Absent key (or an absent dep) means "no reason known" — the composer
@@ -4689,6 +5387,14 @@ interface WorkBuddyPoolDeps {
      * ranking simply ignores it.
      */
     orderAccountIds?: readonly string[];
+    /**
+     * Whether the user asked for the automatic daily check-in (issue #191).
+     *
+     * Optional so a Host that predates the setting still satisfies this
+     * interface — its absence then reads as OFF, which is the truth for every
+     * profile until someone ticks it.
+     */
+    autoCheckin?: boolean;
   };
   /** One region's CHECKED accounts, plus their credits and last measurements. */
   members(region: WorkBuddyRegion): Promise<readonly WorkBuddyPoolMember[]>;
@@ -4827,6 +5533,20 @@ interface WorkBuddyPoolDeps {
    */
   checkin?(region: WorkBuddyRegion): Promise<readonly WorkBuddyPoolCheckinRow[]>;
   /**
+   * What the automatic check-in has settled today, when it is switched on
+   * (issue #191).
+   *
+   * Optional so a Host that predates the feature still satisfies this
+   * interface: its absence then reads as "the switch is off", which is the
+   * truth for every profile until someone ticks it.
+   *
+   * Answers from the runner's own memory rather than recomputing: only the
+   * runner knows which accounts a previous tick already settled, and asking the
+   * route to guess is how the card's count would drift from what actually
+   * happened.
+   */
+  autoCheckinToday?(region: WorkBuddyRegion): WorkBuddyWebAutoCheckinToday | undefined;
+  /**
    * Test every account of one region against the resolved target model.
    *
    * `onRow` is optional and exists so the route can STREAM each account as it
@@ -4931,6 +5651,13 @@ interface WorkBuddyRegionState {
    */
   showCreditsInMainUi?: boolean;
   /**
+   * Whether the composer pill shows its "· N 新模型" segment (opt-IN).
+   *
+   * Absent means OFF: "new" means first seen by this machine, so on a fresh
+   * install the whole roster qualifies and the number means nothing.
+   */
+  showNewModelsInMainUi?: boolean;
+  /**
    * Whether the model may call the image-generation tool here (opt-IN).
    *
    * The only switch in this interface where an ABSENT value means OFF. Every
@@ -4963,7 +5690,7 @@ interface WorkBuddyRegionState {
    *
    * Two seats, because the first one is not always available:
    *
-   *   - `composer` — the composer tool row (`conversation.input.left`), shared
+   *   - `composer` — the composer row (`conversation.input.right`), shared
    *     with the shell's own controls. It is the closer, more glanceable seat,
    *     and it is the default so nothing moves for anyone who does not choose.
    *   - `stats` — the ambient dock below the composer card
@@ -4981,8 +5708,35 @@ interface WorkBuddyRegionState {
   lastCatalog?: WorkBuddyModelInfo[];
   /** The user's selection in this region, as model ids. */
   enabledModelIds?: string[];
-  /** Model ids the user explicitly opted into image input. */
+  /**
+   * Model ids the user opted into image input for this region.
+   *
+   * Every id here is honoured. What the SAVED array cannot express is the
+   * difference between "I looked at this model and unticked it" and "this model
+   * did not exist when the list was last refreshed" — so the runtime also adds
+   * a model this build's vendor table classifies as verified-multimodal, UNLESS
+   * {@link imageSelectionExplicit} says the user has edited these boxes. See
+   * `effectiveImageIds` (issue #168); the seed never rewrites this array.
+   */
   imageModelIds?: string[];
+  /**
+   * Whether the image boxes have been edited by a human (issue #168).
+   *
+   * `imageModelIds` alone cannot distinguish a DECISION from a leftover refresh
+   * snapshot: the array is written both by the card's save (a judgement) and by
+   * a catalog refresh (what the roster said on that day). Without that
+   * distinction a model the roster gained after the last refresh was stamped
+   * `multimodal: false` purely by its ABSENCE, `workBuddyModelInput` answered
+   * `['text']`, and the host refused the attachment with
+   * `MODEL_DOES_NOT_SUPPORT_IMAGES` — 「这个模型不支持图片」 — for a model the
+   * plugin's own table calls verified-multimodal.
+   *
+   * `false`/absent means "nobody has chosen yet, so the table may fill the gaps";
+   * a card save sets `true`, after which this array is the whole answer — which
+   * is what keeps an explicit UNTICK of a verified-multimodal model from being
+   * silently re-ticked on the next read.
+   */
+  imageSelectionExplicit?: boolean;
   /**
    * Model ids whose `off` thinking level is offered (issue #34). Seeded from
    * the built-in rule (upstream declaration minus the models known to reject
@@ -4991,6 +5745,38 @@ interface WorkBuddyRegionState {
   offModelIds?: string[];
   /** Local DSH context budget per model in this region. */
   contextBudgets?: Record<string, WorkBuddyContextBudget>;
+  /**
+   * The thinking tier each model runs on when a caller names none (issue #179).
+   *
+   * Keyed by model id because the vocabularies disagree across one roster (see
+   * `regionStateConfig`'s declaration of the same field). An ABSENT key follows
+   * the model's own upstream `defaultEffort` — the runtime answer is computed by
+   * `defaultEffortFor` in `src/default-effort.ts`, which is the only place that
+   * decides, and which refuses to name a tier the model does not declare.
+   */
+  defaultThinkingEfforts?: Record<string, string>;
+  /**
+   * An alternative CN gateway host (issue #220).
+   *
+   * Only the CN region reads it; the international gateways follow the
+   * credential's own brand domain and have no equivalent setting.
+   *
+   * EXISTS FOR ONE CASE: a corporate network that filters on the TLS
+   * ClientHello's SNI. `copilot.tencent.com` is then reset before any HTTP is
+   * sent (`ECONNRESET`, <100ms) while the WorkBuddy desktop app keeps working,
+   * because the app reads a failover list from its own config and also uses
+   * `wb.tencentbuddy.com`. Without this field the plugin is simply unusable on
+   * such a network, and looks broken rather than filtered.
+   *
+   * The value is a HOST, validated against a closed allowlist by
+   * `resolveCnGateway` (`src/cn-gateway.ts`) — never a free-form URL. That
+   * allowlist is the security boundary, not a convenience: this base carries
+   * `Authorization: Bearer <token>` on every CN request, so accepting an
+   * arbitrary host would turn a settings file into a token-exfiltration
+   * primitive. Empty/absent means the built-in gateway, i.e. the behaviour
+   * before #220.
+   */
+  cnBase?: string;
   /** This region's account-pool preferences (opt-in; see {@link WorkBuddyPoolPreferences}). */
   pool?: WorkBuddyPoolPreferences;
 }
@@ -5076,6 +5862,19 @@ interface WorkBuddyPoolPreferences {
    * silently merged into membership.
    */
   orderAccountIds?: string[];
+  /**
+   * Whether the plugin claims the daily check-in by itself (issue #191).
+   *
+   * OFF by default. Claiming a daily reward is a real WRITE on the user's
+   * account, and this plugin deliberately shipped without an automatic
+   * check-in so it would never make that decision on someone's behalf. The
+   * reasoning still holds — what changed is that the user can now make that
+   * decision once and have it honoured.
+   *
+   * Only the CN region has a check-in, so the card hides the switch elsewhere
+   * and the runner refuses to start there.
+   */
+  autoCheckin?: boolean;
 }
 /** Plugin configuration. */
 interface Config {
@@ -5122,6 +5921,20 @@ interface Config {
    */
   cliBridge?: CliBridgeSettings;
   /**
+   * Put the WorkBuddy panel in the DSH sidebar (opt-IN, PR #188).
+   *
+   * OFF by default, like every other optional surface this plugin adds: the
+   * panel claims a GLOBAL seat (`sidebar.panellist` row + `main` page) that
+   * every bundle shares, so switching it on is a decision about the user's
+   * whole sidebar rather than a preference about this card. An absent value
+   * therefore reads as off, and an upgrade must never re-arrange a sidebar
+   * nobody asked to change.
+   *
+   * The settings card is unaffected either way: this only adds a second door to
+   * the same content, and the Plugins page keeps the first one.
+   */
+  sidebarPanel?: boolean;
+  /**
    * When scanned messages are perturbed with invisible characters.
    *
    * `failure` (default) learns from a successful channel-gate rescue and starts
@@ -5131,13 +5944,76 @@ interface Config {
    */
   channelPerturbation?: 'off' | 'failure' | 'always';
   /**
+   * 出站身份档位（`docs/DEVICE-IDENTITY-AUDIT.md` 的 P1）。
+   *
+   * `balanced`（默认）让每一条出站请求说同一种话：`X-Product` / `X-IDE-Name` /
+   * `X-IDE-Type` 同值 `WorkBuddy`，加 `X-Agent-Purpose`、`X-CodeBuddy-Request`、
+   * `Accept-Language`、`X-Root-Request-ID`，以及按账号派生的一对
+   * `X-Machine-ID` / `X-Session-ID`；billing 域补齐 UA / Origin / Referer。
+   *
+   * `conservative` 逐字节还原 5.16.0：**连 `X-Product: SaaS` 这个改名前的值也还原**，
+   * 因为"回退了但没完全回退"会造出第三个从未上线过的形状，排查时最误导人。
+   *
+   * 为什么默认已经是 `balanced`：P0.5 的对照实验（2026-10-31）证实这组头有效。
+   * 留这一档不是为了默认值，是为了让"某台机器上某个账号忽然不行了"能先换档排除，
+   * 而不必先回滚一个版本。
+   */
+  wireProfile?: 'conservative' | 'balanced';
+  /**
+   * How often the card refreshes its account table, in milliseconds.
+   *
+   * One of 60000 / 300000 / 600000 / 1800000 / 3600000; absent reads as 5
+   * minutes. This is the setting that decides the plugin's upstream request
+   * volume (one credits read plus one check-in read per pooled account, per
+   * refresh), and the composer account panel follows it.
+   */
+  pollIntervalMs?: number;
+  /**
+   * SDK 功能的**总开关**（默认开）。
+   *
+   * 关掉之后：不发现 SDK 目录、不起取 token 的子进程、不后台预热——真实值档因此
+   * 永远取不到 token。这是"我根本不想让这个插件碰桌面端的原生模块"的那条退路：
+   * 在此之前这项能力是无条件启动的，一个只想用虚拟值档的人也照样每 10 分钟付一次
+   * 子进程与一次风控取数。
+   *
+   * 与「取不到真实设备时退回虚拟值」不是一回事：那个管**取不到时怎么办**（落在设备
+   * 设置文件里），这个管**要不要去取**。两者都关时真实值档零设备头；总开关关而回退
+   * 开时，退到虚拟值。
+   *
+   * 关掉不影响虚拟值档：派生值全靠本机盐，与 SDK 无关。
+   */
+  deviceSdkEnabled?: boolean;
+  /**
+   * 外部设备 token（`docs/DEVICE-IDENTITY-AUDIT.md` 的 P2）。
+   *
+   * 只收**文件**，不收内联字符串：token 是分钟级过期的，写在配置里的值十分钟后
+   * 就是死值，只能靠人改配置——那条路只在一次性排障里成立。文件可以由 A 自己的
+   * `.turing_token_cache.json`、一个 cron 或任何脚本刷新，插件按 `ttlMs` 重读。
+   *
+   * 文件支持两种形状：裸 token，或 A 的 `{"token":"v3:…","ts":…}` 信封。上限
+   * 4 KB（A 实测 1210 字符，B 的 1 KB 上限会把它误杀成"没配"）。
+   *
+   * 读不到时**不发送该头**并记一条 warn，绝不回退成临时造一个 token。只在
+   * `wireProfile: 'balanced'` 下生效——`conservative` 的契约是逐字节等于 5.16.0。
+   */
+  deviceToken?: {
+    /**
+     * token 文件的绝对路径（支持 `~`）。空 = 不启用。
+     *
+     * 指向 A 的缓存文件即可直接复用它的设备身份，不需要额外脚本。
+     */
+    file?: string;
+    /** 重读周期，默认 5 分钟。token 本身约 10 分钟过期。 */
+    ttlMs?: number;
+  };
+  /**
    * Adopt the official client's usage-page identity on chat requests (issue #132).
    *
-   * Adds `X-IDE-Name: WorkBuddy` (which is what fills the upstream's 使用端
-   * column) and sends the conversation-identity triple in the 32-hex UUIDv7
-   * shape the official client uses. Off by default: the reporter measured it at
-   * HTTP 200, this plugin has not reproduced that against the live gateway, and a
-   * display-only change should not be the reason an account starts failing.
+   * 2026-10-31（P1）：`X-IDE-*` 从这里搬到了 {@link Config.wireProfile} 的
+   * `balanced` 档（它属于"客户端是谁"，而那一层现在整体统一）。这条开关**现在
+   * 只管 id 的格式**：把会话身份三连换成官方客户端用的 32 位十六进制 UUIDv7，并
+   * 补一个镜像消息 id 的 `X-Request-ID`。Off by default：它是 reporter 测的、
+   * 本插件未复现的显示对齐，不该成为某个账号开始失败的理由。
    */
   usageIdentity?: boolean;
   /**
@@ -5180,6 +6056,15 @@ interface Config {
    */
   dropForeignThinking?: boolean;
   /**
+   * Strip every historical thinking block from the request (issue #213).
+   *
+   * A reasoning REDACTION rather than a repair: the channel gate scans the text
+   * we send, and past reasoning rides along as `reasoning_content` whenever a
+   * block carries a signature. Costs the model its own earlier reasoning, so it
+   * is off unless the user says otherwise.
+   */
+  dropAllThinking?: boolean;
+  /**
    * Move the host's session-title request onto the hidden lightweight model
    * (issues #132/#133). Off by default: it is a real upstream request either
    * way, and the rewrite changes which bucket it is billed against.
@@ -5199,6 +6084,37 @@ interface Config {
      * changes or a region exposes a different one.
      */
     model?: string;
+  };
+  /**
+   * 被网关渠道校验拦截（`channel_reject` / 11128）之后自动再发一次「继续」，
+   * 可选、有上限。默认关闭。
+   *
+   * 这条失败**不换号也不重试**（`isFailoverWorthy` 刻意把它排除在外：网关匹配的
+   * 是消息开头，换账号只会每个账号白烧一次请求），所以这一轮就此结束，用户看到的
+   * 是「本轮运行失败400: … 被网关的渠道校验拦截 …」。固定指纹由 `prepareChatBody`
+   * 的按句改词处理；这条开关只是**最后兜底**：只有被拒内容刚好随轮次变化的窄情况
+   * 才可能靠新回合碰过去。固定 system 指纹每轮相同，重发也救不了（#163 实测）。
+   *
+   * 默认关闭的理由与 {@link Config.usageIdentity} 相同：它会在用户没有发消息的
+   * 情况下花掉真实请求，属于必须显式授权的开销。上限默认 1 次：1 次救不了，3 次也
+   * 救不了，旧默认 3 只会把同一个 400 付三遍。
+   */
+  channelRejectContinue?: {
+    /**
+     * 是否启用自动续发。只有显式 `true` 才算开启。
+     */
+    enabled?: boolean;
+    /**
+     * 连续自动续发的次数上限（默认 1，夹在 1..10）。
+     *
+     * 「连续」是关键：一次成功回合、或者用户自己发了一条消息，计数立刻清零。
+     * 所以上限拦的是「一直过不去就一直试」，而不是这个会话一生的总次数。
+     */
+    maxConsecutive?: number;
+    /**
+     * 续发时发送的文本，默认「继续」。
+     */
+    text?: string;
   };
 }
 /**
@@ -5237,6 +6153,36 @@ declare function regionStateOf(config: Config, region: WorkBuddyRegion): WorkBud
  * about a region's state.
  */
 declare function regionEnabled(config: Config, region: WorkBuddyRegion): boolean;
+/**
+ * 「真实值」档在这台机器上能不能真的工作，以及为什么不能。
+ *
+ * ## 为什么不让界面自己判断平台
+ *
+ * 客户端能拿到 `sdk.platform`，但**平台不是判据**。macOS 上 SDK 能被发现、
+ * `probe` 也答 `ready`，真正坏掉的是取 token 那一环：SDK 向 dispatch 主队列
+ * `dispatch_sync`，而纯 libuv 子进程永不排空那个队列（`sample` 栈实测，见
+ * CHANGELOG 的「macOS 现状如实记录」）。于是「darwin → 禁用」会把一台**没装**
+ * 桌面端的 mac 和一台装了的 mac 说成同一件事，而它们的用户该做的事完全不同。
+ *
+ * ## 为什么现在还写死
+ *
+ * 这是一个**已知的、非本平台的**缺陷，不是运行时可以测出来的：真去测就要起子进程
+ * 等 15 秒超时，而这一页每次打开都会拉一次设置。写成常量意味着它是可以被人替换
+ * 的显式声明，而不是散在三个组件里的 `if (platform === 'darwin')`。
+ *
+ * ⚠️ 修好 `dispatch_sync` 那条路之后，**这里必须跟着改**，否则界面会继续劝退一个
+ * 已经能用的功能。修法不在本次范围（需要一个排空主队列的伴生原生模块）。
+ *
+ * `state`：
+ *   - `available` —— 能取到 token，切成「真实值」就能用；
+ *   - `broken` —— 这套 SDK 在本平台取不到 token，切过去只会降级，界面上应禁用
+ *     并说明原因；
+ *   - `unavailable` —— 本平台没有这条取链（不预期出现，留作兜底）。
+ */
+declare function realTierAvailabilityFor(platform: string): {
+  state: 'available' | 'broken' | 'unavailable';
+  platform: string;
+};
 /**
  * The region that owns the image tool right now, or `undefined` when no region
  * has it switched on.
@@ -5312,4 +6258,4 @@ declare function legacyAttributionRegion(value: Config, accountsFor: (region: Wo
  */
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { CREDENTIAL_REJECTED_CODE, Config, DEFAULT_PROBE_INPUT_TOKENS, ENCRYPTED_CREDENTIAL_CODE, FALLBACK_WORKBUDDY_MODELS, FALLBACK_WORKBUDDY_MODELS_GLOBAL, NATIVE_MODALITY_BY_MODEL_ID, PROBE_INPUT_TOKEN_CHOICES, PROBE_MAX_TOKENS, PROBE_SYSTEM_PROMPT, REFUSES_OFF_MODEL_IDS, type UpstreamErrorKind, WORKBUDDY_ACCOUNTS_REFRESH_PATH, WORKBUDDY_APP_EXECUTABLE_ENV, WORKBUDDY_AUTH_FILENAME, WORKBUDDY_AUTH_FILE_ENV, WORKBUDDY_CHECKIN_PATH, WORKBUDDY_CONNECT_VERSION, WORKBUDDY_GLOBAL_PROVIDER, WORKBUDDY_HOST_HEARTBEAT_FILENAME, WORKBUDDY_MODELS_REFRESH_PATH, WORKBUDDY_PROBE_PATH, WORKBUDDY_PROVIDER, WORKBUDDY_PROVIDERS, WORKBUDDY_PROVIDER_DISPLAY_NAMES, WORKBUDDY_REGIONS, WORKBUDDY_REGION_PARAM, WORKBUDDY_SETTINGS_NS, WORKBUDDY_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY_TPS_PATH, WORKBUDDY_USAGE_PATH, type WorkBuddyAccountChoice, type WorkBuddyAdapter, type WorkBuddyAuthStatus, type WorkBuddyCandidateFailure, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCredential, type WorkBuddyCredentialRecovery, WorkBuddyCredentialRejectedError, WorkBuddyCredentialStore, type WorkBuddyCreditPackage, type WorkBuddyCredits, WorkBuddyEncryptedCredentialError, type WorkBuddyEncryptedField, type WorkBuddyHostHeartbeat, type WorkBuddyModelInfo, type WorkBuddyNativeModality, WorkBuddyPoolPreferences, type WorkBuddyProbeClient, type WorkBuddyProbeOutcome, type WorkBuddyProbeResult, type WorkBuddyProbeStore, type WorkBuddyReasoning, type WorkBuddyRecoveryCandidate, type WorkBuddyRefreshOutcome, WorkBuddyRegionState, type WorkBuddyShim, type WorkBuddyStatusRouteOptions, type WorkBuddyStoreOptions, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyUsabilityProbeOptions, apply, asVolatile, authFileName, classifyUpstreamError, clearAtRestKeyCache, clearHostHeartbeat, cooldownOf, createAccountUsabilityProbe, createWorkBuddyAdapter, createWorkBuddyShim, creditOfStream, defaultDesktopAuthCandidates, defaultDesktopAuthDirs, defaultDesktopAuthPath, defaultOffModelIds, deriveAtRestKey, deriveAtRestKeyId, deriveCatalog, fallbackModelsFor, fetchAtRestKeyPayload, findWorkbuddyAppExecutable, hasEncryptedCredentialFields, imageDefaultFor, imageToolRegionOf, inject, isCredentialRejectedError, isEncryptedCredentialError, isEncryptedFieldWrapper, isHeartbeatProcessAlive, isWorkbuddyBundle, knownRegionOf, legacyAttributionRegion, legacyWorkbuddyOwnAuthPath, macosBundleExecutable, macosNestedAppBundles, modelIdOfBody, name, nativeModalityOf, nextRegionEnabled, nextRegionSlots, offDefaultFor, openEncryptedField, outcomeOfFailure, parseCreditMultiplier, parseReasoning, parseRetryAfter, parseUpstreamModel, parseWorkBuddyAuth, prepareChatBody, probeModel, probeRequestBody, probeSucceeded, processStartTimeMs, readAtRestKey, readHostHeartbeat, regionCleared, regionEnabled, regionEnabledOf, regionOf, regionOfProvider, regionOfStatusUrl, regionStateOf, regionsFieldIsCorrupt, regionsMapOf, registerWorkBuddyStatusRoute, resolveCredentialRecovery, selectAccountFor, settingsNamespaceOf, toPersistedWorkBuddyModel, unwrapVolatileDeep, videoToolRegionOf, withEffectiveOff, withWorkBuddyRegion, workBuddyDisplayName, workBuddyModelInput, workBuddyThinkingLevelMap, workBuddyWebStatus, workbuddyAccountId, workbuddyAppExecutableCandidates, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, writeHostHeartbeat };
+export { CREDENTIAL_REJECTED_CODE, Config, DEFAULT_PROBE_INPUT_TOKENS, ENCRYPTED_CREDENTIAL_CODE, FALLBACK_WORKBUDDY_MODELS, FALLBACK_WORKBUDDY_MODELS_GLOBAL, NATIVE_MODALITY_BY_MODEL_ID, PROBE_INPUT_TOKEN_CHOICES, PROBE_MAX_TOKENS, PROBE_SYSTEM_PROMPT, REFUSES_OFF_MODEL_IDS, type UpstreamErrorKind, WORKBUDDY_ACCOUNTS_REFRESH_PATH, WORKBUDDY_APP_EXECUTABLE_ENV, WORKBUDDY_AUTH_FILENAME, WORKBUDDY_AUTH_FILE_ENV, WORKBUDDY_CHECKIN_PATH, WORKBUDDY_CONNECT_VERSION, WORKBUDDY_GLOBAL_PROVIDER, WORKBUDDY_HOST_HEARTBEAT_FILENAME, WORKBUDDY_MODELS_REFRESH_PATH, WORKBUDDY_PROBE_PATH, WORKBUDDY_PROVIDER, WORKBUDDY_PROVIDERS, WORKBUDDY_PROVIDER_DISPLAY_NAMES, WORKBUDDY_REGIONS, WORKBUDDY_REGION_PARAM, WORKBUDDY_SETTINGS_NS, WORKBUDDY_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY_TPS_PATH, WORKBUDDY_USAGE_PATH, type WorkBuddyAccountChoice, type WorkBuddyAdapter, type WorkBuddyAuthStatus, type WorkBuddyCandidateFailure, WorkBuddyCatalog, type WorkBuddyChatResult, type WorkBuddyCredential, type WorkBuddyCredentialRecovery, WorkBuddyCredentialRejectedError, WorkBuddyCredentialStore, type WorkBuddyCreditPackage, type WorkBuddyCredits, WorkBuddyEncryptedCredentialError, type WorkBuddyEncryptedField, type WorkBuddyHostHeartbeat, type WorkBuddyModelInfo, type WorkBuddyNativeModality, WorkBuddyPoolPreferences, type WorkBuddyProbeClient, type WorkBuddyProbeOutcome, type WorkBuddyProbeResult, type WorkBuddyProbeStore, type WorkBuddyReasoning, type WorkBuddyRecoveryCandidate, type WorkBuddyRefreshOutcome, WorkBuddyRegionState, type WorkBuddyShim, type WorkBuddyStatusRouteOptions, type WorkBuddyStoreOptions, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyUsabilityProbeOptions, apply, asVolatile, authFileName, classifyUpstreamError, clearAtRestKeyCache, clearHostHeartbeat, cooldownOf, createAccountUsabilityProbe, createWorkBuddyAdapter, createWorkBuddyShim, creditOfStream, defaultDesktopAuthCandidates, defaultDesktopAuthDirs, defaultDesktopAuthPath, defaultOffModelIds, deriveAtRestKey, deriveAtRestKeyId, deriveCatalog, fallbackModelsFor, fetchAtRestKeyPayload, findWorkbuddyAppExecutable, hasEncryptedCredentialFields, imageDefaultFor, imageToolRegionOf, inject, isCredentialRejectedError, isEncryptedCredentialError, isEncryptedFieldWrapper, isHeartbeatProcessAlive, isWorkbuddyBundle, knownRegionOf, legacyAttributionRegion, legacyWorkbuddyOwnAuthPath, macosBundleExecutable, macosNestedAppBundles, modelIdOfBody, name, nativeModalityOf, nextRegionEnabled, nextRegionSlots, offDefaultFor, openEncryptedField, outcomeOfFailure, parseCreditMultiplier, parseReasoning, parseRetryAfter, parseUpstreamModel, parseWorkBuddyAuth, prepareChatBody, probeModel, probeRequestBody, probeSucceeded, processStartTimeMs, readAtRestKey, readHostHeartbeat, realTierAvailabilityFor, regionCleared, regionEnabled, regionEnabledOf, regionOf, regionOfProvider, regionOfStatusUrl, regionStateOf, regionsFieldIsCorrupt, regionsMapOf, registerWorkBuddyStatusRoute, resolveCredentialRecovery, selectAccountFor, settingsNamespaceOf, toPersistedWorkBuddyModel, unwrapVolatileDeep, videoToolRegionOf, withEffectiveOff, withWorkBuddyRegion, workBuddyDisplayName, workBuddyModelInput, workBuddyThinkingLevelMap, workBuddyWebStatus, workbuddyAccountId, workbuddyAppExecutableCandidates, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, writeHostHeartbeat };

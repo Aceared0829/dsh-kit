@@ -1,8 +1,8 @@
 import { lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve, win32 } from "node:path";
-import { execFile, execFileSync } from "node:child_process";
+import { dirname, join, posix, resolve, sep, win32 } from "node:path";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 //#region src/host-peers.ts
@@ -962,6 +962,777 @@ function clearAtRestKeyCache() {
 	cachedAppExecutable = void 0;
 }
 //#endregion
+//#region src/windows-acl.ts
+/**
+* Windows ACL hardening for the plugin's credential vault (issue #183).
+*
+* THE REPORT. `<dsh home>/workbuddy-vault/<region>/<accountId>.json` holds the
+* decrypted WorkBuddy `accessToken` / `refreshToken` as plaintext JSON, and the
+* writer asked for `mode: 0o600`. On POSIX that is the whole story. On Windows
+* `mode` is accepted and effectively ignored: a file's permissions come from the
+* DACL it inherits from its parent directory, and nothing in `fs.writeFile` or
+* `fs.rename` consults the mode argument there. The reporter measured the
+* result with `Get-Acl`: the vault files came out readable by
+* `<machine>\CodexSandboxUsers` — the account DSH's own sandbox runs as — so any
+* sandboxed process, sibling plugin or script on that machine could read a
+* usable JWT straight off disk.
+*
+* WHY HARDEN THE DIRECTORY, NOT JUST THE FILE. Two reasons, both measured:
+*
+*   1. The writer commits with an atomic replace (`writeFileAtomic`): a fresh
+*      `<name>.<hex>.tmp` inode is created and renamed over the target. A
+*      per-file ACL applied AFTER the rename leaves a window in which the new
+*      inode carries whatever it inherited, and a crash mid-sequence leaves a
+*      file that was never hardened. Children of a hardened directory inherit
+*      the hardened ACEs at creation, so the replacement is born correct.
+*   2. Windows RE-PROPAGATES inheritable ACEs down an existing tree, so
+*      hardening the directory also repairs the files already sitting in it.
+*      Verified on a real Windows 11 host: a file carrying
+*      `Everyone: FullControl` inherited from `~/.dsh` came out with exactly the
+*      three intended ACEs after only the directory was hardened.
+*
+* WHY NOT `icacls /T`. Measured on the same host: `/T` combined with an
+* `(OI)(CI)` grant spec blanks the DACL of the FILES it walks — they end up with
+* zero ACEs, which reads as "nobody may read this" and would break the plugin's
+* own reads. The two-pass form (directories with `(OI)(CI)`, then files with a
+* plain `(F)` grant) produces the correct result, so `/T` is deliberately not
+* used anywhere here.
+*
+* WHY WINDOWS SIDS AND NOT NAMES. `icacls` prints and accepts localized account
+* names, and this project's hosts are frequently zh-CN (`Everyone` shows up as
+* `Everyone` but `BUILTIN\Administrators` does not). The `*S-1-5-…` form makes
+* every argument locale-independent, so the same argv works on any UI language.
+*
+* WHY `OWNER RIGHTS` (S-1-3-4) RATHER THAN THE CURRENT USER — AND WHERE THAT
+* ASSUMPTION BREAKS. Resolving the current user's SID costs a child process
+* (`whoami`) on every hardening round, and the answer is usually already
+* implied: the process that creates a file becomes its owner, so `OWNER RIGHTS`
+* grants exactly the account that will read it back. `SYSTEM` and
+* `Administrators` are kept so backup/AV/service software that legitimately
+* expects to reach user files is not locked out — removing them would make the
+* vault unmanageable on a machine where the user's own session is not the one
+* repairing it.
+*
+* THE BREAK. "The creator is the owner" only holds when the creating process
+* runs with the user's own (possibly elevated) token. When a directory was
+* created by a process whose token derives from the Administrators group — an
+* elevated DSH started from a RunLevel=Highest scheduled task, an installer,
+* a recovery console — the directory owner is `BUILTIN\Administrators`, and
+* `OWNER RIGHTS` then grants Administrators, not the user. Because
+* {@link applyAcl} also drops inherited ACEs (`/inheritance:r`), a non-admin
+* user is left with NO access at all to their own vault: stat/readdir/write
+* all fail with EPERM, and recovery requires an explicit `takeown`. Reproduced
+* as a controlled experiment (same command, only the owner differs):
+* owner=user → writable; owner=Administrators → locked. Reported in issue
+* #199 (forensic: fork branch `forensic/acl-lockout-20261102`).
+*
+* THE FIX. The grant names the account that will read the vault — the current
+* user — EXPLICITLY, and never relies on `OWNER RIGHTS`. {@link resolveUserSid}
+* reads that SID once per process (memoized) via `whoami.exe`, which measured
+* 22–26 ms on the reported host against PowerShell's 133 ms;
+* {@link hardenDirectory} then issues the same single `icacls` call the 5.x
+* design used, with `*<userSid>:(OI)(CI)(F)` in place of `*S-1-3-4`. Because
+* the granted principal no longer depends on who owns the object, a vault
+* created by an elevated process (owner = Administrators) stays readable by
+* its user.
+*
+* WHY NOT COMPARE THE OWNER FIRST. The alternative — read each directory's
+* owner and keep `OWNER RIGHTS` when it matches the user — needs a PowerShell
+* `Get-Acl` (~133 ms) on the credential-write path, and it does not buy
+* anything: the granted principal is always the user, so the comparison only
+* decides which spelling of the same grant to emit. That extra child process
+* is also what broke the 1 s polling budget of
+* `tests/issue12-region-hiding.spec.ts` while this fix was being developed
+* (measured: the owner lookup plus the user lookup pushed a first vault write
+* past the budget, the startup refresh lost the race, and the global region
+* kept advertising its fallback models). One memoized `whoami` for the whole
+* process replaces a per-directory `Get-Acl`.
+*
+* OWNER RIGHTS IS STILL ACCEPTED ON READ. {@link ALLOWED_SIDS} keeps
+* `S-1-3-4` so a vault hardened by 5.x — where the user usually IS the owner
+* and the ACE therefore was correct — still reads as `protected` instead of
+* being reported as a widening that never happened. It is simply no longer
+* ever GRANTED.
+*
+* WHAT THIS IS AND IS NOT. This is the issue's suggestion #2 (explicit ACLs
+* after writing), which it calls "the smallest change". It is NOT DPAPI
+* encryption (suggestion #1): the bytes on disk remain plaintext, so an
+* administrator, a SYSTEM service, or an attacker who has already achieved the
+* user's own token can still read them. Closing that gap requires encrypting the
+* document with a key bound to the user profile, which is a format change to the
+* vault and cannot be done without a migration; it is tracked separately. The
+* README says plainly that the file holds plaintext tokens.
+*
+* FAILURE IS NOT FATAL. A credential write is on the sign-in path: refusing to
+* persist a credential because the ACL could not be applied would turn a
+* defence-in-depth measure into an outage. Every function here is therefore
+* best-effort and reports its outcome instead of throwing, and `doctor` surfaces
+* that outcome so a machine where hardening silently failed is visible rather
+* than assumed safe.
+*
+* @module dsh-connect-workbuddy/windows-acl
+*/
+/**
+* Well-known SID for "the owner of this object".
+*
+* Deliberately a SID rather than an account name: it needs no lookup, it works
+* on every UI language, and `icacls` accepts it in the `*S-…` form.
+*
+* Since issue #199 it is READ-ONLY here: 5.x granted it, which locks a user out
+* of a directory owned by somebody else, so {@link directoryGrants} and
+* {@link fileGrants} no longer use it — but {@link ALLOWED_SIDS} still accepts
+* it, so a vault hardened by 5.x (where the user normally IS the owner) still
+* inspects as `protected`.
+*/
+const OWNER_RIGHTS_SID = "S-1-3-4";
+/** Well-known SID for `NT AUTHORITY\SYSTEM`. */
+const SYSTEM_SID = "S-1-5-18";
+/** Well-known SID for `BUILTIN\Administrators`. */
+const ADMINISTRATORS_SID = "S-1-5-32-544";
+/**
+* Principals allowed to keep access, as SIDs.
+*
+* Used by {@link inspectCredentialDirectory} to tell "hardened" from "somebody
+* widened it again"; keeping the list beside the grant specs is what stops the
+* two from drifting.
+*/
+const ALLOWED_SIDS = /* @__PURE__ */ new Set([
+	OWNER_RIGHTS_SID,
+	SYSTEM_SID,
+	ADMINISTRATORS_SID
+]);
+/**
+* Grant specs for a DIRECTORY: `(OI)` object-inherit and `(CI)` container-inherit
+* make the ACE apply to files and subdirectories created later, which is the
+* whole mechanism this module relies on.
+*
+* `userSid` is deliberately a PARAMETER rather than a constant: it is the only
+* principal whose identity is not a well-known SID, and making it explicit at
+* the call site is what keeps a future edit from quietly falling back to
+* `OWNER RIGHTS` (the issue #199 lockout).
+*/
+function directoryGrants(userSid) {
+	return [
+		`*${userSid}:(OI)(CI)(F)`,
+		`*${SYSTEM_SID}:(OI)(CI)(F)`,
+		`*${ADMINISTRATORS_SID}:(OI)(CI)(F)`
+	];
+}
+/** How long one `icacls` (or PowerShell) child may take before it is abandoned. */
+const ACL_COMMAND_TIMEOUT_MS = 1e4;
+/** Paths already hardened by THIS process, so repeat writes cost nothing. */
+const protectedDirectories = /* @__PURE__ */ new Set();
+/** Hardening attempts in flight, keyed by path: a burst joins one child. */
+const inflightProtection = /* @__PURE__ */ new Map();
+/** Whether this process is running on Windows; a seam for tests. */
+function isWindows() {
+	return process.platform === "win32";
+}
+/**
+* Run one child process, resolving to its stdout.
+*
+* `windowsHide` is mandatory for the same reason recorded in `at-rest.ts` and
+* `docs/WINDOWS.md` §1-5: the DSH Desktop host is an Electron GUI process with
+* no console, so spawning a console program without it flashes a visible black
+* window. `icacls` here runs on the credential-write path, which a user can
+* trigger repeatedly from the card — an un-hidden spawn would blink at them on
+* every account switch.
+*
+* Sets `windowsVerbatimArguments: false` implicitly (the default) so each argv
+* element is quoted by Node rather than concatenated: the grant specs contain
+* parentheses, which a raw command-line join would hand to `cmd` for parsing.
+* This is why the arguments go through `execFile` as an ARRAY and never as a
+* single shell string.
+*/
+function runCommand(file, args) {
+	return new Promise((resolve, reject) => {
+		execFile(file, [...args], {
+			encoding: "utf8",
+			windowsHide: true,
+			timeout: ACL_COMMAND_TIMEOUT_MS
+		}, (error, stdout) => {
+			if (error !== null) {
+				reject(/* @__PURE__ */ new Error(`${file} exited ${String(error.code ?? error.message)}`));
+				return;
+			}
+			resolve(stdout);
+		});
+	});
+}
+/**
+* Apply one ownership set to `path` with `icacls`.
+*
+* `/inheritance:r` drops the inherited ACEs (that is what removes the
+* `Everyone: FullControl` arriving from `~/.dsh`) and `/grant:r` replaces the
+* ACE for each named principal rather than adding a duplicate, so the call is
+* idempotent — measured: running it twice on the same file leaves the same three
+* ACEs.
+*/
+async function applyAcl(path, grants) {
+	const args = [path, "/inheritance:r"];
+	for (const grant of grants) args.push("/grant:r", grant);
+	await runCommand("icacls", args);
+}
+/**
+* Harden one credential directory tree so that the files inside are readable
+* only by their owner, SYSTEM and Administrators.
+*
+* ONE `icacls` CALL, NOT A WALK. Measured on a real Windows 11 host: hardening
+* the parent directory makes Windows RE-PROPAGATE the new inheritable ACEs down
+* the tree, repairing existing subdirectories AND existing files in the same
+* step — a file carrying `Everyone: FullControl` inherited from `~/.dsh` came out
+* with exactly the three intended ACEs (`weak=0`) after only its parent was
+* hardened. Walking the children would spawn one child process per directory to
+* re-derive a guarantee this single call already delivers.
+*
+* WHY THAT COST MATTERS HERE. This runs on the credential-write path, which the
+* card can trigger per account switch. `icacls` measured 19–52 ms at rest and
+* **up to 1242 ms under parallel load** — enough to blow the 1 s polling budget
+* of `tests/issue12-region-hiding.spec.ts` when the whole suite ran
+* concurrently. The shape below is therefore deliberate on two axes:
+*
+*   - CALLS: one, never a walk.
+*   - CONCURRENCY: an attempt already in flight for the same path is JOINED
+*     rather than repeated, so a burst of writes queues one child for one
+*     directory instead of one per write.
+*
+* Staying ON the write path is not negotiable: the atomic commit creates a fresh
+* temp inode and renames it over the target, so a file-level pass AFTERwards
+* would leave the pre-rename window open and would be undone by the next
+* replace. Hardening before the write is what makes the replacement inode
+* inherit the restricted ACEs.
+*
+* Memoized per process on SUCCESS only: a failed attempt must be retried by the
+* next write, or one transient lock on the directory would leave the machine
+* unhardened for the rest of the session.
+*/
+async function protectCredentialDirectory(directory) {
+	if (!isWindows()) return { state: "not-windows" };
+	const refusal = harnessHomeRefusal(directory);
+	if (refusal !== void 0) return {
+		state: "skipped",
+		reason: refusal
+	};
+	if (protectedDirectories.has(directory)) return { state: "protected" };
+	const pending = inflightProtection.get(directory);
+	if (pending !== void 0) return pending;
+	const attempt = hardenDirectory(directory);
+	inflightProtection.set(directory, attempt);
+	try {
+		return await attempt;
+	} finally {
+		inflightProtection.delete(directory);
+	}
+}
+/**
+* Why `directory` must NOT be hardened, or `undefined` when it may be
+* (issue #208).
+*
+* THE DEFECT THIS CLOSES. Hardening drops inherited ACEs (`/inheritance:r`).
+* Applied to `<DSH home>` itself that also drops what every OTHER directory
+* under it inherits — `<DSH home>/attachments`, sessions, profile config —
+* and a child whose DACL came purely from that inheritance becomes
+* unreadable even to its owner. The reporter measured exactly that: after
+* installing the plugin, sending an image failed with `EPERM: operation not
+* permitted, scandir '<DSH home>/attachments'` while text messages were
+* unaffected, and `icacls <DSH home>` itself printed "Access is denied". The
+* UI showed the host's generic `prompt rejected (session/agent-busy)`, so the
+* symptom pointed at sessions rather than at the DACL.
+*
+* HOW THIS PLUGIN COULD REACH IT. `writeVaultEntry` hardens `dirname(dir)`.
+* For a region-scoped store that is `<DSH home>/workbuddy-vault` (correct), but
+* the UNREGIONED store — which `doctor` builds via `makeAnyStore()` — keeps its
+* vault AT `<DSH home>/workbuddy-vault` itself, so `dirname` resolves to
+* `<DSH home>`. Reproduced here with a stubbed `icacls`: the argv target was
+* the Harness home, and the three SIDs the reporter found on `<DSH home>` are
+* exactly `directoryGrants()`'s.
+*
+* WHY REFUSE RATHER THAN SPECIAL-CASE THE CALLER. A guard at THIS layer also
+* covers `<DSH home>/.dsh`-style ancestors, a future call site computing the
+* root one level too high (the reporter's own third question), and a
+* `WORKBUDDY_*` variable pointing the vault at `$HOME`. The blast radius of
+* getting it wrong is the whole harness home, so the check belongs where the
+* destructive operation is, not where its arguments are assembled.
+*
+* Ancestors are refused too, not just equality: hardening the PARENT of the
+* harness home strips the inheritance the home itself relies on, which breaks
+* it just as thoroughly and is even harder to recognise afterwards.
+*/
+function harnessHomeRefusal(directory) {
+	let home;
+	try {
+		home = resolve(resolveDshHome());
+	} catch {
+		return "the Harness home could not be resolved, so this directory cannot be proven safe to harden";
+	}
+	const target = resolve(directory);
+	if (target.toLowerCase() === home.toLowerCase()) return `refusing to harden the Harness home itself (${home}); /inheritance:r there would strip the ACEs every other directory under it inherits`;
+	if (`${home}${sep}`.toLowerCase().startsWith(`${target}${sep}`.toLowerCase())) return `refusing to harden ${target}, which contains the Harness home (${home}); dropping inherited ACEs on an ancestor breaks the whole home tree`;
+}
+/**
+* The current user's SID, resolved once per process.
+*
+* Node's `os.userInfo()` does NOT expose a SID on Windows (its typings have no
+* `sid`, and the runtime object carries none — measured), so the SID has to
+* come from outside the process.
+*
+* `whoami.exe` rather than PowerShell: measured on the machine that reported
+* issue #199, `whoami /user /fo csv /nh` takes 22–26 ms while a
+* `powershell -Command` round trip takes 133 ms — and since this shape pays the
+* cost on the credential-write path, which the startup roster refresh is
+* racing, that 5× difference is the difference between fitting the poll budget
+* and blowing it.
+*
+* The absolute path is deliberate: a bare `whoami` resolves through `PATH`,
+* where Git for Windows ships an MSYS `whoami` that does not understand
+* `/user` at all. `/fo csv /nh` gives one quoted line
+* (`"desktop\user","S-1-5-21-…"`), which is parsed rather than the default
+* formatted block, again for locale independence.
+*
+* Memoized for the process on SUCCESS only: an unresolvable SID is a real
+* failure and must be retried by the next write, not cached as broken forever.
+*/
+let cachedUserSid;
+async function resolveUserSid() {
+	if (cachedUserSid === void 0) {
+		const line = (await runCommand(join(process.env.SystemRoot ?? "C:\\Windows", "System32", "whoami.exe"), [
+			"/user",
+			"/fo",
+			"csv",
+			"/nh"
+		])).split(/\r?\n/u).map((entry) => entry.trim()).find((entry) => /S-1-5-[\d-]+/u.test(entry));
+		if (line === void 0) throw new Error("whoami returned no resolvable user SID");
+		const match = /"(S-1-5-[\d-]+)"/u.exec(line) ?? /S-1-5-[\d-]+/u.exec(line);
+		if (match === null) throw new Error("whoami output has no parseable SID field");
+		cachedUserSid = match[1] ?? match[0];
+	}
+	return cachedUserSid;
+}
+/** The work behind {@link protectCredentialDirectory}: one `icacls` call. */
+async function hardenDirectory(directory) {
+	try {
+		await mkdir(directory, { recursive: true });
+		let grants;
+		try {
+			grants = directoryGrants(await resolveUserSid());
+		} catch (error) {
+			return {
+				state: "failed",
+				reason: `user SID lookup failed: ${error instanceof Error ? error.message : String(error)}`
+			};
+		}
+		await applyAcl(directory, grants);
+		protectedDirectories.add(directory);
+		return { state: "protected" };
+	} catch (error) {
+		return {
+			state: "failed",
+			reason: error instanceof Error ? error.message : String(error)
+		};
+	}
+}
+/**
+* Read back the ACL of one credential directory as SIDs, for diagnostics.
+*
+* PowerShell rather than `icacls` because the answer has to be COMPARABLE:
+* `icacls` prints localized account names, so testing "is `Everyone` absent"
+* against its output would silently pass on a zh-CN host where the name is
+* spelled differently. `Get-Acl` + `SecurityIdentifier.Value` yields the
+* language-independent form.
+*
+* Read-only and token-free: it never opens the JSON, only the ACL. A failure to
+* read is reported as `unverified` rather than being folded into `exposed` — the
+* two need different user actions, and claiming exposure that was not measured
+* would be its own kind of lie.
+*/
+async function inspectCredentialDirectory(directory) {
+	if (!isWindows()) return {
+		directory,
+		state: "not-windows"
+	};
+	/**
+	* Deliberately a single quoted expression with no interpolation of `directory`
+	* beyond the literal path: `-LiteralPath` keeps a path containing `[` or `$`
+	* from being treated as a wildcard or a subexpression.
+	*/
+	const script = [`$a = Get-Acl -LiteralPath '${directory.replace(/'/gu, "''")}'`, "$a.Access | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }"].join("; ");
+	let stdout;
+	try {
+		stdout = await runCommand("powershell", [
+			"-NoProfile",
+			"-NonInteractive",
+			"-Command",
+			script
+		]);
+	} catch (error) {
+		return {
+			directory,
+			state: "unverified",
+			reason: error instanceof Error ? error.message : String(error)
+		};
+	}
+	const entries = stdout.split(/\r?\n/u).map((line) => line.trim()).filter((line) => line !== "" && /^S-1-/u.test(line));
+	if (entries.length === 0) return {
+		directory,
+		state: "unverified",
+		reason: "Get-Acl returned no principals"
+	};
+	/**
+	* The current user is an ALLOWED principal, not a widening.
+	*
+	* This is the read side of the issue #199 fix: 5.x granted `OWNER RIGHTS`,
+	* whose SID (S-1-3-4) can be compared against {@link ALLOWED_SIDS} without
+	* knowing who runs the process, but the fix grants the user's REAL SID — so
+	* the allowlist has to learn it, or a correctly hardened directory reports as
+	* `exposed` naming the user themselves. Measured on a real host before this
+	* was wired up: `weak: ["S-1-5-21-…-1001"]` on a freshly hardened vault.
+	*
+	* An unresolvable user SID is reported as `unverified` rather than guessed:
+	* without it the read cannot tell "the user" from "some other account", and
+	* both wrong answers (allowing everyone / accusing the user) are worse than
+	* saying the measurement did not happen.
+	*/
+	let userSid;
+	try {
+		userSid = await resolveUserSid();
+	} catch (error) {
+		return {
+			directory,
+			state: "unverified",
+			reason: `user SID lookup failed: ${error instanceof Error ? error.message : String(error)}`
+		};
+	}
+	const weak = entries.filter((sid) => sid !== userSid && !ALLOWED_SIDS.has(sid));
+	return {
+		directory,
+		state: weak.length === 0 ? "protected" : "exposed",
+		entries,
+		weak
+	};
+}
+/**
+* 命名空间，且带版本号。
+*
+* 不带命名空间，本插件的派生值就可能与另一个工具的派生值在同一个 uid 上撞成
+* 同值；不带版本号，将来改一次输入格式就会让所有账号**静默换设备**——那正是
+* 风控最想抓的 device hopping。要改格式，就改这里的 `v1`，并接受"这是一次
+* 有意的身份变更"，而不是让它悄悄发生。
+*/
+const DEVICE_ID_NAMESPACE = "dsh-connect-workbuddy/device/v1";
+/** 36 个**小写**十六进制字符，别的一律不认。 */
+const DEVICE_ID_PATTERN = /^[0-9a-f]{36}$/u;
+/** 64 个**小写**十六进制字符。 */
+const DEVICE_SALT_PATTERN = /^[0-9a-f]{64}$/u;
+/**
+* Derive one stable, account-scoped device identifier.
+*
+* `uid` 为空串时返回空串：匿名请求没有"这台设备属于哪个账号"可言，上游也不要求
+* （B 的同名实现在 uid 为空时同样不注入）。返回空串而不是抛错，是因为调用方
+* 只需要"发还是不发"，而"没有 uid"是正常状态，不是异常。
+*
+* @param uid the account's stable id, as the desktop auth document records it
+* @param purpose which header this value is for — never reuse one for the other
+* @param salt this machine's random salt (see `device-salt.ts`); a constant here
+*   would make every install of this plugin derive identical ids
+*/
+function deriveDeviceId(uid, purpose, salt) {
+	if (uid === "" || salt === "") return "";
+	return createHash("sha256").update(`${DEVICE_ID_NAMESPACE}\0${salt}\0${purpose}\0${uid}`, "utf8").digest("hex").slice(0, 36);
+}
+/** Whether `value` is exactly a derived device id (36 lowercase hex). */
+function isDeviceId(value) {
+	return DEVICE_ID_PATTERN.test(value);
+}
+/** Whether `value` is exactly a device salt (64 lowercase hex). */
+function isDeviceSalt(value) {
+	return DEVICE_SALT_PATTERN.test(value);
+}
+/** 文件名，带前导点，与 `.workbuddy-roster-seen.*.json` 同一约定。 */
+const DEVICE_SALT_FILE_NAME = ".workbuddy-device.json";
+/** `$DSH_HOME/.workbuddy-device.json`, or `dir` when one is pinned (tests). */
+function deviceSaltPath(dir) {
+	const base = typeof dir === "string" && dir !== "" ? dir : resolveDshHome();
+	return join(base, DEVICE_SALT_FILE_NAME);
+}
+/**
+* Read one parsed salt document.
+*
+* `undefined` means the file is not there at all — the ONLY state that permits
+* writing a new one. Everything else that is wrong with the file lands in
+* `reason`, because "we cannot read our own salt" must stay distinguishable from
+* "there is no salt yet".
+*/
+function parseDeviceSaltPayload(raw) {
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return { reason: "not a JSON object" };
+	const document = raw;
+	const version = document["version"];
+	if (version !== 1) return { reason: `version ${typeof version === "number" ? version : "(absent)"} is not readable by this build` };
+	const salt = document["salt"];
+	if (typeof salt !== "string" || !isDeviceSalt(salt)) return { reason: "salt field is not 64 lowercase hex characters" };
+	return { salt };
+}
+/**
+* Read the salt WITHOUT writing anything.
+*
+* A missing file is `absent`; an unreadable one is `unreadable` (never
+* `absent`) — see the module note on why that distinction is load-bearing.
+*/
+async function readDeviceSalt(options = {}) {
+	const path = deviceSaltPath(options.dir);
+	let text;
+	try {
+		text = await readFile(path, "utf8");
+	} catch (error) {
+		const code = error?.code;
+		if (code === "ENOENT") return {
+			path,
+			state: "absent"
+		};
+		return {
+			path,
+			state: "unreadable",
+			reason: code === void 0 ? String(error) : code
+		};
+	}
+	let raw;
+	try {
+		raw = JSON.parse(text);
+	} catch {
+		return {
+			path,
+			state: "unreadable",
+			reason: "file is not valid JSON"
+		};
+	}
+	const parsed = parseDeviceSaltPayload(raw);
+	if ("reason" in parsed) return {
+		path,
+		state: "unreadable",
+		reason: parsed.reason
+	};
+	return {
+		path,
+		state: "ok",
+		salt: parsed.salt
+	};
+}
+/**
+* Read the salt, creating it on the first call that needs one.
+*
+* The read happens twice — once unlocked (the common case costs one `readFile`),
+* once inside the lock before writing — because two processes starting together
+* would otherwise both find the file missing and both write a different salt;
+* the loser's salt would then never be used again and its ids would silently
+* change. Writing asks for `mode: 0o600` under a `0o700` directory: the value is
+* not a credential, but it IS what makes this machine's derived ids unguessable.
+* On Windows those bits are a no-op and the DACL decides — this file lives in
+* `$DSH_HOME`, whose permissions `doctor` already hardens for the vault
+* (`credentialAcl` in `src/bin.ts`).
+*/
+async function ensureDeviceSalt(options = {}) {
+	const first = await readDeviceSalt(options);
+	if (first.state !== "absent") return first;
+	const path = first.path;
+	try {
+		return await withFileLock(path, async () => {
+			const again = await readDeviceSalt(options);
+			if (again.state !== "absent") return again;
+			const salt = randomBytes(32).toString("hex");
+			await writeFileAtomic(path, `${JSON.stringify({
+				version: 1,
+				salt,
+				createdAt: (/* @__PURE__ */ new Date()).toISOString()
+			}, null, 2)}\n`, {
+				mode: 384,
+				dirMode: 448
+			});
+			return {
+				path,
+				state: "ok",
+				salt
+			};
+		});
+	} catch (error) {
+		const code = error?.code;
+		return {
+			path,
+			state: "unwritable",
+			reason: code === void 0 ? String(error) : code
+		};
+	}
+}
+//#endregion
+//#region src/device-token.ts
+/**
+* 外部 `X-Device-Token` 的文件源（审计报告 §6 的 P2）。
+*
+* ## 为什么只有文件，没有"内联配置值"
+*
+* token 的有效期是分钟级（A 实测 10 分钟，旧值最多 24 小时可复用）。写在配置里
+* 的值是死的：十分钟后它过期，只能靠人去改配置——那是一条每十分钟需要人工介入的
+* 路径，实际上只在一次性排障里成立。文件可以由任何东西刷新（A 自己的
+* `.turing_token_cache.json`、一个 cron、一个脚本），插件按 TTL 重读即可。
+*
+* ## 它与 B 的 `device_token.go` 差在哪（三处，都是刻意的）
+*
+*   1. **上限 4 KB，不是 1 KB**。A 现取的 token 实测 **1210 字符**（`v3:` 前缀、
+*      单段不透明 blob），B 的 1024 字节上限会把它判成"过长"→ 返回空 →
+*      **静默不注入**。token 明明有，网关那边却当作没有。
+*   2. **JSON 信封与裸值都吃**。A 写的是 `{"token":"v3:…","ts":…}`，B 只认
+*      裸值——直接把 B 指到 A 的缓存上，注入的会是整段 JSON。
+*   3. **失败会记一条 warn**。B 是完全静默的，"配了但没生效"因此无法从任何地方
+*      看出来。这里只在**状态发生变化**时告警一次，避免每条请求刷一行。
+*
+* ## 安全
+*
+* token 是设备身份，不是访问凭据，但它同样不该进日志：本模块的任何输出
+* （包括错误、warn、doctor）都只带**路径、状态、时长**，绝不含 token 字节。
+*
+* @module dsh-connect-workbuddy/device-token
+*/
+/**
+* 文件大小上限，单位字节。
+*
+* 4 KB 不是随手放的：A 的真实 token 是 1210 字符，B 的 1 KB 上限会误杀它；同时
+* 4 KB 仍然远小于"贴错文件"的量级（把整个 auth.json 指过来会立刻被判过长）。
+*/
+const DEVICE_TOKEN_MAX_BYTES = 4096;
+/** 默认重读周期。与 A 的磁盘缓存一致（10 分钟 token / 5 分钟重读）。 */
+const DEVICE_TOKEN_DEFAULT_TTL_MS = 3e5;
+/**
+* 设备 token 文件路径的环境变量。
+*
+* **它不是第二个真源**，而是同一个值的第二种写法：插件配置 `deviceToken.file`
+* 为空时才回落到它，而 `doctor` 只能看到环境变量（它读不到插件配置）。同一个
+* 值、两个读者，因此不会出现"插件在用 A、CLI 报告 B"。
+*/
+const WORKBUDDY_DEVICE_TOKEN_FILE_ENV = "WORKBUDDY_DEVICE_TOKEN_FILE";
+/**
+* Expand a configured path.
+*
+* `~` is supported because that is how the one interesting path (`A` 的
+* `.turing_token_cache.json`) is naturally written; everything else resolves
+* against the process cwd, which is why the docs ask for an absolute path.
+*/
+function resolveDeviceTokenPath(file) {
+	const trimmed = file.trim();
+	if (trimmed === "~") return homedir();
+	if (trimmed.startsWith("~/") || trimmed.startsWith("~\\")) return join(homedir(), trimmed.slice(2));
+	return resolve(trimmed);
+}
+/**
+* Parse the file body: either a bare token or A's `{token, ts}` envelope.
+*
+* The envelope is not a nicety — pointing this reader at A's cache file is the
+* whole reason a user of both tools gets a working token with no extra script.
+*/
+function parseDeviceTokenDocument(text) {
+	const trimmed = text.trim();
+	if (trimmed === "") return { reason: "file is empty" };
+	if (trimmed.startsWith("{")) {
+		let document;
+		try {
+			document = JSON.parse(trimmed);
+		} catch {
+			return { reason: "file starts with { but is not valid JSON" };
+		}
+		if (typeof document !== "object" || document === null || Array.isArray(document)) return { reason: "JSON document is not an object" };
+		const token = document["token"];
+		if (typeof token !== "string" || token.trim() === "") return { reason: "JSON envelope has no non-empty token field" };
+		return { token: token.trim() };
+	}
+	if (/\s/u.test(trimmed)) return { reason: "raw token must be a single line without whitespace" };
+	return { token: trimmed };
+}
+/** Read the token file once. No caching — see {@link createDeviceTokenReader}. */
+async function readDeviceTokenFile(file, nowMs = Date.now()) {
+	const path = resolveDeviceTokenPath(file);
+	let size;
+	let modifiedMs;
+	try {
+		const info = await stat(path);
+		if (!info.isFile()) return {
+			path,
+			state: "unreadable",
+			reason: "path is not a regular file"
+		};
+		size = info.size;
+		modifiedMs = info.mtimeMs;
+	} catch (error) {
+		const code = error?.code;
+		if (code === "ENOENT") return {
+			path,
+			state: "absent"
+		};
+		return {
+			path,
+			state: "unreadable",
+			reason: code === void 0 ? String(error) : code
+		};
+	}
+	if (size > 4096) return {
+		path,
+		state: "too-large",
+		reason: `${size} bytes exceeds the ${DEVICE_TOKEN_MAX_BYTES}-byte limit`
+	};
+	let text;
+	try {
+		text = await readFile(path, "utf8");
+	} catch (error) {
+		const code = error?.code;
+		return {
+			path,
+			state: "unreadable",
+			reason: code === void 0 ? String(error) : code
+		};
+	}
+	const parsed = parseDeviceTokenDocument(text);
+	if ("reason" in parsed) return {
+		path,
+		state: "unreadable",
+		reason: parsed.reason
+	};
+	return {
+		path,
+		state: "ok",
+		token: parsed.token,
+		ageMs: Math.max(0, nowMs - modifiedMs)
+	};
+}
+/**
+* Build the reader.
+*
+* `warn` fires **only when the state changes** — a missing file would otherwise
+* write one line per request, which is the noise that trains people to ignore
+* logs. Recovery resets the memory, so a later break is reported again.
+*/
+function createDeviceTokenReader(options) {
+	const ttlMs = options.ttlMs !== void 0 && Number.isFinite(options.ttlMs) && options.ttlMs > 0 ? options.ttlMs : DEVICE_TOKEN_DEFAULT_TTL_MS;
+	let cached;
+	let lastBadState;
+	return {
+		async current(nowMs = Date.now()) {
+			if (cached !== void 0 && nowMs - cached.at < ttlMs) return cached.readout.token;
+			const readout = await readDeviceTokenFile(options.file, nowMs);
+			cached = {
+				at: nowMs,
+				readout
+			};
+			if (readout.state === "ok") {
+				lastBadState = void 0;
+				return readout.token;
+			}
+			if (readout.state !== lastBadState) {
+				lastBadState = readout.state;
+				options.warn?.(`device token file is ${readout.state}${readout.reason === void 0 ? "" : ` (${readout.reason})`}; X-Device-Token will not be sent. Path: ${readout.path}`);
+			}
+		},
+		last() {
+			return cached?.readout;
+		}
+	};
+}
+//#endregion
 //#region src/native-modality.ts
 /**
 * Reviewed vendor classifications, keyed by EXACT model id (never a prefix).
@@ -980,7 +1751,9 @@ const NATIVE_MODALITY_BY_MODEL_ID = {
 	"kimi-k2.6": "multimodal",
 	"kimi-k2.7": "multimodal",
 	"kimi-k3-1": "multimodal",
-	"minimax-m3": "multimodal"
+	"minimax-m3": "multimodal",
+	"minimax-m3.1-flash": "multimodal",
+	"space-bunny": "multimodal"
 };
 /**
 * Ids the upstream lists in the model roster that are ROUTERS, not models.
@@ -1038,6 +1811,47 @@ function nativeModalityOf(modelId) {
 function imageDefaultFor(info) {
 	if (info.supportsImages === false) return false;
 	return NATIVE_MODALITY_BY_MODEL_ID[info.id] === "multimodal";
+}
+/**
+* Delete the oldest files in `dir`, keeping the newest `keep`.
+*
+* Ordering is by mtime, not filename: the image name embeds an ISO timestamp
+* and the video name embeds one plus a URL tail, so neither sorts reliably as a
+* string once more than one generator writes into the directory.
+*
+* @returns how many files were removed (for tests and for callers that want to
+*   log a real number); `0` when the directory is absent, unreadable, small
+*   enough, or when every removal failed.
+*/
+async function pruneTempDir(dir, keep = 20, extensions = [".png", ".mp4"]) {
+	let names;
+	try {
+		names = (await readdir(dir)).filter((name) => extensions.some((ext) => name.endsWith(ext)));
+	} catch {
+		return 0;
+	}
+	if (names.length <= keep) return 0;
+	const dated = await Promise.all(names.map(async (name) => {
+		const path = join(dir, name);
+		try {
+			return {
+				path,
+				mtimeMs: (await stat(path)).mtimeMs
+			};
+		} catch {
+			return {
+				path,
+				mtimeMs: 0
+			};
+		}
+	}));
+	dated.sort((a, b) => b.mtimeMs - a.mtimeMs);
+	let removed = 0;
+	for (const entry of dated.slice(Math.max(0, keep))) try {
+		await rm(entry.path, { force: true });
+		removed += 1;
+	} catch {}
+	return removed;
 }
 /** Everything the app treats as a queue condition (`isQueueError`). */
 const WORKBUDDY_QUEUE_CODES = [
@@ -1176,8 +1990,6 @@ function queueNoticeText(report) {
 const IMAGE_TAG_TEXT_TO_IMAGE = "text-to-image";
 /** 产品配置里「图生图 / 改图」模型的标签。 */
 const IMAGE_TAG_IMAGE_TO_IMAGE = "image-to-image";
-/** 官方 CLI 的默认尺寸。 */
-const DEFAULT_IMAGE_SIZE = "1024x1024";
 /** 生图路由。 */
 const IMAGE_GENERATIONS_PATH = "/v2/images/generations";
 /** 改图路由：官方 CLI 的 `ImageService.editImage` 打的就是这条（2026-10-25 国际区实测 200）。 */
@@ -1703,8 +2515,39 @@ function parseVideoTask(payload) {
 	}
 	return {
 		status,
-		videos: []
+		videos: [],
+		detail: describeUnknownTaskFields(data)
 	};
+}
+/**
+* `data` 里除已知键以外的内容，序列化成一行短文本。
+*
+* 已知键：`status`（状态机自己用）、`data`（成品 URL 列表）、`usage`（扣费）。
+* 其余全部带上——那正是"上游说了原因但我们没读"的地方（issue #187）。
+*
+* 深层结构做 JSON 序列化并截断到 400 字符：一轮报错不该因为上游回了一棵大树而
+* 变成几 KB。空对象返回 `undefined`，好让调用方不拼一个空的「（上游未给出原因）」。
+*/
+function describeUnknownTaskFields(data) {
+	const known = /* @__PURE__ */ new Set([
+		"status",
+		"data",
+		"usage"
+	]);
+	const extra = {};
+	for (const [key, value] of Object.entries(data)) {
+		if (known.has(key)) continue;
+		if (value === void 0 || value === null || value === "") continue;
+		extra[key] = value;
+	}
+	if (Object.keys(extra).length === 0) return void 0;
+	let text;
+	try {
+		text = JSON.stringify(extra);
+	} catch {
+		return "（上游返回了无法序列化的额外字段）";
+	}
+	return text.length > 400 ? `${text.slice(0, 400)}…` : text;
 }
 /** 把一次非 2xx 的提交/轮询响应翻成带 `code` 的错误，好让上层决定怎么提示。 */
 function describeVideoFailure(status, bodyText, phase = "submit") {
@@ -2131,6 +2974,156 @@ function attachPromos(models, promos) {
 		};
 	});
 }
+/**
+* Minutes since local midnight in `timeZone` at `nowMs`.
+*
+* `Intl` does the zone maths, because the upstream's windows are written in
+* the zone IT names (Asia/Shanghai for the CN feed) and the user's own clock
+* is not necessarily in that zone. An unusable zone falls back to UTC rather
+* than throwing: a badge that cannot be placed is a missing badge, not a
+* broken card.
+*/
+function zonedMinutes(nowMs, timeZone) {
+	const zone = timeZone ?? "UTC";
+	try {
+		const parts = new Intl.DateTimeFormat("en-US", {
+			timeZone: zone,
+			hour: "2-digit",
+			minute: "2-digit",
+			hourCycle: "h23"
+		}).formatToParts(new Date(nowMs));
+		const hour = Number(parts.find((part) => part.type === "hour")?.value ?? "0");
+		const minute = Number(parts.find((part) => part.type === "minute")?.value ?? "0");
+		if (!Number.isFinite(hour) || !Number.isFinite(minute)) return 0;
+		return hour * 60 + minute;
+	} catch {
+		return 0;
+	}
+}
+/** Whether `nowMinutes` falls inside one of the daily windows. */
+function withinDailyWindows(windows, nowMinutes) {
+	return windows.some((window) => {
+		const start = minutesOfClock(window.start);
+		const end = minutesOfClock(window.end);
+		if (start === void 0 || end === void 0) return false;
+		if (start === end) return true;
+		if (end > start) return nowMinutes >= start && nowMinutes < end;
+		return nowMinutes >= start || nowMinutes < end;
+	});
+}
+/**
+* Whether the promotion's ABSOLUTE window holds now.
+*
+* The absolute window (`validFrom` / `validUntil`) is the promotion's own
+* lifetime. It gates the badge on its own: a promotion whose lifetime has
+* ended must not keep advertising itself, whatever its daily hours say.
+*/
+function promoWithinAbsoluteWindow(promo, nowMs) {
+	const schedule = promo.schedule;
+	if (schedule === void 0) return true;
+	if (schedule.validFrom !== void 0 && nowMs < schedule.validFrom) return false;
+	if (schedule.validUntil !== void 0 && nowMs >= schedule.validUntil) return false;
+	return true;
+}
+/**
+* Whether the promotion's DAILY window holds now.
+*
+* The daily window is the discount's own hours — it is what makes a
+* promotion a "night discount" — and a promotion without one is running
+* whenever its absolute window holds.
+*
+* A schedule whose `daily` was published but could not be evaluated
+* ({@link WorkBuddyPromoSchedule.dailyUnusable}) is NOT running: the upstream
+* did say the campaign has hours, we just cannot read them, and assuming
+* "always" is the one guess that overstates the offer.
+*/
+function promoWithinDailyWindow(promo, nowMs) {
+	const schedule = promo.schedule;
+	if (schedule === void 0) return true;
+	if (schedule.dailyUnusable === true) return false;
+	if (schedule.daily === void 0 || schedule.daily.length === 0) return true;
+	return withinDailyWindows(schedule.daily, zonedMinutes(nowMs, schedule.timezone));
+}
+/**
+* Whether the promotion is running right now: its absolute window AND its
+* daily hours both hold.
+*/
+function promoActiveAt(promo, nowMs) {
+	return promoWithinAbsoluteWindow(promo, nowMs) && promoWithinDailyWindow(promo, nowMs);
+}
+/**
+* Whether the promotion carries ANY temporal statement of its own.
+*
+* A tier badge ("Pro Only") has no `schedule` at all: it describes the model
+* unconditionally, so `promoActiveAt` is trivially true for it. That is
+* correct on its own, but it made such a badge eligible for step 1, where it
+* could shadow a lower-priority campaign whose window really is open.
+* "Running" should mean "this entry says it runs now", and an entry with no
+* schedule never does — it only ever "stands". Entries WITH a schedule (a
+* lifetime, hours, or both) are the ones that can be running.
+*/
+function hasSchedule(promo) {
+	return promo.schedule !== void 0;
+}
+function selectPromoBadge(promos, nowMs) {
+	if (promos === void 0 || promos.length === 0) return void 0;
+	const sorted = [...promos].sort((a, b) => b.priority - a.priority || (a.source === b.source ? 0 : a.source === "promotion" ? -1 : 1));
+	const running = sorted.find((promo) => hasSchedule(promo) && promoActiveAt(promo, nowMs));
+	if (running !== void 0) return running;
+	return sorted.find((promo) => promo.badge.display !== "activeOnly" && promoWithinAbsoluteWindow(promo, nowMs) && promo.schedule?.dailyUnusable !== true);
+}
+/**
+* The chip's colour, when the upstream published a usable one.
+*
+* Only a hex colour is accepted: the value reaches an inline style, and the
+* upstream's feed publishes hex (`#009273`, `#FF0000`). Anything else is
+* refused rather than passed through, and the card falls back to its own
+* brand colour.
+*/
+function promoBadgeColor(promo) {
+	const color = promo.badge.color;
+	if (color === void 0) return void 0;
+	return /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(color) ? color : void 0;
+}
+/**
+* The host's own badge tone for a promotion, for the 0.2.2+ `model.badge` field.
+*
+* WHY A TONE AND NOT A COLOUR. From 0.2.2 the host's model directory accepts a
+* per-model `badge` (`LlmModelBadge = { text, tone }`) and draws it itself, in
+* the same place and shape as the picker's own labels. `tone` is one of four
+* semantic slots (`neutral | info | success | warning`), NOT an arbitrary
+* colour: the shell paints it from theme tokens so it stays legible in every
+* theme, which an upstream hex value cannot guarantee.
+*
+* The upstream's hex colour is therefore mapped onto the CLOSEST tone rather
+* than passed through. Green — the value every CN promotion here uses for "free
+* for now" — reads as `success`; blues as `info`; amber/red as `warning`;
+* anything else stays `neutral` rather than inventing a meaning.
+*
+* WHY IT LIVES IN THIS MODULE, not in `client/promo-badge.ts` beside the other
+* chip helpers. The consumer that needs it is `src/adapter.ts` — the HOST half,
+* which fills `LlmModelInfo.badge` and cannot import from `src/client/` (that
+* directory is a separate build, and the host bundle never reaches it). This
+* module is the one place both halves already share, and it stays DOM-free so
+* the host can load it. `client/promo-badge.ts` re-exports it for the card.
+*
+* @param promo - The resolved promotion.
+* @returns The host tone to stamp on `model.badge`.
+*/
+function promoBadgeTone(promo) {
+	const color = promoBadgeColor(promo);
+	if (color === void 0) return "neutral";
+	const hex = color.replace("#", "");
+	if (hex.length !== 6) return "neutral";
+	const r = Number.parseInt(hex.slice(0, 2), 16);
+	const g = Number.parseInt(hex.slice(2, 4), 16);
+	const b = Number.parseInt(hex.slice(4, 6), 16);
+	if (!Number.isFinite(r) || !Number.isFinite(g) || !Number.isFinite(b)) return "neutral";
+	if (g > r + 24 && g > b + 24) return "success";
+	if (b > r + 24 && b > g + 8) return "info";
+	if (r > b + 24) return "warning";
+	return "neutral";
+}
 //#endregion
 //#region src/busy.ts
 /** The upstream's enum, in the order its own bundle declares it. */
@@ -2345,6 +3338,49 @@ const CLIENT_UA = "CLI/2.63.2 CodeBuddy/2.63.2";
 */
 const PRODUCT_UA = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0";
 /**
+* The GLOBAL gateway's app channel: `WorkBuddy/<version>` with no CLI segment.
+*
+* This exists because the paragraph above is only true for the CN gateway.
+* Measured on the global gateway on 2026-11-06, same token, same URL, only
+* this header differing, each shape read 3–30 times with identical results:
+*
+*   | User-Agent                                     | global `/v3/config` answer                       |
+*   | ---                                            | ---                                              |
+*   | `WorkBuddy/5.8.3`                               | 23 models, 1 agent (`cli` roster of 21),         |
+*   |                                                | `hy-image-3.5` + `kling-video-v3`,                |
+*   |                                                | `max-model` / `hy4free` / `hy4std` present       |
+*   | `WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0`  | 39 models, 14 agents, NO `cli` roster,           |
+*   |                                                | `hy-image-3.5` GONE,                             |
+*   |                                                | `max-model` / `hy4free` / `hy4std` GONE          |
+*   | `CLI/2.63.2 CodeBuddy/2.63.2`                  | 28 models, 16 agents (`cli` roster of 26),       |
+*   |                                                | `deepseek-v4.1-flash` at `x0.00`                 |
+*
+* So on the global gateway a trailing `CLI/…` segment selects a THIRD
+* document — the poorest of the three — while on the CN gateway that same
+* composite string is the richest one (62 models + 8 promos). The two
+* gateways genuinely disagree, which is why {@link PRODUCT_UA} must NOT be
+* "fixed" globally: doing so collapses CN from 61 models + a 17-row `cli`
+* roster down to 39 models with no roster at all (measured, same token).
+*/
+const APP_CHANNEL_UA = "WorkBuddy/5.8.3";
+/**
+* The CLI channel's product identity, used to read the SECOND global document.
+*
+* Deliberately not a reference to {@link CLIENT_UA} even though the strings are
+* equal today: that constant is a CHAT contract pinned to the versions the
+* conversation-identity triple was verified against, while this one only
+* selects a catalog. A future chat-contract bump must not silently move the
+* discovery channel with it.
+*
+* Why read it at all: the plugin CHATS as the CLI agent, and the global CLI
+* document publishes eight chat models the app document does not mention —
+* `fast-model`, `balanced-model`, `primary-model`, `deepseek-v4.1-flash`,
+* `hy4-preview`, `gpt-5.5`, `gpt-5.4`, `glm-5.2`. Reading only the app
+* document hid the CLI's own `x0.00` DeepSeek row while that row answered
+* HTTP 200 over the plugin's own chat channel. See {@link mergeModelRosters}.
+*/
+const CATALOG_CLI_UA = "CLI/2.63.2 CodeBuddy/2.63.2";
+/**
 * The app version inside {@link PRODUCT_UA}, for headers that need it alone.
 *
 * Derived from the UA instead of repeated as a literal: the `X-IDE-Version`
@@ -2362,11 +3398,30 @@ const ERROR_BODY_LIMIT = 4096;
 * tokens, so prompt processing legitimately takes a while before the first byte
 * comes back. It exists only to stop a connection that will NEVER answer — the
 * pool's batch is serial, so one hung member would otherwise block all the rest
-* with nothing in the UI to say which one it was. Ten seconds is comfortably
-* above a working gateway's first byte and far below a user's patience; the
-* budget covers the response only, never the one-line body that follows.
+* with nothing in the UI to say which one it was; the budget covers the response
+* only, never the one-line body that follows.
+*
+* THIRTY SECONDS, NOT TEN. The old 10 s was chosen as "comfortably above a
+* working gateway's first byte", and on a fast path it is — but measured on a
+* real 25k-token probe body over ordinary Chinese broadband, the first byte
+* alone took 3.47 s / 3.57 s / 6.97 s on three consecutive attempts. A 10 s
+* ceiling therefore left under 3 s of margin on the worst run, and any jitter
+* blew through it.
+*
+* The cost of tripping it was never just a failed test: `status: 0` carries no
+* `retryAtMs`, so the pool fell back to {@link POOL_UNKNOWN_COOLDOWN_MS} (30
+* minutes) and benched healthy accounts, answering "池中已无可用账号" and a 502 to
+* every request until the cooldown lapsed. The two failure directions are not
+* symmetric — waiting an extra 20 s on a genuinely dead endpoint costs one
+* stalled batch member, while firing early costs half an hour of the whole pool
+* — so this ceiling is deliberately generous.
+*
+* It also does not cover THIS MACHINE's identity work. Since P3 the header build
+* may spawn the device-token subprocess (budget 20 s), and starting the clock
+* before that would turn a healthy gateway into "unreachable" on a cold start —
+* see the note in `probeChat` for why that matters to the pool.
 */
-const PROBE_TIMEOUT_MS = 1e4;
+const PROBE_TIMEOUT_MS = 3e4;
 /**
 * 生图请求的超时。
 *
@@ -2380,8 +3435,15 @@ const IMAGE_TIMEOUT_MS = 18e4;
 const VIDEO_TIMEOUT_MS = 6e5;
 /** 轮询之间的间隔（官方 CLI pollTask 用 5s）。 */
 const VIDEO_POLL_INTERVAL_MS = 5e3;
-/** 单个轮询轮次的上限（与 VIDEO_TIMEOUT_MS 对应，防死循环）。 */
-const VIDEO_POLL_TIMEOUT_MS = 6e5;
+/**
+* 轮询循环自身上限（防死循环）。
+*
+* 比 {@link VIDEO_TIMEOUT_MS} 短 60s：工具层给的是一个更短的 signal
+* （`VIDEO_TOOL_TIMEOUT_MS`），两者叠在一起时**这个检查要先生效**，才能带着
+* task id 抛出 `POLL_TIMEOUT`。曾经的 600s 与宿主工具上限相等，先在宿主那边
+* 掐断，于是用户只看到 `tool call timed out after 600000ms`（issue #187）。
+*/
+const VIDEO_POLL_TIMEOUT_MS = 54e4;
 /** 单条视频下载超时（官方 CLI 用 120s）。 */
 const VIDEO_DOWNLOAD_TIMEOUT_MS = 12e4;
 /**
@@ -3109,17 +4171,41 @@ function globalBase(domain) {
 	if (lowered === "codebuddy.ai" || lowered.endsWith(".codebuddy.ai")) return "https://www.codebuddy.ai";
 	return GLOBAL_BASE;
 }
-function chatBase(credential) {
-	return regionOf(credential.domain) === "global" ? globalBase(credential.domain) : CN_CHAT_BASE;
+/**
+* The CN gateway base for this process, resolved ONCE at construction.
+*
+* Empty means "no override", and then the constant is used — the pre-#220
+* behaviour, byte for byte. A non-empty value has already passed
+* `resolveCnGateway`'s allowlist, so this is a validated host and not whatever
+* happened to be in the settings file.
+*
+* Deliberately injected rather than read from config at each call site: the CN
+* base feeds a Bearer token, so "which host" must be decided in exactly one
+* place that can be pointed at and audited, not re-derived by ten request
+* builders. The class also swaps it when the setting changes (the mount
+* reconstructs the client on a volatile update).
+*/
+function chatBase(credential, cnBase) {
+	if (regionOf(credential.domain) === "global") return globalBase(credential.domain);
+	return cnBase === void 0 || cnBase === "" ? CN_CHAT_BASE : cnBase;
 }
-function billingBase(credential) {
-	return regionOf(credential.domain) === "global" ? globalBase(credential.domain) : CN_BILLING_BASE;
+function billingBase(credential, cnBase) {
+	if (regionOf(credential.domain) === "global") return globalBase(credential.domain);
+	return cnBase === void 0 || cnBase === "" ? CN_BILLING_BASE : cnBase;
 }
 function originReferer(credential) {
 	return regionOf(credential.domain) === "global" ? globalBase(credential.domain) : CN_BILLING_BASE;
 }
-/** Headers every upstream request shares. */
-function commonHeaders(credential) {
+/**
+* 5.16.0 的公共头，**不含 P1 增补**。
+*
+* 只给 {@link refreshHeaders} 用，而且是有意的：refresh 是整条链路里唯一
+* "失败就等于掉登录"的一跳，它的字节不该因为一次身份统一而变化。B 的
+* `RefreshHeaders` 确实也走 `CommonHeaders`（因此带 `X-CodeBuddy-Request`），
+* 但那是 B 一直在跑的形状；本插件没有在 refresh 上验过任何新头，
+* "别人这么发" 不等于 "我们可以这么改"。
+*/
+function legacyCommonHeaders(credential) {
 	return {
 		"Accept": "application/json, text/plain, */*",
 		"X-Requested-With": "XMLHttpRequest",
@@ -3127,6 +4213,20 @@ function commonHeaders(credential) {
 		"Referer": `${originReferer(credential)}/`,
 		"User-Agent": CLIENT_UA
 	};
+}
+/**
+* 客户端调用（chat 家族）的公共头 = {@link legacyCommonHeaders} + P1 增补。
+*
+* 目前只有 chat 一条路径用它（`chatStream` 与 `probeChat`，两者是同一个合同）。
+* 元数据读与维护跳走 `legacyCommonHeaders`，见那条注释里的边界说明。
+*/
+function commonHeaders(credential, identity = {}) {
+	const headers = legacyCommonHeaders(credential);
+	if (profileOf(identity) === "balanced") {
+		headers["X-CodeBuddy-Request"] = "1";
+		headers["Accept-Language"] = acceptLanguageOf(credential);
+	}
+	return headers;
 }
 /**
 * The conversation-identity triple the chat endpoint now requires (issue #66).
@@ -3179,9 +4279,11 @@ function conversationHeaders(shape, identity = {}) {
 	const officialIds = shape === "chat" && identity.usageIdentity === true;
 	const id = officialIds ? uuidv7 : randomUUID;
 	const messageId = id();
+	const conversationRequestId = id();
 	return {
 		"X-Conversation-ID": id(),
-		"X-Conversation-Request-ID": id(),
+		"X-Conversation-Request-ID": conversationRequestId,
+		...profileOf(identity) === "balanced" ? { "X-Root-Request-ID": conversationRequestId } : {},
 		"X-Conversation-Message-ID": messageId,
 		...officialIds ? { "X-Request-ID": messageId } : {}
 	};
@@ -3213,70 +4315,185 @@ function uuidv7(nowMs = Date.now()) {
 	return bytes.toString("hex");
 }
 /**
-* The IDE identity headers the official desktop client sends on chat (issue #132).
+* 没有显式配置时用的档位。
 *
-* WHY. The gateway records the usage page's 使用端 (client) column from
-* `X-IDE-Name`, and it is EMPTY when the header is absent. The plugin has always
-* spoken the CLI channel — {@link CLIENT_UA}, which is correct for the chat
-* contract — but it sent no `X-IDE-*` at all, so every request this plugin made
-* appeared on the user's own usage page as an unidentified client while the
-* official app's requests read `WorkBuddy`. That is a reporting mismatch, not a
-* gate: the reporter measured that adding the header changes the usage column
-* and nothing else (HTTP 200, model unaffected).
-*
-* `X-IDE-Type` stays `CLI` on purpose. Claiming the desktop app's type as well
-* would be a bigger identity claim than the one this fix needs, and the mixed
-* CLI + WorkBuddy shape is what the reporter measured. The version comes from
-* {@link PRODUCT_UA} rather than a second hardcoded number, so the two cannot
-* drift apart when the app version is bumped.
-*
-* Sent only when {@link WorkBuddyWireIdentity.usageIdentity} is on — see that
-* field for the evidence tier behind the default.
+* `balanced`：P0.5 已证实有效，默认就应该吃到收益；`conservative` 留给
+* "某台机器上某个账号忽然不行了"的排查场景。
 */
-function ideHeaders(identity) {
-	if (identity.usageIdentity !== true) return {};
+const DEFAULT_WIRE_PROFILE = "balanced";
+/** 生效档位；未配置时取默认。 */
+function profileOf(identity) {
+	return identity.profile ?? "balanced";
+}
+/**
+* 归属头的产品名。
+*
+* `WorkBuddy` 而不是 `SaaS`：`SaaS` 是"某种 SaaS 租户"的泛化标签，官方客户端
+* 从不会这么称呼自己；A（`client_name` 默认 `WorkBuddy`）与 B
+* （`attributionClientName` 默认 `WorkBuddy`）都发 `WorkBuddy`，而 B 的注释直接
+* 把 `SaaS` 称作"还原旧行为"。同值三头（Name / Type / Product）也是两家的共同
+* 形状——官方客户端不会一边说自己是 WorkBuddy、一边说自己是 CLI。
+*/
+const ATTRIBUTION_CLIENT_NAME = "WorkBuddy";
+/**
+* `Accept-Language`：按账号域切。
+*
+* 官方客户端按账号所属区发对应语言（B 的 D5：CN `zh-CN` / global `en-US`）。
+* 一个中文账号发 `en-US` 是"这台机器换了语言"，而语言是设备指纹里最廉价、
+* 也最常被用来做聚类的一维——顺手对齐没有成本。
+*/
+function acceptLanguageOf(credential) {
+	return regionOf(credential.domain) === "global" ? "en-US" : "zh-CN";
+}
+/**
+* 归属头：这台客户端"是谁"，一次说清（P1 的"统一为 WorkBuddy 客户端"）。
+*
+* ## 为什么是从 `ideHeaders` 扩成函数族
+*
+* 5.16.0 发的是 `X-Product: SaaS` + 可选的 `X-IDE-Type: CLI` / `X-IDE-Name:
+* WorkBuddy`，而且三个头分两处、其中两个还被 `usageIdentity` 挡着。结果是同一条
+* 请求里"产品"说自己是泛化 SaaS、"类型"说自己是 CLI、"名字"说自己是 WorkBuddy —
+* 三个互不相同的自称。A 与 B 都不是这么做的：两家都是 Name / Type / Product
+* **同值**，且都发 `X-Agent-Purpose: conversation`。
+*
+* ## `conservative` 为什么还原的是 `SaaS` 而不是"少发几个"
+*
+* 回退档的契约是"逐字节等于 5.16.0"。只删新头、留下改名后的 `X-Product`，等于
+* 造出第三个从未上线过的形状——排查时最怕的就是"回退了但没完全回退"。
+*
+* 版本号取 {@link APP_VERSION}（从 {@link PRODUCT_UA} 解析出来），不写字面量：
+* 两个独立字面量正是版本升级时开始互相矛盾的方式。
+*/
+function attributionHeaders(identity) {
+	if (profileOf(identity) !== "balanced") return { "X-Product": "SaaS" };
 	return {
-		"X-IDE-Type": "CLI",
-		"X-IDE-Name": "WorkBuddy",
-		"X-IDE-Version": APP_VERSION
+		"X-Agent-Purpose": "conversation",
+		"X-IDE-Name": ATTRIBUTION_CLIENT_NAME,
+		"X-IDE-Type": ATTRIBUTION_CLIENT_NAME,
+		"X-IDE-Version": APP_VERSION,
+		"X-Product": ATTRIBUTION_CLIENT_NAME
+	};
+}
+/**
+* 设备头：真实值档只发真 token；虚拟值档发派生的 id 对（+ P2 的文件 token，若有）。
+*
+* 盐来自本机 `$DSH_HOME/.workbuddy-device.json`（见 `src/device-salt.ts`），由
+* 客户端解析一次后放进 identity；**盐缺席就整对不发**——只发 Machine-ID 不发
+* Session-ID 是一个真实客户端不会出现的形状。token 来自
+* `deviceToken.file`（见 `src/device-token.ts`），每 5 分钟重读。
+*
+* ## 两档互斥，且互斥在**代码**里
+*
+* 真 token 内含设备信息（A 调 `fetchDeviceToken({includesDeviceInfo:true})`），
+* 再配一对伪造 id 等于自证不一致（审计 §5.3）。P2 把这个组合先放上线是为了让
+* 档位规则由实测决定；P3 的决定是：真实值档只发 token，派生对整对不发。这里不是
+* "少发几个头"，是两条互斥的返回路径——同时带着两者发出去的那条路已经不存在了，
+* 也就没有配置能配出矛盾组合。
+*/
+function deviceHeaders(credential, identity) {
+	if (profileOf(identity) !== "balanced") return {};
+	if (identity.deviceTier === "real") return identity.deviceReal === void 0 || identity.deviceReal === "" ? {} : { "X-Device-Token": identity.deviceReal };
+	const headers = {};
+	if (identity.deviceToken !== void 0 && identity.deviceToken !== "") headers["X-Device-Token"] = identity.deviceToken;
+	const salt = identity.deviceSalt;
+	const override = identity.deviceProfile;
+	const derivedMachine = salt !== void 0 && salt !== "" && credential.uid !== "" ? deriveDeviceId(credential.uid, "machine", salt) : "";
+	const derivedSession = salt !== void 0 && salt !== "" && credential.uid !== "" ? deriveDeviceId(credential.uid, "session", salt) : "";
+	const machineId = override?.machineId !== void 0 && override.machineId !== "" ? override.machineId : derivedMachine;
+	const sessionId = override?.sessionId !== void 0 && override.sessionId !== "" ? override.sessionId : derivedSession;
+	if (machineId !== "") headers["X-Machine-ID"] = machineId;
+	if (sessionId !== "") headers["X-Session-ID"] = sessionId;
+	return headers;
+}
+/**
+* 把 identity 补全成"可以直接拿去构造头"的形态——解析本机设备盐。
+*
+* 三条提前返回，各有理由：
+*   - 非 `balanced`：这一档根本不发设备头，去读盘只是浪费一次 IO；
+*   - 调用方已经给了盐（测试、或 doctor 已经解析过）：不复读；
+*   - 读不到（absent / unreadable / unwritable）：原样返回，`deviceHeaders`
+*     会因为 `deviceSalt === undefined` 整对不发。**绝不现场造一个临时盐**。
+*/
+async function resolveWireIdentity(identity) {
+	if (profileOf(identity) !== "balanced") return identity;
+	if (identity.deviceSalt !== void 0 && identity.deviceSalt !== "") return identity;
+	const readout = await ensureDeviceSalt();
+	if (readout.state !== "ok") return identity;
+	return {
+		...identity,
+		deviceSalt: readout.salt
 	};
 }
 /** Chat request headers, including the X-No-* conventions the official CLI uses. */
 function chatHeaders(credential, identity = {}) {
 	return {
-		...commonHeaders(credential),
+		...commonHeaders(credential, identity),
 		"Content-Type": "application/json",
 		...credential.uid === "" ? { "X-No-User-Id": "1" } : { "X-User-Id": credential.uid },
 		...credential.enterpriseId === void 0 || credential.enterpriseId === "" ? { "X-No-Enterprise-Id": "1" } : { "X-Enterprise-Id": credential.enterpriseId },
 		...credential.domain === "" ? { "X-No-Department-Info": "1" } : { "X-Domain": credential.domain },
-		"X-Product": "SaaS",
-		...ideHeaders(identity),
+		...attributionHeaders(identity),
+		...deviceHeaders(credential, identity),
 		...conversationHeaders("chat", identity)
 	};
 }
-/** Refresh-endpoint headers; X-Refresh-Token appears here and nowhere else. */
+/**
+* Refresh-endpoint headers; X-Refresh-Token appears here and nowhere else.
+*
+* **签名里刻意没有 `identity`**：这条路径不参与 P1 的身份统一，多一个用不到的
+* 参数只会让下一个人以为它本该用上。见 {@link legacyCommonHeaders}。
+*/
 function refreshHeaders(credential) {
 	const headers = {
-		...commonHeaders(credential),
+		...legacyCommonHeaders(credential),
 		"X-Refresh-Token": credential.refreshToken,
 		"X-Auth-Refresh-Source": "workbuddy"
 	};
 	if (credential.enterpriseId !== void 0 && credential.enterpriseId !== "") headers["X-Enterprise-Id"] = credential.enterpriseId;
 	return headers;
 }
-/** Billing request headers. */
-function billingHeaders(credential) {
+/**
+* Billing request headers.
+*
+* ## 为什么这条路径要补这么多（审计 §1.3 的 D2）
+*
+* 5.16.0 的 billing 只发三件套 + 用户/企业/域，**没有 UA、没有 Origin/Referer、
+* 没有 X-Requested-With、没有任何归属头**。于是同一个 token 在同一分钟里发出
+* 两种客户端：chat 声称自己是 CLI，billing 声称自己是一个连 UA 都没有的裸 HTTP
+* 客户端。这种"两条路径互不承认"的反差不需要任何启发式就能被静态规则挑出来，
+* 而 billing 恰好是签到、领补偿这类**写操作**所在的域——最不该显得可疑的地方。
+*
+* 补齐的四类，每一类都有参照实现：
+*   - `User-Agent: WorkBuddy/<ver>`：B 的 billing 域用单段形态（官方 banner
+*     白名单头组不带 CLI 段），A 则对所有路径复用同一套头。
+*   - `Origin` / `Referer` / `X-Requested-With`：B 的 `CommonHeaders` 全路径发送。
+*   - `X-CodeBuddy-Request` + `Accept-Language`：B 在 billing 域单独注入（D1/D5）。
+*   - 归属头与设备头：与本插件的 chat 路径同源，保证"同一个客户端"这个说法成立。
+*
+* `conservative` 档整段跳过，billing 逐字节还原 5.16.0 的裸形状。
+*/
+function billingHeaders(credential, identity = {}) {
+	const balanced = profileOf(identity) === "balanced";
 	const headers = {
 		"Authorization": `Bearer ${credential.accessToken}`,
 		"Accept": "application/json",
 		"Content-Type": "application/json"
 	};
+	if (balanced) {
+		headers["User-Agent"] = `WorkBuddy/${APP_VERSION}`;
+		headers["X-Requested-With"] = "XMLHttpRequest";
+		headers["X-CodeBuddy-Request"] = "1";
+		headers["Accept-Language"] = acceptLanguageOf(credential);
+		headers["Origin"] = originReferer(credential);
+		headers["Referer"] = `${originReferer(credential)}/`;
+	}
 	if (credential.uid !== "") headers["X-User-Id"] = credential.uid;
 	if (credential.enterpriseId !== void 0 && credential.enterpriseId !== "") {
 		headers["X-Enterprise-Id"] = credential.enterpriseId;
 		headers["X-Tenant-Id"] = credential.enterpriseId;
 	}
 	if (credential.domain !== "") headers["X-Domain"] = credential.domain;
+	if (balanced) Object.assign(headers, attributionHeaders(identity), deviceHeaders(credential, identity));
 	return headers;
 }
 /**
@@ -3286,6 +4503,26 @@ function billingHeaders(credential) {
 * 用户/企业/域三连 + 会话身份三连 + `PRODUCT_UA`，在 `copilot.tencent.com` 与
 * `www.workbuddy.cn` 两个入口都返回 200。刻意**不带** `Origin` / `Referer`：
 * 探针当时没带，带了只是多一个可能被网关拒掉的变量，没有收益。
+*
+* 2026-10-31（P1）：`X-Product` 由 `SaaS` 改为 `WorkBuddy`，并补上
+* `X-Agent-Purpose` / `X-IDE-*` 与设备对，与 chat / billing 同一份自称（见
+* {@link attributionHeaders}）。这里遵守的是一条明确的界线：
+*
+*   - **身份类头**（`X-Product` / `X-IDE-*` / `X-Agent-Purpose` / 设备对）跟着
+*     统一走。不统一的代价是新的 D2：同一个 host 上 chat 说自己是 WorkBuddy、
+*     生图说自己是 SaaS，而这个矛盾恰恰是这次要消掉的东西。
+*   - **网络环境类头**（`Origin` / `Referer`）保持上表的实测形态。它们回答的是
+*     "这条请求从哪来"，与"谁在说话"不是一个判据，当时特意排除就先不请回来。
+*
+* 代价说清楚：这毕竟是在一条逐字节测过的路径上加了几个头。若生图那道闸哪天
+* 开始拒，第一个该试的是把 `wireProfile` 切到 `conservative` —— 那一档会把这
+* 一行连同所有新增头一起还原成 5.16.0。
+*
+* 增量的边界是"**自我描述**"：`X-Product` / `X-IDE-*` / `X-Agent-Purpose` /
+* 设备对 / `X-Root-Request-ID` 进，`X-CodeBuddy-Request` 与 `Accept-Language`
+* **不进**。后两个不是身份而是传输层标记：若闸门真的要求 `X-CodeBuddy-Request`，
+* 生图（从来没发过它）今天就该失败，而它一直是 200；语言同理，生图输出不是
+* 语言相关的东西。没有收益的变量不加——这条正是上面那段实测留下的规则。
 *
 * 复用 {@link conversationHeaders}：官方 CLI 的 ImageService 也是每次现生成
 * 一组会话 UUID。但这里**传 `'image'`，且刻意不跟 `usageIdentity` 开关走**：
@@ -3304,13 +4541,43 @@ function imageHeaders(credential, identity = {}) {
 		"Accept": "application/json, text/plain, */*",
 		"Content-Type": "application/json",
 		"User-Agent": PRODUCT_UA,
-		"X-Product": "SaaS",
 		"X-Requested-With": "XMLHttpRequest",
 		...credential.uid === "" ? { "X-No-User-Id": "1" } : { "X-User-Id": credential.uid },
 		...credential.enterpriseId === void 0 || credential.enterpriseId === "" ? { "X-No-Enterprise-Id": "1" } : { "X-Enterprise-Id": credential.enterpriseId },
 		...credential.domain === "" ? { "X-No-Department-Info": "1" } : { "X-Domain": credential.domain },
+		...attributionHeaders(identity),
+		...deviceHeaders(credential, identity),
 		...conversationHeaders("image", identity)
 	};
+}
+/**
+* The header NAMES one outbound request would carry — names only, never values.
+*
+* WHY THIS EXISTS. 审计（`docs/DEVICE-IDENTITY-AUDIT.md`）的 P0 要回答"我们现在
+* 到底发了什么"，而这个答案必须**由代码给出**，不能由一段写死的清单给出：写死的
+* 清单在上线三个月后一定与真实请求脱节，届时它会安静地撒谎。因此这里直接调用
+* 请求路径上同一批构造器（{@link chatHeaders} / {@link imageHeaders} /
+* {@link refreshHeaders} / {@link billingHeaders}），返回它们的键集合——往
+* `chatHeaders` 里加一个头，这里自动跟着变，不需要第二次修改。
+*
+* 两处**刻意与调用点对齐**的地方：
+*   - `chat` 的 `Authorization` 由调用点合并（`:3739` / `:3810`），不在这批构造器
+*     里，所以这里补上；不补的话，"chat 有没有带鉴权"会被答成"没有"。
+*   - `refresh` 确实没有 `Authorization`（它用 `X-Refresh-Token`），不补。
+*
+* READ-ONLY：不发请求、不返回任何值、不打印任何东西。调用方（`doctor`）决定
+* 显示到哪一层。
+*/
+function describeRequestHeaderNames(kind, credential, identity = {}) {
+	switch (kind) {
+		case "chat": return Object.keys({
+			...chatHeaders(credential, identity),
+			Authorization: `Bearer ${credential.accessToken}`
+		});
+		case "image": return Object.keys(imageHeaders(credential, identity));
+		case "refresh": return Object.keys(refreshHeaders(credential));
+		case "billing": return Object.keys(billingHeaders(credential, identity));
+	}
 }
 /**
 * Stand-in system message for a request that reached the wire carrying none.
@@ -3379,12 +4646,14 @@ const WEB_GUI_PROMPT_ZH = "你正通过 DeepSeek Harness 网页界面与用户�
 * not a guarantee — and the self-healing retry is what covers the openings
 * nobody has measured yet.
 */
-const UNAPPROVED_CHANNEL_OPENINGS = [
-	{ prefix: "you are interacting with the user through the deepseek harness", replacement: WEB_GUI_PROMPT_ZH },
-	{ prefix: "you are an ai agent powered by deepseek harness", replacement: WORKBUDDY_FALLBACK_SYSTEM_PROMPT },
-	{ prefix: "you are claude code, anthropic's official cli for claude", replacement: WORKBUDDY_FALLBACK_SYSTEM_PROMPT },
-	{ prefix: "you are a helpful assistant", replacement: WORKBUDDY_FALLBACK_SYSTEM_PROMPT }
-];
+	const UNAPPROVED_CHANNEL_OPENINGS = [
+		{ prefix: "you are interacting with the user through the deepseek harness", replacement: WEB_GUI_PROMPT_ZH },
+		{ prefix: "you are working with the user inside the deepseek harness web gui", replacement: WEB_GUI_PROMPT_ZH },
+		{ prefix: "you are an ai agent, powered by deepseek harness", replacement: WORKBUDDY_FALLBACK_SYSTEM_PROMPT },
+		{ prefix: "you are an ai agent running inside deepseek harness", replacement: WORKBUDDY_FALLBACK_SYSTEM_PROMPT },
+		{ prefix: "you are claude code", replacement: WORKBUDDY_FALLBACK_SYSTEM_PROMPT },
+		{ prefix: "you are a helpful assistant", replacement: WORKBUDDY_FALLBACK_SYSTEM_PROMPT }
+	];
 /**
 * The identity clauses an agent prompt introduces itself with, matched so the
 * plugin can break them INSIDE rather than in front of.
@@ -3512,6 +4781,104 @@ function scansOpening(role) {
 	return name === "system" || name === "assistant";
 }
 /**
+* The gateway's current content fingerprints, and same-meaning rewrites for
+* them (issue #163).
+*
+* WHY REWRITE INSTEAD OF ZERO-WIDTH. On 2026-10-29 two independent probes
+* measured that the CN gateway normalizes invisible characters before matching:
+* the DSH identity with U+200B at every word boundary still answers 11128.
+* `breakIdentityClauses` and both perturbation rungs therefore cannot help this
+* family. A real wording change is what the same probes measured as 200.
+*
+* WHY SENTENCE-LEVEL, NOT ONE WHOLE-PARAGRAPH LITERAL. The third fingerprint is
+* an eight-sentence, roughly 800-character @-path paragraph. Two reporters
+* measured that each sentence alone answers 200 and the whole paragraph answers
+* 400 — it is a COMBINATION, not a single listed sentence. Replacing the
+* paragraph as one literal would stop matching the moment the host changes one
+* word; replacing every sentence breaks the combination and keeps working when
+* only some of the text moves. The rows below are the table proposed in issue
+* #163 (yicneggima-glitch, 18:56; QIYU-PLUS, 18:57), with the identity and Web
+* GUI rows both probes measured.
+*
+* `from` strings are matched ANYWHERE, not just at an opening, because the
+* measured rule is position-independent. Only a hit is replaced; every other
+* byte is left alone, so an ordinary conversation is unchanged.
+*
+* WHICH HOST PACKAGE TO WATCH WHEN A ROW STOPS MATCHING (issue #164 traced the
+* three paragraphs to their owners in the DSH install): the identity sentence
+* comes from `@deepseek-ai/dsh-system-prompt`, the @-path paragraph from
+* `@deepseek-ai/dsh-file-reference`, and the Web GUI paragraph from
+* `@deepseek-ai/dsh-harness-dev-context`. #164 also bisected the MINIMUM
+* triggering span: the @-path paragraph already fails at its first two sentences
+* (112 chars) and the Web GUI paragraph at its first two (217 chars), each
+* sentence alone answering 200 — so a row must clear the truncated shape too,
+* which is exactly what sentence-level rows do. Pinned by
+* `tests/issue163-sentence-rewrite.spec.ts`.
+*/
+const CHANNEL_GATE_PHRASES = [
+	["You are an AI agent powered by DeepSeek Harness", "You are an AI agent running inside DeepSeek Harness"],
+	["You are a coding agent powered by the ", "You are a coding agent running on the "],
+	["You are interacting with the user through the DeepSeek Harness Web GUI", "You are working with the user inside the DeepSeek Harness Web GUI"],
+	["Agent Teams is available in this session", "Agent Teams is enabled for this session"],
+	["Tokens prefixed with @ are paths the user explicitly referenced.", "Paths that begin with @ are the ones the user explicitly referenced."],
+	["Relative paths resolve from the workspace root;", "Relative paths are resolved against the workspace root;"],
+	["absolute paths identify files or directories on the host.", "absolute paths point at files or directories on the host."],
+	["A trailing slash marks a directory:", "A trailing slash indicates a directory:"],
+	["list it when its contents matter.", "list it whenever its contents matter."],
+	["Anything else is a file:", "Everything else is a file:"],
+	["use the read tool when its contents are needed,", "use the read tool whenever you need its contents,"],
+	["and do not claim to have inspected it before reading.", "and never claim to have inspected it before reading it."],
+	["@\"...\" quotes a path containing spaces.", "A path containing spaces is quoted with @\"...\"."],
+	["without naming another target, they mean this GUI.", "and names no other target, the interface described here is meant."],
+	["they mean this GUI.", "the interface described here is meant."]
+];
+/**
+* Rewrite the measured gate phrases in one text part.
+*
+* Exported for the tests and for callers that build a body themselves. It is
+* idempotent: every `to` string is different from its `from` string and no
+* rewrite recreates another `from` string, so a second pass is a no-op.
+*/
+function rewriteChannelFingerprintPhrases(text) {
+	let out = text;
+	for (const [from, to] of CHANNEL_GATE_PHRASES) if (out.includes(from)) out = out.replaceAll(from, to);
+	return out;
+}
+/**
+* Apply {@link rewriteChannelFingerprintPhrases} to every scanned text part.
+*
+* `system` and `assistant` only (the roles the gate reads). `user` and `tool`
+* are deliberately untouched: QIYU-PLUS re-measured both on 2026-10-29 and
+* both answer 200 with the DSH identity at an opening, and rewriting a user's
+* own words would change the conversation for no gate.
+*/
+function rewriteChannelFingerprintPhrasesInBody(obj) {
+	const messages = obj["messages"];
+	if (!Array.isArray(messages)) return;
+	for (const value of messages) {
+		if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+		const message = value;
+		if (!scansOpening(message["role"])) continue;
+		const content = message["content"];
+		if (typeof content === "string") {
+			const next = rewriteChannelFingerprintPhrases(content);
+			if (next !== content) message["content"] = next;
+			continue;
+		}
+		if (!Array.isArray(content)) continue;
+		for (const part of content) {
+			if (typeof part !== "object" || part === null || Array.isArray(part)) continue;
+			const record = part;
+			const type = record["type"];
+			if (typeof type !== "string" || type.trim().toLowerCase() !== "text") continue;
+			const text = record["text"];
+			if (typeof text !== "string") continue;
+			const next = rewriteChannelFingerprintPhrases(text);
+			if (next !== text) record["text"] = next;
+		}
+	}
+}
+/**
 * Move every scanned message (`system` and `assistant`) off the content
 * fingerprint above by prepending the placeholder head.
 *
@@ -3593,66 +4960,24 @@ function neutralizeText(text) {
 	}
 	return changed ? lines.join("\n") : void 0;
 }
-/**
-* Spans the gateway REFUSES that are neither identity clauses nor openings —
-* matched ANYWHERE in a scanned message and replaced in place.
-*
-* MEASURED on the live CN gateway (2026-10-28) against a REAL 14454-character DSH
-* system prompt: with every identity clause already neutralised, the request still
-* answered 400 / 11128. Bisecting that body character by character left exactly
-* ONE trigger, 111 characters long, in the MIDDLE of the prompt:
-*
-*   Tokens prefixed with @ are paths the user explicitly referenced.
-*   Relative paths resolve from the workspace root
-*
-* It is a SUBSTRING rule, so no existing rung can reach it: the opening list is a
-* prefix rule (12 characters prepended still answered 400), breakIdentityClauses
-* knows only the identity clauses, and forceNeutralHead moves openings, not middle
-* spans. Measured locality: leave either sentence out and the body answers 200, so
-* the pair is one unit; the match is case-insensitive and whitespace-sensitive (a
-* newline between the two sentences passes, a plain space does not). Replacing the
-* span with the Chinese text below answered 200 on the same 13793-character body —
-* as did inserting a single U+200B. The replacement therefore KEEPS THE MEANING
-* instead of merely mangling bytes: this line tells the model how to read
-* @-prefixed paths, and a Chinese rendering preserves what it was for.
-*
-* This is the case the comment above predicted (the list cannot be complete). An
-* entry belongs here ONLY with a measured refusal behind it: a phrase added by
-* guesswork would rewrite prompts the gateway answers today.
-*/
-const REFUSED_CONTENT_SPANS = [{
-	text: "Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root",
-	// The host continues the sentence with "; absolute paths identify …", so a
-	// replacement that stops before the semicolon leaves a half-width ";" glued to
-	// Chinese text. Swallow it when it is there, and match BOTH forms: the gateway
-	// was measured to refuse the sentence with and without the trailing punctuation
-	// (its tail boundary is lenient), so the span must not depend on which one the
-	// host happened to write.
-	tail: ";",
-	replacement: "以 @ 开头的标记是用户显式引用的路径，相对路径从工作区根目录解析。"
-}];
-/**
-* Replace every measured refused span with its Chinese equivalent.
-*
-* Case-insensitive, and deliberately tolerant about the whitespace BETWEEN the two
-* sentences: the gateway was measured to accept a newline there, so a host that
-* wraps the sentence across lines must still get the same meaning through. The
-* span's own words are escaped, so a future entry carrying regex metacharacters
-* cannot turn into a pattern that matches something else.
-*/
+const REFUSED_CONTENT_SPANS = [
+	{ text: "Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root", replacement: "以 @ 开头的标记是用户显式引用的路径，相对路径从工作区根目录解析。" },
+	{ text: "Paths that begin with @ are the ones the user explicitly referenced. Relative paths resolve from the workspace root", replacement: "以 @ 开头的标记是用户显式引用的路径，相对路径从工作区根目录解析。" }
+];
+function escapeRegExpSource(part) {
+	return part.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
 function replaceRefusedContentSpans(text) {
 	let out = text;
 	for (const span of REFUSED_CONTENT_SPANS) {
-		const words = span.text.split(/\s+/u).map((word) => word.replace(/[.*+?$^{}()|[\]\\]/gu, "\\$&"));
-		const tail = span.tail === void 0 ? "" : `\\s*${span.tail.replace(/[.*+?$^{}()|[\]\\]/gu, "\\$&")}?`;
-		out = out.replace(new RegExp(`${words.join("\\s+")}${tail}`, "giu"), span.replacement);
+		const pattern = new RegExp(span.text.trim().split(/\s+/u).map(escapeRegExpSource).join("\\s+"), "giu");
+		out = out.replace(pattern, span.replacement);
 	}
 	return out;
 }
 function neutralizeScannedText(text) {
-	const replaced = neutralizeText(text) ?? text;
-	const spanned = replaceRefusedContentSpans(replaced);
-	const broken = breakIdentityClauses(spanned);
+	const replaced = replaceRefusedContentSpans(neutralizeText(text) ?? text);
+	const broken = breakIdentityClauses(replaced);
 	return broken === text ? void 0 : broken;
 }
 /**
@@ -4233,6 +5558,7 @@ function prepareChatBody(source, options) {
 	}
 	ensureSystemHead(obj);
 	if (options?.keepPromptLast === true && Array.isArray(obj["messages"])) keepPromptLast(obj["messages"], injectedPrefixPattern(options.extraInjectedPrefixes));
+	rewriteChannelFingerprintPhrasesInBody(obj);
 	neutralizeChannelFingerprints(obj);
 	normalizeToolChoice(obj);
 	dropRefusedReasoning(obj);
@@ -4704,6 +6030,72 @@ function selectCliModels(rawModels, agents, keepIds = []) {
 	return resolved;
 }
 /**
+* Merge two rosters by model id, keeping the PRIMARY entry for every id both
+* documents publish.
+*
+* Exists because the global `/v3/config` answers a different roster per client
+* channel and NEITHER channel is a superset of the other — measured on a real
+* global account 2026-11-06:
+*
+*   - desktop-only: `max-model`, `hy4free`, `hy4std`
+*   - CLI-only:     `fast-model`, `balanced-model`, `primary-model`,
+*                   `deepseek-v4.1-flash`, `hy4-preview`, `gpt-5.5`, `gpt-5.4`,
+*                   `glm-5.2`
+*   - common (20):  `deepseek-v4.1-flash-sg` is priced differently per channel
+*                   (desktop `x0.11`, CLI `x0.03`); the other 18 agree.
+*
+* The caller passes the CLI roster as PRIMARY because the plugin chats as the
+* CLI agent, so the CLI document is the one whose prices are actually settled
+* when a request is made. Rows only the app document carries are appended, so
+* the desktop-only `hy4free`/`hy4std` keep working — both answer HTTP 200 over
+* the CLI chat channel.
+*
+* `max-model` is appended too even though the provider rejects it for personal
+* accounts (`11133`): that veto belongs to the upstream at request time, and
+* hiding a row the user can see in the app is the defect this merge fixes.
+*/
+function mergeModelRosters(primary, secondary) {
+	const byId = /* @__PURE__ */ new Map();
+	for (const model of primary) byId.set(model.id, model);
+	const merged = [...primary];
+	for (const model of secondary) {
+		const existing = byId.get(model.id);
+		if (existing === void 0) {
+			byId.set(model.id, model);
+			merged.push(model);
+			continue;
+		}
+		/**
+		* THE ID COLLIDED — and a plain id-dedup here silently deleted badges.
+		*
+		* `attachPromos` hangs a promotion on the MODEL OBJECT, so for a row both
+		* documents publish, "which one survived" decides "does this row have a
+		* badge". The two global documents are read through DIFFERENT client
+		* channels: the app channel publishes `modelPromotions` / `modelTiers`, the
+		* CLI channel publishes NEITHER (see the `fetchModels` docblock — reading
+		* `/v3/config` as the CLI channel is the documented cause of an
+		* entirely badge-less card). The caller passes the CLI roster as PRIMARY
+		* because its PRICES are the settled ones, so keeping the primary row —
+		* correct for prices — was also throwing away every badge the app document
+		* carried for those 20 shared ids.
+		*
+		* So: keep the primary's fields (prices stay the CLI's) and graft on the
+		* secondary's promotions when the primary has none. Merging is not
+		* "pick a winner for the whole row"; these two facts are independent.
+		*/
+		if ((existing.promos === void 0 || existing.promos.length === 0) && model.promos !== void 0 && model.promos.length > 0) {
+			const index = merged.indexOf(existing);
+			const grafted = {
+				...existing,
+				promos: model.promos
+			};
+			if (index !== -1) merged[index] = grafted;
+			byId.set(model.id, grafted);
+		}
+	}
+	return merged;
+}
+/**
 * The roster plus the promotion badges the SAME document carries.
 *
 * `data.modelPromotions` and `data.modelTiers` sit beside `data.models` in
@@ -4781,7 +6173,6 @@ function requestEvidenceOf(bodyJson) {
 */
 var WorkBuddyUpstreamClient = class {
 	onFallback;
-	identity;
 	/**
 	* Reports an anomaly the reader or classifier had to tolerate.
 	*
@@ -4791,20 +6182,106 @@ var WorkBuddyUpstreamClient = class {
 	* `ctx.logger.warn` in; without a host the event is dropped, which is the
 	* same silence the previous single-source reader had.
 	*/
-	constructor(onFallback, identity = {}) {
+	/**
+	* 解析一次的底座：设备盐（P1）。真 token 不在这里——它分钟级过期，
+	* 必须每条请求现取，见 {@link wireIdentity}。
+	*/
+	baseIdentity;
+	/** 外部 device token 的 TTL 读取器；未配置时为 undefined。 */
+	deviceTokens;
+	/** 每账号覆盖值的读取器（设置里齿轮保存的那些）；未接线时为 undefined。 */
+	deviceProfiles;
+	/** 真实值档的 token 源（本机安装的桌面端 SDK）；未接线时为 undefined。 */
+	realDevice;
+	/**
+	* CN 网关 base（issue #220）。空 = 用内置常量，即 #220 之前的行为逐字节不变。
+	*
+	* 只影响 CN 区域：国际版仍然跟随凭据自己的域（`workbuddy.ai` /
+	* `codebuddy.ai`），因为国际 token 跨品牌互不通用，那里没有"换一个同构主机"
+	* 这回事。返回值必须已由 `resolveCnGateway` 的允许清单校验过，这个类不重新校验。
+	*/
+	cnBaseOf;
+	constructor(onFallback, identity = {}, options = {}) {
 		this.onFallback = onFallback;
-		this.identity = identity;
+		this.cnBaseOf = options.cnBase === void 0 ? () => "" : options.cnBase;
+		this.baseIdentity = resolveWireIdentity(identity);
+		this.deviceProfiles = options.deviceProfiles;
+		this.realDevice = options.realDevice;
+		const file = options.deviceTokenFile === void 0 ? "" : options.deviceTokenFile.trim();
+		this.deviceTokens = file === "" ? void 0 : createDeviceTokenReader({
+			file,
+			...options.deviceTokenTtlMs === void 0 ? {} : { ttlMs: options.deviceTokenTtlMs },
+			warn: (message) => this.onFallback?.(message)
+		});
+	}
+	/**
+	* 本次请求的完整身份：底座（盐）+ 当前有效的真 token + 这个账号的覆盖值。
+	*
+	* 为什么不是"构造时算一次"：盐是本机常量，token 是分钟级过期的东西，覆盖值是
+	* 用户随时会改的设置。三者里只有盐是常量，把另外两个钉在构造期，一个跑了几小时
+	* 的进程会一直发过期 token、也永远看不到刚保存的覆盖值。
+	*/
+	async wireIdentity(credential) {
+		const base = await this.baseIdentity;
+		if (profileOf(base) !== "balanced") return base;
+		if ((this.deviceProfiles === void 0 ? "virtual" : await this.deviceProfiles.mode()) === "real") {
+			const real = this.realDevice === void 0 ? void 0 : await this.realDevice.current();
+			if (real !== void 0) return {
+				...base,
+				deviceTier: "real",
+				deviceReal: real
+			};
+			/**
+			* 取不到真实 token。两条路，由用户在卡片上选（作者意见 #2）。
+			*
+			* **不退回（默认关时会走到这里，也是 P3 原来的行为）**：一个设备头都不发。
+			* 那是"SDK 不可用"时唯一不会说谎的答案——拿虚拟值顶上而界面写着「真实值」
+			* 会让线上与界面对不上。
+			*
+			* **退回**（默认开）：落到下面的虚拟值通道，但**档位降成 `virtual`**，不是
+			* 保留 `real` 再补一对派生 id。这一点是刻意的：`deviceTier` 既决定发哪些头，
+			* 也决定界面与 `doctor` 怎么称呼"现在发的是什么"。保留 `real` 会让报告与
+			* 出站字节相反，而报告正是用户用来判断"到底退没退"的唯一依据。
+			*
+			* 退回的那个瞬间不会静默：`readout()` 里 token 状态是 `unavailable` 并带
+			* 原因，卡片与 `doctor` 都照实显示"现在发的是虚拟值，因为 SDK 取不到 token"。
+			*/
+			if (this.deviceProfiles === void 0 || !await this.deviceProfiles.fallbackToVirtual()) return {
+				...base,
+				deviceTier: "real"
+			};
+			const fallbackToken = this.deviceTokens === void 0 ? void 0 : await this.deviceTokens.current();
+			return {
+				...base,
+				deviceTier: "virtual",
+				...fallbackToken === void 0 ? {} : { deviceToken: fallbackToken }
+			};
+		}
+		const token = this.deviceTokens === void 0 ? void 0 : await this.deviceTokens.current();
+		const profile = this.deviceProfiles === void 0 ? void 0 : await this.deviceProfiles.forUid(credential.uid);
+		return {
+			...base,
+			...token === void 0 ? {} : { deviceToken: token },
+			...profile === void 0 ? {} : { deviceProfile: profile }
+		};
 	}
 	/** POST the chat endpoint; a successful answer is the raw SSE response. */
 	async chatStream(credential, bodyJson, signal) {
 		let response;
 		try {
-			response = await fetch(`${chatBase(credential)}/v2/chat/completions`, {
+			const headers = {
+				...chatHeaders(credential, await this.wireIdentity(credential)),
+				"Authorization": `Bearer ${credential.accessToken}`
+			};
+			if (signal?.aborted === true) return {
+				ok: false,
+				status: 0,
+				kind: "server",
+				message: "cancelled before send"
+			};
+			response = await fetch(`${chatBase(credential, this.cnBaseOf())}/v2/chat/completions`, {
 				method: "POST",
-				headers: {
-					...chatHeaders(credential, this.identity),
-					"Authorization": `Bearer ${credential.accessToken}`
-				},
+				headers,
 				body: bodyJson,
 				...signal === void 0 ? {} : { signal }
 			});
@@ -4856,20 +6333,33 @@ var WorkBuddyUpstreamClient = class {
 	* model on the same clock as a dead endpoint, and the whole point of the
 	* period is to answer "did the upstream answer at all". A probe asks for a
 	* single token, so the body that follows is one SSE line.
+	*
+	* It likewise does not cover building the headers. That step became slow in P3
+	* (the device-token path is a subprocess with a 20 s budget), and starting the
+	* clock first made a healthy gateway answer `status 0` on a cold start — which
+	* the pool reads as "unreachable" and acts on by benching the account. Hence
+	* the deliberate order below: resolve identity, THEN arm the timer.
 	*/
 	async probeChat(credential, bodyJson, signal) {
+		const headers = {
+			...chatHeaders(credential, await this.wireIdentity(credential)),
+			"Authorization": `Bearer ${credential.accessToken}`
+		};
+		if (signal?.aborted === true) return {
+			ok: false,
+			status: 0,
+			retryAfter: null,
+			body: "cancelled before send"
+		};
 		let response;
 		const ceiling = new AbortController();
 		const timer = setTimeout(() => {
 			ceiling.abort(/* @__PURE__ */ new Error(`no response within ${PROBE_TIMEOUT_MS}ms`));
 		}, PROBE_TIMEOUT_MS);
 		try {
-			response = await fetch(`${chatBase(credential)}/v2/chat/completions`, {
+			response = await fetch(`${chatBase(credential, this.cnBaseOf())}/v2/chat/completions`, {
 				method: "POST",
-				headers: {
-					...chatHeaders(credential, this.identity),
-					"Authorization": `Bearer ${credential.accessToken}`
-				},
+				headers,
 				body: bodyJson,
 				signal: signal === void 0 ? ceiling.signal : AbortSignal.any([signal, ceiling.signal])
 			});
@@ -4900,7 +6390,7 @@ var WorkBuddyUpstreamClient = class {
 	}
 	/** POST the token-refresh endpoint; the caller merges the outcome. */
 	async refreshToken(credential) {
-		const response = await fetch(`${chatBase(credential)}/v2/plugin/auth/token/refresh`, {
+		const response = await fetch(`${chatBase(credential, this.cnBaseOf())}/v2/plugin/auth/token/refresh`, {
 			method: "POST",
 			headers: refreshHeaders(credential),
 			signal: AbortSignal.timeout(JSON_TIMEOUT_MS)
@@ -4947,26 +6437,62 @@ var WorkBuddyUpstreamClient = class {
 	async fetchModels(credential, signal, keepModelIds = []) {
 		const timeout = signal ?? AbortSignal.timeout(JSON_TIMEOUT_MS);
 		if (regionOf(credential.domain) === "global") {
-			const response = await fetch(`${globalBase(credential.domain)}${GLOBAL_CONFIG_PATH}`, {
-				headers: {
-					"Authorization": `Bearer ${credential.accessToken}`,
-					"Accept": "application/json",
-					...credential.uid === "" ? {} : { "X-User-Id": credential.uid },
-					...credential.domain === "" ? {} : { "X-Domain": credential.domain },
-					"X-Product": "SaaS",
-					"X-Requested-With": "XMLHttpRequest",
-					"Connection": "close",
-					"User-Agent": PRODUCT_UA
-				},
-				signal: timeout
-			});
-			const envelope = await readEnvelope(response);
-			if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope);
-			const data = typeof envelope.data === "object" && envelope.data !== null ? envelope.data : {};
-			return withPromos(selectCliModels(data["models"], data["agents"], keepModelIds), data);
+			/**
+			* Read the global product configuration ONCE per client channel, then
+			* merge. Both reads are the same endpoint and differ ONLY in
+			* `User-Agent`, which is the header that selects the channel; both are
+			* read-only GETs that spend no credits.
+			*
+			* Neither document is a superset of the other (see
+			* {@link mergeModelRosters}), so reading one of them is what left the
+			* CLI's own free `deepseek-v4.1-flash` row invisible while it was
+			* perfectly usable through this plugin's chat path.
+			*/
+			const readChannel = async (userAgent) => {
+				const response = await fetch(`${globalBase(credential.domain)}${GLOBAL_CONFIG_PATH}`, {
+					headers: {
+						"Authorization": `Bearer ${credential.accessToken}`,
+						"Accept": "application/json",
+						...credential.uid === "" ? {} : { "X-User-Id": credential.uid },
+						...credential.domain === "" ? {} : { "X-Domain": credential.domain },
+						"X-Product": "SaaS",
+						"X-Requested-With": "XMLHttpRequest",
+						"Connection": "close",
+						"User-Agent": userAgent
+					},
+					signal: timeout
+				});
+				const envelope = await readEnvelope(response);
+				if (!response.ok || envelope.code !== 0) throw envelopeError(response.status, envelope);
+				const data = typeof envelope.data === "object" && envelope.data !== null ? envelope.data : {};
+				return withPromos(selectCliModels(data["models"], data["agents"], keepModelIds), data);
+			};
+			/**
+			* Fail-soft in ONE direction only. If the CLI read fails the app document
+			* alone is still a usable roster, so fall back to it rather than
+			* disarming the provider. If the APP read fails the CLI roster is already
+			* a complete answer and is returned as-is — reported through
+			* `onFallback` rather than swallowed, because the desktop-only rows then
+			* disappear from the picker and that is worth a log line.
+			*/
+			let cliRoster;
+			try {
+				cliRoster = await readChannel(CATALOG_CLI_UA);
+			} catch (error) {
+				this.onFallback?.(`global CLI catalog ${GLOBAL_CONFIG_PATH} failed; using the app document only: ` + (error instanceof Error ? error.message : String(error)));
+				return await readChannel(APP_CHANNEL_UA);
+			}
+			let appRoster;
+			try {
+				appRoster = await readChannel(APP_CHANNEL_UA);
+			} catch (error) {
+				this.onFallback?.(`global app catalog ${GLOBAL_CONFIG_PATH} failed; using the CLI document only: ` + (error instanceof Error ? error.message : String(error)));
+				return cliRoster;
+			}
+			return mergeModelRosters(cliRoster, appRoster);
 		}
 		const readCatalog = async (path) => {
-			const response = await fetch(`${chatBase(credential)}${path}`, {
+			const response = await fetch(`${chatBase(credential, this.cnBaseOf())}${path}`, {
 				headers: {
 					"Authorization": `Bearer ${credential.accessToken}`,
 					"Accept": "application/json",
@@ -5002,10 +6528,10 @@ var WorkBuddyUpstreamClient = class {
 	async fetchModelBusy(credential, modelIds, signal) {
 		const levels = /* @__PURE__ */ new Map();
 		for (const batch of batchModelIds(modelIds)) {
-			const response = await fetch(`${chatBase(credential)}${MODEL_BUSY_PATH}`, {
+			const response = await fetch(`${chatBase(credential, this.cnBaseOf())}${MODEL_BUSY_PATH}`, {
 				method: "POST",
 				headers: {
-					...commonHeaders(credential),
+					...legacyCommonHeaders(credential),
 					"Authorization": `Bearer ${credential.accessToken}`,
 					"Content-Type": "application/json"
 				},
@@ -5043,14 +6569,26 @@ var WorkBuddyUpstreamClient = class {
 	* `/v3`，聊天目录会降级而这里不能变成一个原始异常。
 	*/
 	async fetchMediaModels(credential, signal) {
+		/**
+		* The media roster is read from the APP document, so it must use that
+		* document's own channel per region.
+		*
+		* This was a single constant, and the global read silently lost
+		* `hy-image-3.5` as a result: on the global gateway {@link PRODUCT_UA}
+		* answers the 39-model third document, which carries `kling-video-v3` but
+		* NOT the image model — so the image tool reported "this gateway publishes
+		* no image model" for an account whose app offers one. CN keeps
+		* {@link PRODUCT_UA} untouched; there it is the correct app channel.
+		*/
+		const mediaChannelUA = regionOf(credential.domain) === "global" ? APP_CHANNEL_UA : PRODUCT_UA;
 		const readMedia = async (path) => {
-			const response = await fetch(`${chatBase(credential)}${path}`, {
+			const response = await fetch(`${chatBase(credential, this.cnBaseOf())}${path}`, {
 				headers: {
 					"Authorization": `Bearer ${credential.accessToken}`,
 					"Accept": "application/json",
 					"Origin": originReferer(credential),
 					"Referer": `${originReferer(credential)}/`,
-					"User-Agent": PRODUCT_UA
+					"User-Agent": mediaChannelUA
 				},
 				signal: signal ?? AbortSignal.timeout(JSON_TIMEOUT_MS)
 			});
@@ -5079,9 +6617,9 @@ var WorkBuddyUpstreamClient = class {
 	* HTTP 200 但信封 `code !== 0` 由 {@link parseImageResponse} 处理。
 	*/
 	async generateImage(credential, request, signal) {
-		const response = await fetch(`${chatBase(credential)}${IMAGE_GENERATIONS_PATH}`, {
+		const response = await fetch(`${chatBase(credential, this.cnBaseOf())}${IMAGE_GENERATIONS_PATH}`, {
 			method: "POST",
-			headers: imageHeaders(credential, this.identity),
+			headers: imageHeaders(credential, await this.wireIdentity(credential)),
 			body: JSON.stringify(buildImageBody(request)),
 			signal: signal ?? AbortSignal.timeout(IMAGE_TIMEOUT_MS)
 		});
@@ -5108,9 +6646,9 @@ var WorkBuddyUpstreamClient = class {
 	*/
 	async editImage(credential, request, signal) {
 		if (request.image.length === 0) throw new WorkBuddyImageError("workbuddy image: 改图请求缺少输入图（image 数组为空）。", "INVALID_ARGS");
-		const response = await fetch(`${chatBase(credential)}${IMAGE_EDITS_PATH}`, {
+		const response = await fetch(`${chatBase(credential, this.cnBaseOf())}${IMAGE_EDITS_PATH}`, {
 			method: "POST",
-			headers: imageHeaders(credential),
+			headers: imageHeaders(credential, await this.wireIdentity(credential)),
 			body: JSON.stringify(buildEditBody(request)),
 			signal: signal ?? AbortSignal.timeout(IMAGE_TIMEOUT_MS)
 		});
@@ -5149,9 +6687,9 @@ var WorkBuddyUpstreamClient = class {
 			aspectRatio: request.aspectRatio,
 			enableAudio: request.enableAudio
 		}, isImageToVideo);
-		const response = await fetch(`${chatBase(credential)}${VIDEO_GENERATIONS_PATH}`, {
+		const response = await fetch(`${chatBase(credential, this.cnBaseOf())}${VIDEO_GENERATIONS_PATH}`, {
 			method: "POST",
-			headers: imageHeaders(credential, this.identity),
+			headers: imageHeaders(credential, await this.wireIdentity(credential)),
 			body: JSON.stringify(body),
 			signal: signal ?? AbortSignal.timeout(VIDEO_TIMEOUT_MS)
 		});
@@ -5185,9 +6723,9 @@ var WorkBuddyUpstreamClient = class {
 			if (Date.now() - startedAt > VIDEO_POLL_TIMEOUT_MS) throw new WorkBuddyVideoError(`workbuddy video: 轮询超过 ${VIDEO_POLL_TIMEOUT_MS / 1e3} 秒仍未完成（task ${taskId}）。`, "POLL_TIMEOUT");
 			let payload;
 			try {
-				const response = await fetch(`${chatBase(credential)}${VIDEO_TASKS_PATH}`, {
+				const response = await fetch(`${chatBase(credential, this.cnBaseOf())}${VIDEO_TASKS_PATH}`, {
 					method: "POST",
-					headers: imageHeaders(credential, this.identity),
+					headers: imageHeaders(credential, await this.wireIdentity(credential)),
 					body: JSON.stringify({ task_id: taskId }),
 					signal: combined
 				});
@@ -5210,7 +6748,7 @@ var WorkBuddyUpstreamClient = class {
 					...result.credit !== void 0 ? { credit: result.credit } : {}
 				};
 			}
-			if (result.status === "failed") throw new WorkBuddyVideoError(`workbuddy video: 生视频任务失败（task ${taskId}）。`, "TASK_FAILED");
+			if (result.status === "failed") throw new WorkBuddyVideoError(`workbuddy video: 生视频任务失败（task ${taskId}）。` + (result.detail === void 0 ? "上游没有给出任何原因字段。" : ` 上游返回的额外字段：${result.detail}`), "TASK_FAILED");
 			await new Promise((resolve, reject) => {
 				const timer = setTimeout(resolve, VIDEO_POLL_INTERVAL_MS);
 				const onAbort = () => {
@@ -5238,13 +6776,14 @@ var WorkBuddyUpstreamClient = class {
 		const safeUrl = url.replace(/[^A-Za-z0-9._-]+/g, "_").slice(-32);
 		const path = join(dir, `video-${stamp}-${safeUrl}.mp4`);
 		await writeFile(path, buffer);
+		pruneTempDir(dir, 20, [".mp4"]);
 		return path;
 	}
 	/** Query today's check-in status without changing account state. */
 	async fetchCheckinStatus(credential) {
-		const response = await fetch(`${billingBase(credential)}/v2/billing/meter/checkin-activity-status`, {
+		const response = await fetch(`${billingBase(credential, this.cnBaseOf())}/v2/billing/meter/checkin-activity-status`, {
 			method: "POST",
-			headers: billingHeaders(credential),
+			headers: billingHeaders(credential, await this.wireIdentity(credential)),
 			body: "{}",
 			signal: AbortSignal.timeout(JSON_TIMEOUT_MS)
 		});
@@ -5295,9 +6834,9 @@ var WorkBuddyUpstreamClient = class {
 	}
 	/** One benefit status endpoint. Throws on anything that is not a clean `code: 0`. */
 	async readBenefitStatus(kind, credential, path) {
-		const response = await fetch(`${billingBase(credential)}${path}`, {
+		const response = await fetch(`${billingBase(credential, this.cnBaseOf())}${path}`, {
 			method: "POST",
-			headers: billingHeaders(credential),
+			headers: billingHeaders(credential, await this.wireIdentity(credential)),
 			body: "{}",
 			signal: AbortSignal.timeout(JSON_TIMEOUT_MS)
 		});
@@ -5340,9 +6879,9 @@ var WorkBuddyUpstreamClient = class {
 	* that silently did nothing still cannot leave the card saying 待领取.
 	*/
 	async claimBenefit(credential, kind) {
-		const response = await fetch(`${billingBase(credential)}${BENEFIT_CLAIM_PATHS[kind]}`, {
+		const response = await fetch(`${billingBase(credential, this.cnBaseOf())}${BENEFIT_CLAIM_PATHS[kind]}`, {
 			method: "POST",
-			headers: billingHeaders(credential),
+			headers: billingHeaders(credential, await this.wireIdentity(credential)),
 			body: "{}",
 			signal: AbortSignal.timeout(JSON_TIMEOUT_MS)
 		});
@@ -5351,9 +6890,9 @@ var WorkBuddyUpstreamClient = class {
 	}
 	/** Claim today's check-in reward. The browser route guards this mutation. */
 	async claimDailyCheckin(credential) {
-		const response = await fetch(`${billingBase(credential)}/v2/billing/meter/daily-checkin`, {
+		const response = await fetch(`${billingBase(credential, this.cnBaseOf())}/v2/billing/meter/daily-checkin`, {
 			method: "POST",
-			headers: billingHeaders(credential),
+			headers: billingHeaders(credential, await this.wireIdentity(credential)),
 			body: "{}",
 			signal: AbortSignal.timeout(JSON_TIMEOUT_MS)
 		});
@@ -5388,9 +6927,9 @@ var WorkBuddyUpstreamClient = class {
 	*          reporting zero).
 	*/
 	async fetchEnterpriseCredits(credential) {
-		const response = await fetch(`${billingBase(credential)}/billing/meter/get-enterprise-user-usage`, {
+		const response = await fetch(`${billingBase(credential, this.cnBaseOf())}/billing/meter/get-enterprise-user-usage`, {
 			method: "POST",
-			headers: billingHeaders(credential),
+			headers: billingHeaders(credential, await this.wireIdentity(credential)),
 			body: JSON.stringify({}),
 			signal: AbortSignal.timeout(JSON_TIMEOUT_MS)
 		});
@@ -5437,9 +6976,9 @@ var WorkBuddyUpstreamClient = class {
 			date.getMinutes().toString().padStart(2, "0"),
 			date.getSeconds().toString().padStart(2, "0")
 		].join(":");
-		const response = await fetch(`${billingBase(credential)}/v2/billing/meter/get-user-resource`, {
+		const response = await fetch(`${billingBase(credential, this.cnBaseOf())}/v2/billing/meter/get-user-resource`, {
 			method: "POST",
-			headers: billingHeaders(credential),
+			headers: billingHeaders(credential, await this.wireIdentity(credential)),
 			body: JSON.stringify({
 				PageNumber: 1,
 				PageSize: 100,
@@ -5624,8 +7163,38 @@ function mergeCredentialDisplayNames(previous, next) {
 const WORKBUDDY_AUTH_FILENAME = ".workbuddy-auth.json";
 /** Env variable that overrides the desktop auth-file location. */
 const WORKBUDDY_AUTH_FILE_ENV = "WORKBUDDY_AUTH_FILE";
-/** Basename of the live WorkBuddy desktop auth file. */
-const WORKBUDDY_LIVE_FILENAME = "workbuddy-desktop.info";
+/**
+* Basenames the live WorkBuddy desktop auth file is known to use.
+*
+* ISSUE #174: the constant used to be ONE name, `workbuddy-desktop.info`, and
+* the 5.7.x Windows app writes `workbuddy-desktop-ai.info` instead — the same
+* directory, the same payload, a different filename (measured by the reporter:
+* `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\` held
+* `workbuddy-desktop-ai.info` plus timestamped backups of that same name, and no
+* file carrying the constant's name at all). The consequences were both silent:
+* the "live file always wins" rule in {@link fileRank} never matched, so
+* ordering fell back to `lastRefreshAtMs` (correct by luck, not by rule), and
+* `doctor` reported `desktopAuthFile.present: false` with a hint to set
+* `WORKBUDDY_AUTH_FILE` — on a machine whose credential had just been read
+* successfully from the default directory.
+*
+* Ordered, not a set: {@link WORKBUDDY_LIVE_FILENAME} stays the one this build
+* treats as canonical for writing, and the alternatives are probed after it. The
+* FIRST entry is what {@link defaultDesktopAuthCandidates} reports as the
+* expected path, so keep it there.
+*/
+const WORKBUDDY_LIVE_FILENAMES = ["workbuddy-desktop.info", "workbuddy-desktop-ai.info"];
+WORKBUDDY_LIVE_FILENAMES[0];
+/**
+* Whether one basename is a LIVE desktop auth file (any of the known names).
+*
+* Every place that asked "is this the live file?" now asks this, so a new
+* spelling is added in one list instead of being chased through the reader, the
+* ranker and `doctor` separately — which is exactly how the three drifted apart.
+*/
+function isLiveDesktopAuthFileName(name) {
+	return WORKBUDDY_LIVE_FILENAMES.includes(name);
+}
 /** Prefix of the plugin-owned per-region credential copies (legacy, read-only). */
 const WORKBUDDY_OWN_PREFIX = ".workbuddy-auth";
 /**
@@ -5842,12 +7411,24 @@ function isVaultCredentialFileName(name) {
 /** Current on-disk format of the vault; readers reject others. */
 const VAULT_FORMAT_VERSION = 1;
 /**
+* 鸿蒙上用户可见的家目录。
+*
+* `os.homedir()` 在鸿蒙上返回的是**应用沙箱**
+* (`/data/storage/el2/base/haps/entry/files`)，不是用户目录，所以不能像
+* linux 那样由 `home` 派生。真实凭据落在 `/storage/Users/currentUser` 下，
+* 这个挂载点由系统规定，不随应用变化。
+*/
+const OPENHARMONY_USER_HOME = "/storage/Users/currentUser";
+/**
 * Platform-default directories holding the WorkBuddy desktop app's auth file.
 *
 * Windows and Linux prefer the OS-issued env location and fall back to the
 * home-derived convention when it is unset, so a redirected profile (OneDrive
 * folder backup, enterprise policy) still resolves. macOS has no equivalent
 * env variable; the single Application Support path is used as-is.
+*
+* 鸿蒙（issue #190）没有 `homedir()` 可用——它返回应用沙箱，所以那条分支用
+* 系统固定挂载点。Linux 会同时看 XDG 的 data 与 config 两套目录。
 *
 * `platform`, `home`, and `env` are injectable so the platform branches are
 * testable on any host without touching a real machine.
@@ -5859,9 +7440,41 @@ function defaultDesktopAuthDirs(platform = process.platform, home = homedir(), e
 		const roaming = nonEmptyEnv(env["APPDATA"]) ?? join(home, "AppData", "Roaming");
 		return [join(local, "CodeBuddyExtension", "Data", "Public", "auth"), join(roaming, "CodeBuddyExtension", "Data", "Public", "auth")];
 	}
+	/**
+	* 鸿蒙（issue #190）。
+	*
+	* 走 XDG 的 `~/.local/share` 形状，但 `~` **不能**用 `homedir()`——那是
+	* 沙箱路径。用系统固定挂载点，并允许 `WORKBUDDY_USER_HOME` 覆盖（未来的
+	* 多用户或不同发行版挂法）。
+	*
+	* 没有这个分支时落到 `return []`，卡片连一个候选路径都扫不到，账号池恒为 0，
+	* 而 `doctor` 只会说"no platform default; set WORKBUDDY_AUTH_FILE"——
+	* 把一个本该自动完成的事推给用户。
+	*/
+	if (platform === "openharmony") {
+		const root = nonEmptyEnv(env["WORKBUDDY_USER_HOME"]) ?? OPENHARMONY_USER_HOME;
+		return [posix.join(root, ".local", "share", "CodeBuddyExtension", "Data", "Public", "auth")];
+	}
 	if (platform === "linux") {
+		/**
+		* Linux 同时看 XDG 的**两套**目录（issue #190 附带发现）。
+		*
+		* `Data/Public/auth` 是**数据**，按 XDG 惯例该在 `$XDG_DATA_HOME`
+		* （缺省 `~/.local/share`）下；而这里原先只读 `$XDG_CONFIG_HOME`
+		* （缺省 `~/.config`）。issue #190 的报告机器与鸿蒙实测都指向
+		* `.local/share`，所以两套都给。
+		*
+		* ⚠️ **`.config` 仍然排在前面**，也就是探测顺序与改动前完全一致。
+		* 理由：README §平台支持写明"其余候选仍未经真机逐项验证"，Linux 从来没有
+		* 真机证据；把 data 提到前面会改变"没设 WORKBUDDY_AUTH_FILE 时用哪一个"
+		* 这个已经上线的行为，而换来的收益尚无证据。这里只做**加法**：多一个候选，
+		* 不动已有的顺序，老用户的行为一个字节都不变。
+		*
+		* 两个目录都不存在时与以前一致：扫不到，回落 `WORKBUDDY_AUTH_FILE`。
+		*/
 		const config = nonEmptyEnv(env["XDG_CONFIG_HOME"]) ?? join(home, ".config");
-		return [join(config, "CodeBuddyExtension", "Data", "Public", "auth")];
+		const data = nonEmptyEnv(env["XDG_DATA_HOME"]) ?? join(home, ".local", "share");
+		return [join(config, "CodeBuddyExtension", "Data", "Public", "auth"), join(data, "CodeBuddyExtension", "Data", "Public", "auth")];
 	}
 	return [];
 }
@@ -5869,9 +7482,17 @@ function defaultDesktopAuthDirs(platform = process.platform, home = homedir(), e
 function nonEmptyEnv(value) {
 	return typeof value === "string" && value.trim() !== "" ? value.trim() : void 0;
 }
-/** The live auth file's platform candidates, in probe order. */
+/**
+* The live auth file's platform candidates, in probe order.
+*
+* Every known basename for every platform directory: a machine can hold the old
+* and the new spelling side by side during an app upgrade, and probing only the
+* canonical one is the defect issue #174 reports.
+*/
 function defaultDesktopAuthCandidates() {
-	return defaultDesktopAuthDirs().map((dir) => join(dir, WORKBUDDY_LIVE_FILENAME));
+	const candidates = [];
+	for (const dir of defaultDesktopAuthDirs()) for (const name of WORKBUDDY_LIVE_FILENAMES) candidates.push(join(dir, name));
+	return candidates;
 }
 /** First platform-default candidate; see {@link defaultDesktopAuthCandidates}. */
 function defaultDesktopAuthPath() {
@@ -6019,7 +7640,7 @@ function hasEncryptedCredentialFields(text) {
 * backups, never the primary ordering.
 */
 function fileRank(path) {
-	return authFileName(path) === WORKBUDDY_LIVE_FILENAME ? 0 : 1;
+	return isLiveDesktopAuthFileName(authFileName(path)) ? 0 : 1;
 }
 /**
 * Whether `candidate` is a better pick than `incumbent` for the same account.
@@ -6176,15 +7797,65 @@ async function readVaultEntries(dir) {
 	}
 	return entries;
 }
-/** Write one vault entry atomically under the file lock. */
+/**
+* Write one vault entry atomically under the file lock.
+*
+* The directory is hardened BEFORE the file is created (issue #183). Order
+* matters: `writeFileAtomic` commits by creating a temp inode and renaming it
+* over the target, so an ACL applied to the file afterwards would leave the
+* pre-rename window open, and a crash between the two would leave a plaintext
+* token in a file nobody hardened. Hardening the directory first means the
+* replacement inode inherits the restricted ACEs at creation.
+*
+* The hardening is best-effort on purpose: it is defence in depth, and refusing
+* to persist a credential because an ACL call failed would turn it into an
+* outage. `doctor` reports the outcome so a machine where it failed is visible.
+* On POSIX this call is a no-op, and `mode` below carries the same intent.
+*
+* WHICH directory gets hardened is decided by {@link vaultRootToHarden}, not by
+* a bare `dirname(dir)` — see the issue #208 note there.
+*/
 async function writeVaultEntry(dir, accountId, credential, refreshedFrom) {
 	const path = join(dir, `${accountId}.json`);
+	await protectCredentialDirectory(vaultRootToHarden(dir));
 	await withFileLock(path, async () => {
 		await writeFileAtomic(path, `${JSON.stringify(vaultDocument(credential, accountId, refreshedFrom), null, 2)}\n`, {
 			mode: 384,
 			dirMode: 448
 		});
 	});
+}
+/**
+* The directory {@link writeVaultEntry} hardens: the vault ROOT, not this
+* entry's own directory (issue #183), and never the Harness home (issue #208).
+*
+* WHY THE ROOT. `Everyone: FullControl` is inherited from `~/.dsh` onto
+* `…/workbuddy-vault`; hardening only `<vault>/<region>` would leave the root
+* writable, so any local process could replace the region directory itself and
+* defeat the restriction inside it. Hardening the root propagates down the
+* whole tree in one `icacls` call (measured on a real host: one call on the
+* root left the root, both region directories AND the files inside with exactly
+* the three intended ACEs).
+*
+* WHY NOT ALWAYS `dirname(dir)` — THE ISSUE #208 DEFECT. That shape assumes
+* `dir` is `<vault>/<region>`. It is not for the UNREGIONED store, whose vault
+* directory IS `<DSH home>/workbuddy-vault`; `dirname` then yields `<DSH home>`
+* itself, and `/inheritance:r` there strips the ACEs every other directory
+* under the home inherits. A reporter hit exactly that: `<DSH home>/attachments`
+* became unreadable (EPERM on `scandir`) and every image send failed with the
+* host's unrelated `prompt rejected (session/agent-busy)`. `doctor` reaches
+* this path because it builds an unregioned store.
+*
+* So the parent is used only when it is genuinely a vault root — i.e. NOT the
+* Harness home. When `dir` already IS the vault root, `dir` is the right
+* target. `src/windows-acl.ts` independently refuses the home and its
+* ancestors, which covers an injected `vaultDir` and any future call site that
+* computes this one level too high; this function is what keeps the CORRECT
+* call from relying on that backstop.
+*/
+function vaultRootToHarden(dir) {
+	const parent = dirname(dir);
+	return resolve(parent) === resolve(resolveDshHome()) ? dir : parent;
 }
 /**
 * Probe one auth file, reporting WHY it yielded no credential.
@@ -6408,7 +8079,7 @@ var WorkBuddyCredentialStore = class {
 		const fromEnv = process.env[WORKBUDDY_AUTH_FILE_ENV];
 		const explicit = this.desktopPathOverride ?? (fromEnv !== void 0 && fromEnv.trim() !== "" ? fromEnv : void 0);
 		if (explicit !== void 0) return [explicit];
-		return defaultDesktopAuthCandidates();
+		return (this.authDirs ?? defaultDesktopAuthDirs()).flatMap((dir) => WORKBUDDY_LIVE_FILENAMES.map((name) => join(dir, name)));
 	}
 	/** The resolved desktop auth-file path, for diagnostics. */
 	desktopAuthPath() {
@@ -6435,10 +8106,20 @@ var WorkBuddyCredentialStore = class {
 			return files;
 		}
 		const dirs = this.authDirs ?? defaultDesktopAuthDirs();
+		const seen = /* @__PURE__ */ new Set();
 		for (const dir of dirs) {
-			const live = join(dir, WORKBUDDY_LIVE_FILENAME);
-			files.push(live);
-			for (const backup of await this.backupsBeside(live)) files.push(backup);
+			for (const name of WORKBUDDY_LIVE_FILENAMES) {
+				const live = join(dir, name);
+				if (!seen.has(live)) {
+					seen.add(live);
+					files.push(live);
+				}
+			}
+			for (const name of WORKBUDDY_LIVE_FILENAMES) for (const backup of await this.backupsBeside(join(dir, name))) {
+				if (seen.has(backup)) continue;
+				seen.add(backup);
+				files.push(backup);
+			}
 		}
 		return files;
 	}
@@ -6644,6 +8325,34 @@ var WorkBuddyCredentialStore = class {
 		const credentials = await this.readAll();
 		if (credentials.length === 0) return false;
 		return !credentials.some((credential) => workbuddyAccountId(credential) === this.accountId);
+	}
+	/**
+	* Why the vault could not be read, when it could not (issue #199).
+	*
+	* `syncVault` deliberately swallows a failed `readVaultEntries` so account
+	* discovery stays up — the right call for availability, the wrong call for
+	* honesty: the user then sees the SAVED account reported as "no longer on
+	* this machine" when the truth is "this process may not read the directory".
+	* The issue #199 lockout (foreign owner + `/inheritance:r`) produces exactly
+	* that shape: readdir EPERM while per-path readFile still works, so nothing
+	* else in the diagnostics reports the directory either.
+	*
+	* A dedicated readdir probe rather than a field recorded during the scan:
+	* the scan is shared/cached (`scanInflight`), its failure is transient by
+	* design, and a probe here is one cheap readdir on a path that is already
+	* failing — the error string is the fact the card needs.
+	*
+	* Returns the raw error message, or `undefined` when the directory reads
+	* (including the absent case, which is normal before the first OAuth add).
+	*/
+	async vaultReadError() {
+		try {
+			await readdir(this.vaultDir());
+			return;
+		} catch (error) {
+			if (isENOENT(error)) return void 0;
+			return error instanceof Error ? error.message : String(error);
+		}
 	}
 	/** The freshest stored credential for the current selection, no refresh. */
 	async current() {
@@ -6946,8 +8655,33 @@ var WorkBuddyCredentialStore = class {
 	*/
 	async diagnose() {
 		const candidates = [];
-		for (const path of await this.candidateFiles()) {
-			const probe = await probeAuthFile(path, this.resolveAtRestKey);
+		const desktopTried = this.resolveDesktopCandidates();
+		const probed = [];
+		for (const path of await this.candidateFiles()) probed.push({
+			path,
+			probe: await probeAuthFile(path, this.resolveAtRestKey)
+		});
+		/**
+		* Directories that need no `missing` complaint (issue #174).
+		*
+		* A directory is "accounted for" when it either yielded a readable
+		* credential OR produced some other, more specific complaint. The first case
+		* is the healthy machine whose app writes only one of the two known
+		* spellings; the second is a machine holding a broken file — and telling
+		* that user "no auth file at the expected path" would be both false and
+		* less useful than the `invalid` line they already have.
+		*/
+		const accountedDirs = /* @__PURE__ */ new Set();
+		for (const entry of probed) {
+			if ("credential" in entry.probe) {
+				accountedDirs.add(dirname(entry.path));
+				continue;
+			}
+			if (entry.probe.failure.reason !== "missing") accountedDirs.add(dirname(entry.path));
+		}
+		/** Directories whose `missing` complaint has already been made. */
+		const missingReported = /* @__PURE__ */ new Set();
+		for (const { path, probe } of probed) {
 			if ("credential" in probe) {
 				if (!this.matchesRegion(probe.credential.domain)) candidates.push({
 					path,
@@ -6956,6 +8690,11 @@ var WorkBuddyCredentialStore = class {
 					message: `holds a ${regionOf(probe.credential.domain)} sign-in, but this tab reads the ${this.region} region`
 				});
 				continue;
+			}
+			if (probe.failure.reason === "missing") {
+				const dir = dirname(path);
+				if (accountedDirs.has(dir) || missingReported.has(dir)) continue;
+				missingReported.add(dir);
 			}
 			candidates.push({
 				path,
@@ -7015,7 +8754,7 @@ var WorkBuddyCredentialStore = class {
 			}
 		} catch {}
 		return {
-			tried,
+			tried: [...desktopTried, ...this.ownCandidates()],
 			failures: candidates
 		};
 	}
@@ -7123,141 +8862,143 @@ const FALLBACK_WORKBUDDY_MODELS = [
 * expose different rosters — the CN list has no `gpt-*`/`gemini-*` entries —
 * so a global account must never be seeded with the CN list. Like the CN
 * fallback this is replaced by the live refresh; it only keeps the provider
-* usable before the first fetch lands. Order and rates mirror the upstream.
+* usable before the first fetch lands. Order mirrors the upstream.
+*
+* ⚠️ IT CARRIES NO `creditMultiplier`, AND THAT IS THE FIX FOR ISSUE #214.
+* This list used to hardcode one rate per model, captured on 2026-09-11. The
+* upstream moves those rates — the reporter measured `glm-5.3` at x0.69 and
+* `hy4-preview` at x0.29 on 2026-11-04 against the x0.79 / x0.00 written
+* here — so every captured rate aged into a WRONG PRICE. Worse, the overlay
+* rule (`overlayLiveCapabilities`: the live side owns `creditMultiplier`)
+* meant this table WON over the user's saved directory whenever the catalog
+* still held it, which is exactly the reported symptom: the card showed the
+* built-in table's figures, not the saved ones and not the upstream's.
+*
+* A price is a FACT ABOUT NOW, and this module never learns "now": it is the
+* offline placeholder, written once and never refreshed. So it must not
+* assert a price at all. An absent multiplier renders as "no rate" — the
+* honest answer — and `pickFreeModel` deliberately treats absence as NOT
+* free, so the account pool can never probe a paid model by mistake. The CN
+* table has always been shaped this way for the same reason.
+*
+* The ROSTER (ids, names, windows) stays: that is what keeps the provider
+* non-empty while the first fetch is in flight, and an id list ages far
+* more slowly than a price list.
 */
 const FALLBACK_WORKBUDDY_MODELS_GLOBAL = [
 	{
 		id: "fast-model",
 		name: "Fast",
 		contextWindow: 2e5,
-		maxTokens: 32e3,
-		creditMultiplier: .34
+		maxTokens: 32e3
 	},
 	{
 		id: "balanced-model",
 		name: "Balanced",
 		contextWindow: 256e3,
-		maxTokens: 32e3,
-		creditMultiplier: .59
+		maxTokens: 32e3
 	},
 	{
 		id: "primary-model",
 		name: "Primary",
 		contextWindow: 272e3,
-		maxTokens: 72e3,
-		creditMultiplier: 3.31
+		maxTokens: 72e3
 	},
 	{
 		id: "deep-model",
 		name: "Deep",
 		contextWindow: 176e3,
-		maxTokens: 24e3,
-		creditMultiplier: 3.33
+		maxTokens: 24e3
 	},
 	{
 		id: "deepseek-v4.1-flash",
 		name: "Deepseek-V4.1-Flash",
 		contextWindow: 1e6,
-		maxTokens: 128e3,
-		creditMultiplier: 0
+		maxTokens: 128e3
 	},
 	{
 		id: "gpt-6-astra",
 		name: "GPT-6-Astra",
 		contextWindow: 1e6,
-		maxTokens: 128e3,
-		creditMultiplier: 6.67
+		maxTokens: 128e3
 	},
 	{
 		id: "hy4-preview",
 		name: "Hy4 preview",
 		contextWindow: 1e6,
-		maxTokens: 64e3,
-		creditMultiplier: 0
+		maxTokens: 64e3
 	},
 	{
 		id: "hy3",
 		name: "Hy3",
 		contextWindow: 192e3,
-		maxTokens: 64e3,
-		creditMultiplier: 0
+		maxTokens: 64e3
 	},
 	{
 		id: "gpt-5.6-sol",
 		name: "GPT-5.6-Sol",
 		contextWindow: 1e6,
-		maxTokens: 128e3,
-		creditMultiplier: 3.47
+		maxTokens: 128e3
 	},
 	{
 		id: "gpt-5.6-terra",
 		name: "GPT-5.6-Terra",
 		contextWindow: 1e6,
-		maxTokens: 128e3,
-		creditMultiplier: 1.39
+		maxTokens: 128e3
 	},
 	{
 		id: "gpt-5.6-luna",
 		name: "GPT-5.6-Luna",
 		contextWindow: 1e6,
-		maxTokens: 128e3,
-		creditMultiplier: .14
+		maxTokens: 128e3
 	},
 	{
 		id: "gpt-5.5",
 		name: "GPT-5.5",
 		contextWindow: 1e6,
-		maxTokens: 128e3,
-		creditMultiplier: 3.31
+		maxTokens: 128e3
 	},
 	{
 		id: "gpt-5.4",
 		name: "GPT-5.4",
 		contextWindow: 272e3,
-		maxTokens: 72e3,
-		creditMultiplier: 1.65
+		maxTokens: 72e3
 	},
 	{
 		id: "gpt-5.3-codex",
 		name: "GPT-5.3-Codex",
 		contextWindow: 272e3,
-		maxTokens: 72e3,
-		creditMultiplier: 1.25
+		maxTokens: 72e3
 	},
 	{
 		id: "gemini-3.5-flash",
 		name: "Gemini-3.5-Flash",
 		contextWindow: 1e6,
-		maxTokens: 65536,
-		creditMultiplier: .99
+		maxTokens: 65536
 	},
 	{
 		id: "glm-5.3",
 		name: "GLM-5.3",
 		contextWindow: 1e6,
-		maxTokens: 48e3,
-		creditMultiplier: .79
+		maxTokens: 48e3
 	},
 	{
 		id: "glm-5.2",
 		name: "GLM-5.2",
 		contextWindow: 1e6,
-		maxTokens: 48e3,
-		creditMultiplier: .79
+		maxTokens: 48e3
 	},
 	{
 		id: "kimi-k3",
 		name: "Kimi-K3",
 		contextWindow: 1e6,
-		maxTokens: 32e3,
-		creditMultiplier: 1.62
+		maxTokens: 32e3
 	},
 	{
 		id: "kimi-k2.6",
 		name: "Kimi-K2.6",
 		contextWindow: 256e3,
-		maxTokens: 32e3,
-		creditMultiplier: .52
+		maxTokens: 32e3
 	}
 ];
 /**
@@ -7335,6 +9076,13 @@ function deriveCatalog(catalog, enabled, budgets = {}) {
 var WorkBuddyCatalog = class {
 	models;
 	/**
+	* Whether {@link models} came from the upstream at least once.
+	*
+	* Starts `false`: the constructor seeds the static fallback, and that list
+	* must never be mistaken for a live answer (see {@link hasLiveRoster}).
+	*/
+	live = false;
+	/**
 	* Whether this region has any local sign-in. Defaults to `true` — the
 	* permissive direction — so a scan that has not run yet (or failed) keeps
 	* serving the fallback rather than blanking a region that may be fine.
@@ -7374,6 +9122,28 @@ var WorkBuddyCatalog = class {
 	current() {
 		return this.usable && this.enabled ? this.models : [];
 	}
+	/**
+	* Whether {@link current} is an UPSTREAM answer rather than the built-in
+	* fallback it was constructed with.
+	*
+	* This distinction is what keeps issue #32 fixed. `applySelection` passes
+	* `current()` into `configuredModels` as the live roster to fall back to, so
+	* a partial saved slot demotes to the live directory instead of the static
+	* list. But before the first refresh lands, `current()` IS the static list
+	* (the constructor seeds it), and `resolveRoster` cannot tell the two apart
+	* because it only sees a non-empty array. The result was the exact bug #32
+	* describes, reached from the other direction: a settings write arriving
+	* before the first catalog refresh let the STATIC roster masquerade as live,
+	* and `set()` then committed it — so a model that only exists upstream
+	* (`space-bunny`) vanished from the picker while the runtime still served it.
+	*
+	* Callers that use `current()` as a *live* answer must check this first. A
+	* caller that only wants "what would we advertise right now" does not need
+	* to: the fallback is the honest answer to that question.
+	*/
+	hasLiveRoster() {
+		return this.live;
+	}
 	/** Whether this region currently advertises any model. */
 	isRegionUsable() {
 		return this.usable;
@@ -7412,12 +9182,883 @@ var WorkBuddyCatalog = class {
 		this.enabled = enabled;
 		return true;
 	}
-	/** Replace the list; callers invalidate their adapter snapshot after this. */
-	set(models) {
+	/**
+	* Replace the list; callers invalidate their adapter snapshot after this.
+	*
+	* `origin` says where the list came from, and it is not cosmetic: only an
+	* `upstream` answer may mark the catalog live. `applySelection` also calls
+	* this on every settings write — including before the first refresh has
+	* landed — and the list it passes then is the static fallback. Letting that
+	* count as live is what re-opened issue #32 (see {@link hasLiveRoster}).
+	*
+	* The default is `'upstream'` so every pre-existing call site keeps meaning
+	* what it meant; only the re-derivation path opts into `'derived'`.
+	*/
+	set(models, origin = "upstream") {
 		if (models.length === 0) throw new Error("workbuddy model catalog cannot be empty");
+		if (origin === "upstream") this.live = true;
 		this.models = models.map((model) => ({ ...model }));
 	}
 };
+/** 文件名，带前导点，与 `.workbuddy-device.json` 同一约定。 */
+const DEVICE_PROFILE_FILE_NAME = ".workbuddy-device-profiles.json";
+/**
+* 文件不存在、不可读、版本不认识时的答案：虚拟档、无覆盖、回退开、无手填目录。
+*
+* 回退默认**开**，所以一个 5.16.0 时代写下的文件（没有这个字段）升级后立刻拿到
+* 作者希望的默认行为，不需要用户去点一次。
+*/
+function emptyDocument() {
+	return {
+		version: 1,
+		mode: "virtual",
+		accounts: {},
+		sdkDir: "",
+		sdkFallbackToVirtual: true
+	};
+}
+/**
+* 读盘缓存：同一进程内的请求路径不该每条都去读 200 字节。
+*
+* **按路径索引**，不是一个全局槽：这个模块同时服务"真实 DSH home"与测试里
+* 那些临时目录，一个全局槽会让第二台机器（或第二个测试）读到第一份内容。
+*/
+const CACHE_MS = 5e3;
+const cache = /* @__PURE__ */ new Map();
+/** Drop the cache — every write calls this, so a save is visible immediately. */
+function invalidate() {
+	cache.clear();
+}
+/** `$DSH_HOME/.workbuddy-device-profiles.json`, or `dir` when one is pinned (tests). */
+function deviceProfilePath(dir) {
+	const base = typeof dir === "string" && dir !== "" ? dir : resolveDshHome();
+	return join(base, DEVICE_PROFILE_FILE_NAME);
+}
+/** Whether an unknown value is a mode this build understands. */
+function isDeviceMode(value) {
+	return value === "virtual" || value === "real";
+}
+/** Keep only the fields that are well-formed; a hand-edited file must not break a request. */
+function sanitizeAccount(raw) {
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return void 0;
+	const record = raw;
+	const account = {};
+	if (typeof record["uid"] === "string" && record["uid"] !== "") account.uid = record["uid"];
+	if (typeof record["machineId"] === "string" && isDeviceId(record["machineId"])) account.machineId = record["machineId"];
+	if (typeof record["sessionId"] === "string" && isDeviceId(record["sessionId"])) account.sessionId = record["sessionId"];
+	if (typeof record["updatedAt"] === "string") account.updatedAt = record["updatedAt"];
+	return account.uid === void 0 && account.machineId === void 0 && account.sessionId === void 0 ? void 0 : account;
+}
+/** Read the on-disk document, tolerating anything a hand edit can produce. */
+async function readStored(dir, nowMs = Date.now(), fresh = false) {
+	const path = deviceProfilePath(dir);
+	const hit = cache.get(path);
+	if (!fresh && hit !== void 0 && nowMs - hit.at < CACHE_MS) return hit.document;
+	const remember = (document) => {
+		cache.set(path, {
+			at: nowMs,
+			document
+		});
+		return document;
+	};
+	let text;
+	try {
+		text = await readFile(path, "utf8");
+	} catch {
+		return remember(emptyDocument());
+	}
+	let parsed;
+	try {
+		parsed = JSON.parse(text);
+	} catch {
+		return remember(emptyDocument());
+	}
+	const record = typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed : {};
+	if (record["version"] !== 1) return remember(emptyDocument());
+	const accounts = {};
+	const rawAccounts = record["accounts"];
+	if (typeof rawAccounts === "object" && rawAccounts !== null && !Array.isArray(rawAccounts)) for (const [id, value] of Object.entries(rawAccounts)) {
+		const account = sanitizeAccount(value);
+		if (account !== void 0) accounts[id] = account;
+	}
+	return remember({
+		version: 1,
+		mode: isDeviceMode(record["mode"]) ? record["mode"] : "virtual",
+		accounts,
+		sdkDir: typeof record["sdkDir"] === "string" ? record["sdkDir"].trim() : "",
+		sdkFallbackToVirtual: record["sdkFallbackToVirtual"] !== false
+	});
+}
+/** The browser-facing shape: no uids, no timestamps it cannot use. */
+function toSettings(document) {
+	const accounts = {};
+	for (const [id, account] of Object.entries(document.accounts)) {
+		const profile = {
+			...account.machineId === void 0 ? {} : { machineId: account.machineId },
+			...account.sessionId === void 0 ? {} : { sessionId: account.sessionId }
+		};
+		if (profile.machineId !== void 0 || profile.sessionId !== void 0) accounts[id] = profile;
+	}
+	return {
+		mode: document.mode,
+		accounts,
+		sdkDir: document.sdkDir,
+		sdkFallbackToVirtual: document.sdkFallbackToVirtual
+	};
+}
+/** Read the settings the card renders. Never throws. */
+async function readDeviceSettings(options = {}) {
+	return toSettings(await readStored(options.dir));
+}
+/**
+* 算出每个账号"留空时会发出"的那一对 id，供弹窗直接显示。
+*
+* 为什么需要它：弹窗里两个输入框为空时只写"留空 = 自动派生"，用户既看不到
+* 结果，也无法判断两个账号是否被算成了同一台设备。把派生值摆出来，"留空"就从
+* 一句承诺变成了一个可核对的事实。
+*
+* `uid` 由调用方（Host 的凭据库）提供——浏览器只知道 accountId，而**派生必须
+* 用 uid**，因为构头时 `deviceHeaders()` 手上只有 credential.uid。两边用同一种
+* 输入，界面显示的值才等于真正发出去的值。
+*
+* 盐不可用时返回 `undefined`（而不是空对象）：那一档一个设备头都不发，显示一个
+* "派生值"会是在说谎；而空对象表示"盐是好的，但这些账号没有一个算得出来"
+* （没有 uid），两者在界面上要说不同的话。
+*/
+async function describeDerivedDevices(entries, options = {}) {
+	let salt = options.salt;
+	if (salt === void 0) {
+		const readout = options.dir === void 0 ? await readDeviceSalt() : await readDeviceSalt({ dir: options.dir });
+		if (readout.state !== "ok") return void 0;
+		salt = readout.salt;
+	}
+	if (salt === "") return void 0;
+	const derived = {};
+	for (const entry of entries) {
+		if (entry.accountId === "" || entry.uid === "") continue;
+		derived[entry.accountId] = {
+			machineId: deriveDeviceId(entry.uid, "machine", salt),
+			sessionId: deriveDeviceId(entry.uid, "session", salt)
+		};
+	}
+	return derived;
+}
+/**
+* Persist one document atomically.
+*
+* **The caller holds the lock.** Every write path takes `withFileLock` itself
+* (read-merge-write must be one step against another process), so this function
+* must not take it again — a second acquisition on the same path is how a save
+* turns into a hang.
+*/
+async function writeStored(document, dir) {
+	await writeFileAtomic(deviceProfilePath(dir), `${JSON.stringify(document, null, 2)}\n`, {
+		mode: 384,
+		dirMode: 448
+	});
+	invalidate();
+}
+/**
+* Switch the device-head tier.
+*
+* 「真实值」目前只被记住，不改任何出站字节——P3 才接真 token 与互斥规则。
+* 界面上必须把这件事说清楚（`row.deviceModeRealNote`），否则用户会以为切过去
+* 就换成了真实设备。
+*/
+async function setDeviceMode(mode, options = {}) {
+	return withFileLock(deviceProfilePath(options.dir), async () => {
+		const next = {
+			...await readStored(options.dir, Date.now(), true),
+			mode
+		};
+		await writeStored(next, options.dir);
+		return toSettings(next);
+	});
+}
+/**
+* Save the two SDK settings the card edits (作者意见 #1 与 #2).
+*
+* 两项都是**可选**参数，`undefined` 表示"不要动这一项"——与
+* {@link saveDeviceProfile} 同一条约定：卡片上有两个独立控件，其中一个的保存
+* 不该把另一个刚改的值写回旧值。
+*
+* `sdkDir` 只做去空白，不做存在性校验：一个路径填错的正确反馈是「探不到 SDK」
+* （`probe` 会答 `missing` 或 `error` 并带上那个路径），而不是在这里拒绝保存——
+* 后者会让用户面对一个"保存没反应"的输入框，而他刚刚明明看见文件在那儿。
+*/
+async function saveDeviceSdkSettings(values, options = {}) {
+	return withFileLock(deviceProfilePath(options.dir), async () => {
+		const next = {
+			...await readStored(options.dir, Date.now(), true),
+			...typeof values.sdkDir === "string" ? { sdkDir: values.sdkDir.trim() } : {},
+			...typeof values.sdkFallbackToVirtual === "boolean" ? { sdkFallbackToVirtual: values.sdkFallbackToVirtual } : {}
+		};
+		await writeStored(next, options.dir);
+		return toSettings(next);
+	});
+}
+/**
+* Save (or clear) one account's overrides.
+*
+* `machineId` / `sessionId` 为 `''` 表示"清掉这一项、回到派生值"；为 `undefined`
+* 表示"不要动这一项"。两种省略必须能分开：弹窗里只改机器 id 时，不能把用户之前
+* 设的 session id 顺手抹掉。
+*
+* @throws when a supplied value is not a 36-character lowercase hex id — the
+*   route turns that into a 400 rather than writing a value the upstream will reject.
+*/
+async function saveDeviceProfile(accountId, values, options = {}) {
+	for (const value of [values.machineId, values.sessionId]) if (value !== void 0 && value !== "" && !isDeviceId(value)) throw new Error("device id must be 36 lowercase hex characters");
+	return withFileLock(deviceProfilePath(options.dir), async () => {
+		const document = await readStored(options.dir, Date.now(), true);
+		const next = { ...document.accounts[accountId] ?? {} };
+		if (values.uid !== void 0 && values.uid !== "") next.uid = values.uid;
+		for (const key of ["machineId", "sessionId"]) {
+			const value = values[key];
+			if (value === void 0) continue;
+			if (value === "") delete next[key];
+			else next[key] = value;
+		}
+		next.updatedAt = (/* @__PURE__ */ new Date()).toISOString();
+		const accounts = {
+			...document.accounts,
+			[accountId]: next
+		};
+		if (next.machineId === void 0 && next.sessionId === void 0) delete accounts[accountId];
+		const merged = {
+			...document,
+			accounts
+		};
+		await writeStored(merged, options.dir);
+		return toSettings(merged);
+	});
+}
+/** Build the lookup; `ttlMs` exists so an externally edited file is still picked up. */
+function createDeviceProfileLookup(options = {}) {
+	const byUid = (document) => {
+		const map = /* @__PURE__ */ new Map();
+		for (const account of Object.values(document.accounts)) {
+			if (account.uid === void 0) continue;
+			const profile = {
+				...account.machineId === void 0 ? {} : { machineId: account.machineId },
+				...account.sessionId === void 0 ? {} : { sessionId: account.sessionId }
+			};
+			if (profile.machineId !== void 0 || profile.sessionId !== void 0) map.set(account.uid, profile);
+		}
+		return map;
+	};
+	return {
+		async forUid(uid) {
+			if (uid === "") return void 0;
+			return byUid(await readStored(options.dir)).get(uid);
+		},
+		async mode() {
+			return (await readStored(options.dir)).mode;
+		},
+		async fallbackToVirtual() {
+			return (await readStored(options.dir)).sdkFallbackToVirtual;
+		},
+		async sdkDir() {
+			return (await readStored(options.dir)).sdkDir;
+		}
+	};
+}
+//#endregion
+//#region src/turing-sdk.ts
+/**
+* 真实设备参数：本机已安装的 WorkBuddy 桌面端自带 Turing Shield SDK 的取链（P3）。
+*
+* ## SDK 从哪来
+*
+* 插件**不携带任何 SDK 副本**。原生模块与厂商 DLL 是桌面端自己的构建产物
+* （`turing_sdk.node` 内的 pdb 路径指向桌面端仓库），随插件再分发既无 provenance
+* 也无许可证，因此这个模块找的是**用户机器上已安装的那份**：环境变量
+* `WORKBUDDY_TURING_SDK_DIR` 显式指定优先，否则按桌面端的安装形状（Windows 卸载
+* 注册表 + 常见目录，macOS `/Applications` 与 `~/Applications` 的 bundle）现推
+* SDK 目录。找不到就是 `missing`——真实值档下发零个设备头，与从前"这个平台没有
+* 副本"是同一个降级，用户能做的是装上桌面端或指定目录。
+*
+* ## 它补的是哪一格
+*
+* 「虚拟值」档的设备对（`X-Machine-ID` / `X-Session-ID`）是算出来的：稳定、按号
+* 隔离，但**任何一台机器都能算出同样的形状**。「真实值」档要的是这台机器上
+* 真的装着的那套东西——由 SDK 向风控服务换回的 `X-Device-Token`。两者互斥，不能
+* 叠加：真 token 内含设备信息，旁边再挂一对伪造 id 等于自证不一致。
+*
+* ## 为什么要子进程
+*
+* SDK 是原生插件（N-API），加载它会绑定宿主进程：一次 ABI/缺 DLL/被替换的失败
+* 就是插件进程的失败，而不是"设备头不可用"；它的 Promise 没有 cancel，一次超时
+* 会把句柄留在进程里。子进程把这两件事都降级成"这一条命令失败"，父进程杀掉它
+* 就是干净的收场。代价是每次冷启动多一次进程创建（本机实测 ~6 ms）。
+*
+* ## 缓存策略
+*
+* token 是分钟级的东西、进程是小时级的，所以**绝不能只取一次**。内存 TTL 10 分钟，
+* 失败时回落到 24 小时内的旧值并标记 `stale`（设备 token 的有效期远长于它的
+* 刷新周期）。**不落盘**：多一份 secret 文件换来的只是省掉一次 100 ms 的取数，
+* 不划算——这与 P2 的文件源是两种东西，那个读的是别人写的文件。
+*
+* ## 谁来决定"什么时候取"
+*
+* 请求路径只在**要发请求**时调 {@link TuringTokenSource.current}，所以一个空闲
+* 进程一辈子不会刷新 token——面板上永远是"已加载、没取过"，而用户无法把这句话
+* 与"SDK 坏了"区分开。插件 apply 时调 {@link TuringSdk.startAutoRefresh}：立刻
+* 取一次，此后在 TTL 到期前自动换新；失败按 {@link TuringKeepAliveTiming.retryMs}
+* 重试，本机没有 SDK 则按 {@link TuringKeepAliveTiming.unavailableMs} 慢查。
+*
+* ## 从不打印 token
+*
+* 这个模块的任何日志、任何返回给浏览器的状态里都只有掩码与长度。完整值只经
+* {@link TuringTokenSource.reveal} 在用户显式点击时给一次。
+*
+* @module dsh-connect-workbuddy/turing-sdk
+*/
+/** 允许指向别的 SDK 副本（自建、或桌面端安装目录）。 */
+const TURING_SDK_DIR_ENV = "WORKBUDDY_TURING_SDK_DIR";
+/** 取不到新 token 时，旧值最多还能用多久。设备 token 本身长期有效。 */
+const TURING_TOKEN_STALE_MS = 864e5;
+/** 子进程的总预算。SDK 在本机实测 ~110 ms；给到 20 s 是为了覆盖冷启动与 DNS 慢。 */
+const RUN_TIMEOUT_MS = 2e4;
+/** `probe` 的缓存时长：SDK 在进程生命周期内不会变，但 DLL 可能被外部替换。 */
+const PROBE_CACHE_MS = 6e4;
+/**
+* 取数失败后的退避窗口。
+*
+* 这不是性能优化，是正确性：一次对话会并发打出十几条请求，如果每次失败都重试，
+* 一个 SDK 故障会变成"每轮十几个子进程 + 十几个 20 秒超时"。退避期间直接返回上一枚
+* 可用值（没有就返回 `undefined`），而**手动「重新获取」绕过它**——用户点那个按钮，
+* 就是要求现在再试一次。
+*/
+const RETRY_BACKOFF_MS = 3e4;
+/** 生产用法；测试可以整体或部分覆盖（见 `createTuringSdk` 的 `keepAliveTiming`）。 */
+const TURING_KEEP_ALIVE_TIMING = {
+	leadMs: 15e3,
+	retryMs: 6e4,
+	unavailableMs: 3e5,
+	minDelayMs: 5e3
+};
+/** 决定下一次自动预热的延迟（毫秒）。导出来是为了能直接测调度，而不必真等十分钟。 */
+function nextAutoRefreshDelayMs(input, timing = TURING_KEEP_ALIVE_TIMING) {
+	const { nowMs, ttlMs, fetchedAtMs, lastFailureAtMs, sdkState } = input;
+	if (fetchedAtMs !== void 0) {
+		if (lastFailureAtMs !== void 0 && lastFailureAtMs >= fetchedAtMs) return timing.retryMs;
+		const remainMs = ttlMs - timing.leadMs - (nowMs - fetchedAtMs);
+		return Math.max(remainMs, timing.minDelayMs);
+	}
+	return sdkState !== void 0 && sdkState !== "ready" ? timing.unavailableMs : timing.retryMs;
+}
+/** 内置副本的目录名，按 `platform-arch` 分。目前只有 Windows。 */
+/** 展示用的主机的三元组，`win32-x64` 之类。SDK 目录**不再**按它拼——见下方发现逻辑。 */
+function bundledSdkBundleId(platform = process.platform, arch = process.arch) {
+	return `${platform}-${arch}`;
+}
+/**
+* 插件自带的 `native/turing-sdk` 根目录——现在里面**只有** `worker.cjs` 与这份
+* README，不再有 SDK 副本（原生模块与厂商 DLL 是桌面端的构建产物，不随插件分发）。
+*
+* `import.meta.url` 指向 `lib/index.js`（构建产物）或 `src/turing-sdk.ts`（开发与
+* 测试），两者都在包根下一层，所以 `../native/...` 在两种形态下都成立——这是
+* 不用 `process.cwd()` 的原因：cwd 是调用者的，不是插件的。
+*/
+function bundledSdkRoot() {
+	return fileURLToPath(new URL("../native/turing-sdk", import.meta.url));
+}
+/** 子进程脚本的路径；随插件分发，加载的是**用户机器上**的 SDK。 */
+function workerPath() {
+	return join(bundledSdkRoot(), "worker.cjs");
+}
+/**
+* SDK 目录相对桌面端安装根目录的形状（Electron 把原生模块从 asar 里解包出来）。
+*
+* macOS 实测（A 级，2026-11-01，`/Applications/WorkBuddy.app` 与
+* `"/Applications/WorkBuddy AI.app"` 两份都在）：
+* `<bundle>/Contents/Resources/app.asar.unpacked/native/turing-sdk`，里面有
+* `index.cjs` / `package.json` / `build/Release/turing_sdk.node`。
+* Windows 实测（A 级，2026-11-01，`F:\智能体安装路径\WorkBuddy`）：
+* `<install>\resources\app.asar.unpacked\native\turing-sdk` 同形状成立——
+* `WorkBuddy.exe` → 该目录 → `hasTuringSdkBinding` 命中，doctor 报
+* `ready (win32-x64 — <install>\resources\app.asar.unpacked\native\turing-sdk)`
+* 并经桌面端自己的 SDK 副本取到 1174 字符真 token。另经 app.asar 解包核对：
+* `native/turing-sdk` 在 asar 头里标 `unpacked`，实体只在 `app.asar.unpacked`
+* 一侧，两条路径就是全部分布。注意 DSH Desktop / DSH NEXT 本身是另一种应用、
+* **不含**这份 SDK——发现的搜索对象是 WorkBuddy 桌面端，不是运行宿主。
+*/
+function installedSdkDirFromExecutable(platform, executable) {
+	if (platform === "win32") {
+		const install = win32.dirname(executable);
+		return win32.join(install, "resources", "app.asar.unpacked", "native", "turing-sdk");
+	}
+	if (platform === "darwin") {
+		const contents = posix.dirname(posix.dirname(executable));
+		const bundle = posix.dirname(contents);
+		return posix.join(bundle, "Contents", "Resources", "app.asar.unpacked", "native", "turing-sdk");
+	}
+}
+/** 一份 turing-sdk 目录是不是能用：原生模块在不在它声明的位置。 */
+function hasTuringSdkBinding(dir, exists = existsSync, platform = process.platform) {
+	const parts = [
+		"build",
+		"Release",
+		"turing_sdk.node"
+	];
+	const dataJoin = platform === "win32" ? win32.join : posix.join;
+	const alternateJoin = platform === "win32" ? posix.join : win32.join;
+	const dataPath = dataJoin(dir, ...parts);
+	if (exists(dataPath)) return true;
+	const alternatePath = alternateJoin(dir, ...parts);
+	return alternatePath !== dataPath && exists(alternatePath);
+}
+/**
+* 按桌面端的安装形状找本机已安装的 SDK 目录，返回**第一个可用的**。
+*
+* 候选来自 `at-rest.ts` 的同一套安装形状（env 覆盖 → 默认布局；win32 再加
+* 卸载注册表这一路，覆盖装在非默认盘的情况）。所有 win32 路径都用
+* `path.win32`、darwin 用 `path.posix` 拼：这些是**数据**规定的分隔符，
+* 用宿主的 `join` 会在 macOS CI 上产出永不存在的混分隔符路径（docs/WINDOWS.md
+* 的铁律，`at-rest.ts` 里已有前科）。
+*
+* 每个注入参数都是测试缝（RELEASING.md §2.5：断言不能钉住跑测试的机器）：
+* `exists` 决定"这份安装里有没有 SDK"，`readRegistryAppPath` 决定注册表答案；
+* 注册表只在 `platform === 'win32'` 时读——否则 macOS 上的单元测试会去 spawn
+* 一个本机根本不存在的 `reg.exe`。
+*/
+function discoverInstalledSdkDir(options = {}) {
+	const platform = options.platform ?? process.platform;
+	const home = options.home ?? homedir();
+	const env = options.env ?? process.env;
+	const exists = options.exists ?? existsSync;
+	const executables = workbuddyAppExecutableCandidates(platform, home, env);
+	if (platform === "win32") {
+		const fromRegistry = (options.readRegistryAppPath ?? windowsRegistryAppExecutable)();
+		if (fromRegistry !== void 0) executables.push(fromRegistry);
+	}
+	const seen = /* @__PURE__ */ new Set();
+	for (const executable of executables) {
+		const dir = installedSdkDirFromExecutable(platform, executable);
+		if (dir === void 0 || seen.has(dir)) continue;
+		seen.add(dir);
+		if (!exists(executable)) continue;
+		if (hasTuringSdkBinding(dir, exists, platform)) return dir;
+	}
+}
+/** 掩码：保住 scheme 前缀，其余一律星号。`v3:` 是 SDK 的格式标记，不是内容。 */
+function maskToken(token) {
+	if (token === "") return "";
+	const colon = token.indexOf(":");
+	return `${colon > 0 && colon <= 8 ? token.slice(0, colon + 1) : ""}${"*".repeat(16)}`;
+}
+/**
+* Run the worker once.
+*
+* `env` 只带 SDK 需要的白名单，不整份继承：父进程环境里有插件的凭据与用户配置，
+* 一个只需要网络和系统 DLL 的子进程没有理由看到它们。
+*/
+function runWorker(mode, options) {
+	return new Promise((resolve) => {
+		const runtime = process.execPath;
+		const env = {
+			TURING_SDK_DIR: options.dir,
+			TURING_CHANNEL_ID: options.channelId,
+			TURING_PRODUCT_NAME: options.productName,
+			TURING_PRODUCT_VERSION: options.productVersion,
+			TURING_TIMEOUT_MS: String(options.timeoutMs ?? 18e3),
+			TURING_KEYCHAIN_STORAGE: options.keychainStorage === true ? "1" : "0"
+		};
+		for (const name of [
+			"PATH",
+			"SystemRoot",
+			"windir",
+			"TEMP",
+			"TMP",
+			"USERPROFILE",
+			"HOME",
+			"LOCALAPPDATA",
+			"APPDATA",
+			"PROCESSOR_ARCHITECTURE",
+			"NUMBER_OF_PROCESSORS",
+			"LANG",
+			"LC_ALL"
+		]) {
+			const value = process.env[name];
+			if (value !== void 0) env[name] = value;
+		}
+		if (process.versions.electron !== void 0) env["ELECTRON_RUN_AS_NODE"] = "1";
+		let stdout = "";
+		let stderr = "";
+		let settled = false;
+		const settle = (answer) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(killer);
+			resolve(answer);
+		};
+		const child = spawn(runtime, [options.worker, mode], {
+			env,
+			windowsHide: true,
+			stdio: [
+				"ignore",
+				"pipe",
+				"pipe"
+			]
+		});
+		const killer = setTimeout(() => {
+			child.kill("SIGKILL");
+			settle({
+				ok: false,
+				reason: "timeout",
+				message: `worker did not answer within ${options.timeoutMs ?? RUN_TIMEOUT_MS}ms`
+			});
+		}, options.timeoutMs ?? RUN_TIMEOUT_MS);
+		child.stdout?.setEncoding("utf8");
+		child.stdout?.on("data", (chunk) => {
+			stdout += chunk;
+		});
+		child.stderr?.setEncoding("utf8");
+		child.stderr?.on("data", (chunk) => {
+			stderr = `${stderr}${chunk}`.split("\n").slice(-4).join("\n");
+		});
+		child.on("error", (error) => {
+			settle({
+				ok: false,
+				reason: "spawn-failed",
+				message: error.message
+			});
+		});
+		child.on("close", (code) => {
+			const line = stdout.trim().split("\n").filter(Boolean).at(-1);
+			if (line === void 0) {
+				settle({
+					ok: false,
+					reason: "no-output",
+					message: stderr.trim() || `worker exited with code ${String(code)}`
+				});
+				return;
+			}
+			try {
+				settle(JSON.parse(line));
+			} catch {
+				settle({
+					ok: false,
+					reason: "bad-output",
+					message: stderr.trim() || "worker printed no JSON"
+				});
+			}
+		});
+	});
+}
+/**
+* Wire a {@link TuringSdk} into the card.
+*
+* `mode` 从设备设置读，不缓存：用户刚切换的那一下必须立刻反映到面板上。
+*/
+function createDeviceSdkPort(options) {
+	const snap = async () => ({
+		tier: await options.mode(),
+		sdk: await options.sdk.info(),
+		token: options.sdk.tokens.readout()
+	});
+	return {
+		read: snap,
+		async refresh() {
+			await options.sdk.tokens.refresh();
+			return snap();
+		},
+		reveal: () => options.sdk.tokens.reveal(),
+		readEnabled: async () => options.enabled === void 0 ? void 0 : options.enabled.read(),
+		writeEnabled: async (enabled) => options.enabled === void 0 ? false : options.enabled.write(enabled)
+	};
+}
+/**
+* Build the SDK handle.
+*
+* `version` 默认取插件自称的应用版本（与 `User-Agent` 同源），因为它就是这台机器
+* 上那个客户端报给上游的版本；`channelId` 与产品名跟桌面端 `product.json` 一致。
+*/
+function createTuringSdk(options = {}) {
+	const now = options.now ?? (() => Date.now());
+	const worker = options.worker ?? workerPath();
+	const ttlMs = options.ttlMs ?? 6e5;
+	const keepAliveTiming = {
+		...TURING_KEEP_ALIVE_TIMING,
+		...options.keepAliveTiming
+	};
+	/**
+	* 每次**现读**开关，不在构造时求值一次。
+	*
+	* 开关是 `asVolatile` 的配置项，热更新后会变；而句柄活到卸载。钉死一次会让
+	* "关掉开关"必须重启宿主才生效——那与这个开关存在的理由（随时能停）矛盾。
+	*
+	* 未传 `enabled` 时回落到环境变量（{@link TURING_SDK_ENABLED_ENV}）：那是给
+	* `doctor` 这种读不到插件配置的独立进程用的。插件永远显式传，所以两边不会打架。
+	*
+	* **默认也是关**，与插件的 `default(false)` 同一个答案。代价是 `doctor` 在用户
+	* 开启之前只答 `disabled`——但那正是现状，而 `doctor` 的全部价值就是如实回答
+	* 现状。想排障"这个 SDK 到底能不能用"，用
+	* `WORKBUDDY_DEVICE_SDK_ENABLED=1 node lib/bin.js doctor` 临时打开即可。
+	*/
+	const isEnabled = () => options.enabled !== void 0 ? options.enabled !== false : /^(?:1|true)$/u.test(String((options.env ?? process.env)["WORKBUDDY_DEVICE_SDK_ENABLED"] ?? "").trim());
+	const platform = options.platform ?? process.platform;
+	const arch = options.arch ?? process.arch;
+	const env = options.env ?? process.env;
+	const exists = options.exists ?? existsSync;
+	const bundle = bundledSdkBundleId(platform, arch);
+	/**
+	* SDK 目录的**解析器**，不是一个常量（作者意见 #1）。
+	*
+	* 卡片上填一个目录、点保存，下一步就该看见 `ready`——所以目录必须在每次
+	* `probe` 时重新问一次，而不是在 `createTuringSdk` 时钉死。构造期钉死会让
+	* "填了但没生效"成为唯一的可能结果，而用户没有任何办法判断是路径错了还是需要
+	* 重启（后者在这条链路上根本不存在）。
+	*
+	* 优先级：显式 `dir`（测试）→ `WORKBUDDY_TURING_SDK_DIR`（排障旁路）→ 卡片上
+	* 手填的值（{@link TuringSdkOptions.dirSource}）→ 自动发现 → 空串（`missing`）。
+	* 环境变量压过设置的理由写在 `device-profile.ts` 的 `sdkDir` 上。
+	*/
+	const resolveDir = async () => {
+		const configured = options.dir ?? env["WORKBUDDY_TURING_SDK_DIR"];
+		if (configured !== void 0 && configured.trim() !== "") return configured.trim();
+		const fromCard = options.dirSource === void 0 ? "" : (await options.dirSource()).trim();
+		if (fromCard !== "") return fromCard;
+		return discoverInstalledSdkDir({
+			platform,
+			home: options.home,
+			env,
+			exists,
+			readRegistryAppPath: options.readRegistryAppPath
+		}) ?? "";
+	};
+	const channelId = options.channelId ?? env["WORKBUDDY_TURING_CHANNEL_ID"] ?? "109144";
+	const productName = options.productName ?? env["WORKBUDDY_TURING_PRODUCT_NAME"] ?? "WorkBuddy";
+	const productVersion = options.productVersion ?? env["WORKBUDDY_TURING_PRODUCT_VERSION"] ?? "5.8.3";
+	const keychainStorage = options.keychainStorage ?? /^(?:1|true)$/u.test(String(env["WORKBUDDY_TURING_KEYCHAIN_STORAGE"] ?? "").trim());
+	let probeCache;
+	let cached;
+	let lastAttemptMs;
+	let lastFailure;
+	/** 最近一次失败的时刻；退避窗口由它算。 */
+	let lastFailureAtMs;
+	let inFlight;
+	/** 后台预热的定时器；`undefined` 表示当前没有排下一轮。 */
+	let keepAliveTimer;
+	let keepAliveActive = false;
+	/** 最近一次 probe 的结论，用来决定"没有 token"时多久再问一次。 */
+	let lastSdkState;
+	const runtimeLabel = process.versions.electron === void 0 ? process.version.replace(/^v/u, "") : `electron ${process.versions.electron}`;
+	const missingInfo = (path) => {
+		const present = path !== "" && exists(path);
+		return {
+			state: present ? "error" : "missing",
+			bundle,
+			path,
+			platform,
+			arch,
+			runtime: runtimeLabel,
+			reason: present ? "SDK directory exists but the native binding was not found" : `no installed WorkBuddy desktop SDK detected on ${bundle}; install the desktop app or set ${TURING_SDK_DIR_ENV}`
+		};
+	};
+	async function probe() {
+		const at = now();
+		/**
+		* 总开关先于一切：关掉时**不解析目录、不碰文件系统、不起子进程**。
+		*
+		* 放在 `resolveDir()` 之前是刻意的——目录解析本身要读环境、可能读注册表（win32），
+		* 而关掉开关的人要的正是"这个插件别去碰桌面端"。
+		*/
+		if (!isEnabled()) return {
+			state: "disabled",
+			bundle,
+			path: "",
+			platform,
+			arch,
+			runtime: runtimeLabel,
+			reason: "the real-device SDK is turned off in this plugin's settings"
+		};
+		const dir = await resolveDir();
+		if (probeCache !== void 0 && probeCache.path === dir && at - probeCache.at < PROBE_CACHE_MS) return probeCache.info;
+		let info;
+		if (dir === "" || !hasTuringSdkBinding(dir, exists, platform)) info = missingInfo(dir);
+		else {
+			const answer = await runWorker("probe", {
+				dir,
+				worker,
+				channelId,
+				productName,
+				productVersion,
+				timeoutMs: 15e3,
+				keychainStorage
+			});
+			const supported = answer.ok === true && answer.supported === true;
+			info = {
+				state: supported ? "ready" : answer.ok === true ? "unsupported" : "error",
+				bundle,
+				path: dir,
+				platform,
+				arch,
+				runtime: answer.node ?? runtimeLabel,
+				...supported ? {} : { reason: answer.loadError ?? answer.message ?? answer.reason ?? "sdk reported unsupported" }
+			};
+		}
+		probeCache = {
+			at,
+			path: dir,
+			info
+		};
+		return info;
+	}
+	function readout() {
+		const at = now();
+		if (cached === void 0) return {
+			state: "idle",
+			masked: "",
+			length: 0,
+			...lastAttemptMs === void 0 ? {} : { lastAttemptMs },
+			...lastFailure === void 0 ? {} : { reason: lastFailure }
+		};
+		const ageMs = at - cached.fetchedAtMs;
+		const expired = ageMs > ttlMs;
+		const tooOld = ageMs > TURING_TOKEN_STALE_MS;
+		const failedSinceFetch = lastFailure !== void 0 && lastAttemptMs !== void 0 && lastAttemptMs >= cached.fetchedAtMs;
+		return {
+			state: tooOld ? "unavailable" : expired || failedSinceFetch ? "stale" : "ok",
+			masked: maskToken(cached.token),
+			length: cached.token.length,
+			fetchedAtMs: cached.fetchedAtMs,
+			...lastAttemptMs === void 0 ? {} : { lastAttemptMs },
+			...expired || failedSinceFetch ? { reason: lastFailure ?? `older than ${Math.round(ttlMs / 6e4)}m` } : {}
+		};
+	}
+	async function fetchOnce() {
+		lastAttemptMs = now();
+		const info = await probe();
+		lastSdkState = info.state;
+		if (info.state !== "ready") {
+			lastFailure = info.reason ?? `sdk is ${info.state}`;
+			lastFailureAtMs = lastAttemptMs;
+			return;
+		}
+		const answer = await runWorker("token", {
+			dir: info.path,
+			worker,
+			channelId,
+			productName,
+			productVersion,
+			keychainStorage
+		});
+		const token = typeof answer.token === "string" ? answer.token.trim() : "";
+		if (answer.ok !== true || token === "") {
+			lastFailure = answer.message ?? answer.reason ?? "sdk returned no token";
+			lastFailureAtMs = lastAttemptMs;
+			return;
+		}
+		cached = {
+			token,
+			fetchedAtMs: now()
+		};
+		lastFailure = void 0;
+		lastFailureAtMs = void 0;
+		return token;
+	}
+	async function current() {
+		const at = now();
+		if (!isEnabled()) return void 0;
+		if (cached !== void 0 && at - cached.fetchedAtMs <= ttlMs) return cached.token;
+		if (lastFailureAtMs !== void 0 && at - lastFailureAtMs < RETRY_BACKOFF_MS) return cached !== void 0 && at - cached.fetchedAtMs <= TURING_TOKEN_STALE_MS ? cached.token : void 0;
+		if (inFlight !== void 0) return inFlight;
+		inFlight = fetchOnce().finally(() => {
+			inFlight = void 0;
+		});
+		const token = await inFlight;
+		if (token !== void 0) return token;
+		if (cached !== void 0 && now() - cached.fetchedAtMs <= TURING_TOKEN_STALE_MS) return cached.token;
+	}
+	/**
+	* 预热一次：到期前换新，其余情况什么都不做。
+	*
+	* 与 {@link current} 的分工是这条需求的核心。`current()` 只在**请求要发出去**时
+	* 被调用，所以一个空闲的进程永远不会刷新 token——面板看到的永远是"已加载、
+	* 没取过"，而用户无法分辨那是"SDK 没工作"还是"还没轮到它工作"。预热在启动时
+	* 与每次到期前跑，让"现在这枚 token 是什么"随时可以回答。
+	*
+	* 幂等：不算到期就返回，失败退避窗口内也返回，已有请求在飞就等它。
+	*/
+	async function warm() {
+		const at = now();
+		if (!isEnabled()) return;
+		const failedSinceFetch = cached !== void 0 && lastFailureAtMs !== void 0 && lastFailureAtMs >= cached.fetchedAtMs;
+		if (cached !== void 0 && at - cached.fetchedAtMs < ttlMs - keepAliveTiming.leadMs && !failedSinceFetch) return;
+		if (lastFailureAtMs !== void 0 && at - lastFailureAtMs < RETRY_BACKOFF_MS) return;
+		if (inFlight !== void 0) {
+			await inFlight;
+			return;
+		}
+		inFlight = fetchOnce().finally(() => {
+			inFlight = void 0;
+		});
+		await inFlight;
+	}
+	function nextDelayMs() {
+		return nextAutoRefreshDelayMs({
+			nowMs: now(),
+			ttlMs,
+			...cached === void 0 ? {} : { fetchedAtMs: cached.fetchedAtMs },
+			...lastFailureAtMs === void 0 ? {} : { lastFailureAtMs },
+			...lastSdkState === void 0 ? {} : { sdkState: lastSdkState }
+		}, keepAliveTiming);
+	}
+	/**
+	* 一轮预热：取一次，然后按 {@link nextDelayMs} 排下一轮。
+	*
+	* 单链而不是 `setInterval`：间隔不是常数（成功是"到 TTL 前 15 秒"，失败是 60 秒，
+	* SDK 不在这台机器上是 5 分钟），而且每一轮都要按**当下**的时间重算，否则系统
+	* 休眠回来后会把积压的 tick 一次放出来。
+	*/
+	async function tick() {
+		if (!keepAliveActive) return;
+		try {
+			await warm();
+		} catch {}
+		if (!keepAliveActive) return;
+		keepAliveTimer = setTimeout(() => {
+			tick();
+		}, nextDelayMs());
+		keepAliveTimer.unref?.();
+	}
+	return {
+		info: probe,
+		startAutoRefresh() {
+			if (!isEnabled()) return;
+			if (keepAliveActive) return;
+			keepAliveActive = true;
+			tick();
+		},
+		stopAutoRefresh() {
+			keepAliveActive = false;
+			if (keepAliveTimer !== void 0) {
+				clearTimeout(keepAliveTimer);
+				keepAliveTimer = void 0;
+			}
+		},
+		tokens: {
+			current,
+			readout,
+			reveal: current,
+			/**
+			* Force a refetch — but **keep** whatever is cached until the new value
+			* arrives. 清空再取会让"手动刷新失败"顺手抹掉一枚还在宽限期内可用的
+			* token，那正好是用户点刷新想避免的结果。
+			*/
+			async refresh() {
+				if (inFlight !== void 0) return inFlight.then(() => readout());
+				inFlight = fetchOnce().finally(() => {
+					inFlight = void 0;
+				});
+				await inFlight;
+				return readout();
+			}
+		}
+	};
+}
 //#endregion
 //#region src/pi-ai-runtime.ts
 /**
@@ -7576,6 +10217,141 @@ function generationOf(version) {
 	const match = /^0\.(\d+)\./u.exec(version);
 	if (match === null) return "legacy";
 	return Number(match[1]) >= 87 ? "modern" : "legacy";
+}
+//#endregion
+//#region src/cn-gateway.ts
+/**
+* The CN region's gateway host, and the ONE place an override is validated.
+*
+* ## Why this exists (issue #220)
+*
+* The CN chat gateway was the single hard-coded constant
+* `https://copilot.tencent.com`. In a corporate network that filters on the TLS
+* ClientHello's SNI, that name is reset before the handshake completes — while
+* the SAME network lets the WorkBuddy desktop app work, because the app reads a
+* failover list from its own config and uses `wb.tencentbuddy.com` as well.
+*
+* The reporter measured (2026-11-06): `copilot.tencent.com` answers
+* `ECONNRESET` in <100ms while `wb.tencentbuddy.com` answers a normal
+* `401 Authorization Required`. This module is what lets such a user point the
+* plugin at a host their network actually permits.
+*
+* ## Why an allowlist, and not "any URL you like"
+*
+* The value feeds `Authorization: Bearer <token>` on every CN request, plus the
+* refresh-token exchange. A free-form base is therefore a **credential
+* exfiltration primitive**: whoever can edit the settings (a synced profile, a
+* shared dotfile, a pasted "fix" from a forum post) could redirect a live
+* WorkBuddy token to a host they run. That is a strictly worse failure than the
+* timeout it fixes, and it is invisible — the requests would keep succeeding.
+*
+* So the override names a HOST from a closed set, never a URL from the open
+* internet. The set is the CN product's own brand registrable domains, measured
+* 2026-11-06 to answer the chat, billing, catalog and busy routes identically
+* (see `docs/CN_GATEWAY_FALLBACK.md`):
+*
+*   copilot.tencent.com     the shipping default
+*   wb.tencentbuddy.com     what the desktop app's failover.json lists
+*   www.workbuddy.cn        the brand host
+*   www.codebuddy.cn        the sibling brand host, also the billing base
+*
+* Each is admitted by REGISTRABLE domain, so any subdomain of those brands
+* qualifies and a lookalike (`wb.tencentbuddy.com.evil.example`) cannot —
+* the same rule `knownRegionOf` already applies to credential domains.
+*
+* ## What an override does NOT change
+*
+* `Origin` / `Referer` stay on the billing base (see `originReferer`): they
+* describe which web app the request comes from, not which socket it reaches.
+* Rewriting them from the override would make the identity claim disagree with
+* itself for no benefit — the gateway reads them as "this is the CN web app".
+*
+* @module dsh-connect-workbuddy/cn-gateway
+*/
+/** The CN chat gateway the plugin has always used. */
+const CN_GATEWAY_DEFAULT = "https://copilot.tencent.com";
+/**
+* Environment override for `doctor`, mirroring the settings field.
+*
+* WHY THIS EXISTS. `dsh plugin exec … doctor` runs in its own process, which
+* never loads the plugin's settings — the same reason `WORKBUDDY_DEVICE_TOKEN_FILE`
+* already exists as the CLI's way to see what the plugin sees. Without it, a
+* user who fixed their network via the card's field would run `doctor` and get a
+* report measured against the gateway their network RESETS: a diagnostics tool
+* that lies about which host it probed is worse than no tool.
+*
+* The plugin reads the settings field; `doctor` reads this. Both go through
+* `resolveCnGateway`, so the allowlist cannot diverge between them.
+*/
+const WORKBUDDY_CN_BASE_ENV = "WORKBUDDY_CN_BASE";
+/**
+* Hosts an override may name, as registrable domains.
+*
+* A closed set is the security boundary described in this module's header. Adding
+* a host here is a deliberate act that must come with a measurement showing it
+* answers the CN routes, not with a guess about the brand.
+*/
+const ALLOWED_CN_DOMAINS = [
+	"copilot.tencent.com",
+	"tencentbuddy.com",
+	"workbuddy.cn",
+	"codebuddy.cn"
+];
+/**
+* Whether `hostname` belongs to one of the CN brands above.
+*
+* Matched on the registrable domain (`host === domain` or `host.endsWith('.' +
+* domain)`), so `wb.tencentbuddy.com` and `copilot.internal.tencentbuddy.com`
+* both qualify while `tencentbuddy.com.evil.example` does not.
+*/
+function isKnownCnHost(hostname) {
+	const lowered = hostname.trim().toLowerCase();
+	if (lowered === "") return false;
+	return ALLOWED_CN_DOMAINS.some((domain) => lowered === domain || lowered.endsWith(`.${domain}`));
+}
+/**
+* Resolve the CN gateway base from an optional user-supplied value.
+*
+* An ABSENT or blank value is the normal case and yields the default with
+* `overridden: false`. A non-blank value must pass every check or the caller
+* gets `ok: false` and is expected to say so rather than silently falling back:
+* a user who typed a host and got the default anyway has no way to tell the
+* setting was ignored, and would keep debugging a network they already fixed.
+*/
+function resolveCnGateway(value) {
+	const raw = typeof value === "string" ? value.trim() : "";
+	if (raw === "") return {
+		ok: true,
+		base: CN_GATEWAY_DEFAULT,
+		host: "copilot.tencent.com",
+		overridden: false
+	};
+	let parsed;
+	try {
+		parsed = new URL(raw);
+	} catch {
+		return {
+			ok: false,
+			reason: "malformed",
+			value: raw
+		};
+	}
+	if (parsed.protocol !== "https:") return {
+		ok: false,
+		reason: "insecure",
+		value: raw
+	};
+	if (!isKnownCnHost(parsed.hostname)) return {
+		ok: false,
+		reason: "unknown-host",
+		value: raw
+	};
+	return {
+		ok: true,
+		base: `https://${parsed.hostname.toLowerCase()}`,
+		host: parsed.hostname.toLowerCase(),
+		overridden: true
+	};
 }
 /** The versions this build can read (add a new one on upgrade, keep old ones). */
 const KNOWN_ROSTER_SEEN_VERSIONS = Object.freeze([1]);
@@ -7791,7 +10567,7 @@ function describeRosterSeenPayload(raw) {
 //#endregion
 //#region src/version.ts
 /** The npm package version this build was produced from. */
-const WORKBUDDY_CONNECT_VERSION = "5.12.4";
+const WORKBUDDY_CONNECT_VERSION = "5.21.4";
 //#endregion
 //#region src/host-heartbeat.ts
 /**
@@ -7809,8 +10585,18 @@ const WORKBUDDY_CONNECT_VERSION = "5.12.4";
 */
 /** Basename of the host heartbeat file inside the Harness home. */
 const WORKBUDDY_HOST_HEARTBEAT_FILENAME = ".workbuddy-host-heartbeat.json";
-/** Current on-disk heartbeat format; readers reject others. */
-const HEARTBEAT_FORMAT_VERSION = 1;
+/**
+* On-disk heartbeat formats this build WRITES and READS.
+*
+* 1 → 2 added `hostStartedAt` (issue #174). Version 1 is still READ, on purpose:
+* rejecting it would turn the first `doctor` after an upgrade into a spurious
+* "no heartbeat at all", which is a worse diagnosis than the imprecise
+* comparison version 1 supports. Anything newer than {@link HEARTBEAT_FORMAT_VERSION}
+* is rejected, because a future field could change the meaning of the ones read
+* here.
+*/
+const HEARTBEAT_FORMAT_VERSION = 2;
+const READABLE_HEARTBEAT_VERSIONS = [1, 2];
 /** Absolute path of the host heartbeat file. */
 function workbuddyHostHeartbeatPath() {
 	return join(resolveDshHome(), WORKBUDDY_HOST_HEARTBEAT_FILENAME);
@@ -7895,10 +10681,40 @@ function processStartTimeMs(pid) {
 	}
 }
 /**
+* How close a recorded start time must be to the live process's start time for
+* the two to be considered the SAME process.
+*
+* Two tolerances, for two different comparisons:
+*
+*   - {@link HOST_START_REFERENCE_TOLERANCE_MS} when the heartbeat records
+*     `hostStartedAt` — both sides are then the SAME quantity (a process start
+*     time), so the window only has to absorb the coarse resolution of
+*     `ps -o lstart=` (whole seconds) and PowerShell's string round-trip.
+*   - {@link LEGACY_REFERENCE_TOLERANCE_MS} when it does not, and the only
+*     available reference is `registeredAt`. That is a different quantity
+*     (when the plugin mounted, not when the process started), so it is a
+*     lower bound rather than an answer: a host that started more than this
+*     before the plugin mounted would have looked dead. Kept wide on purpose —
+*     a missed reuse is far less harmful than calling a live host stale.
+*/
+const HOST_START_REFERENCE_TOLERANCE_MS = 12e4;
+const LEGACY_REFERENCE_TOLERANCE_MS = 432e5;
+/**
 * Whether the recorded host process still matches the heartbeat's PID.
 *
 * A PID can be reused after a crash, so the recorded start time is compared
 * against the live process: a different start time means a different process.
+*
+* ISSUE #174 — the reference used to be `registeredAt`, the moment the plugin
+* WROTE the heartbeat, and the comparison was `|startedAt − registeredAt| < 60s`.
+* Those are two different quantities: `registeredAt` is when the host finished
+* booting and mounted this plugin, which on a real machine is minutes after the
+* process started. Measured by the reporter on Windows 11: process start
+* 19:47:20, heartbeat written 19:58:45 — 684,817 ms apart — so `doctor` and
+* `status` reported `hostBundle: "stale"` for a host that was alive and had
+* just written the file. The `hostStartedAt` field exists so the comparison has
+* the right reference; `registeredAt` is only read for heartbeats written by an
+* older build, where it is the sole (and merely near) signal available.
 */
 function isHeartbeatProcessAlive(heartbeat) {
 	if (!Number.isInteger(heartbeat.pid) || heartbeat.pid <= 0) return false;
@@ -7909,7 +10725,9 @@ function isHeartbeatProcessAlive(heartbeat) {
 	}
 	const startedAt = processStartTimeMs(heartbeat.pid);
 	if (startedAt === void 0) return true;
-	return Math.abs(startedAt - heartbeat.registeredAt) < 6e4;
+	const recorded = heartbeat.hostStartedAt;
+	if (recorded !== void 0 && Number.isFinite(recorded)) return Math.abs(startedAt - recorded) < HOST_START_REFERENCE_TOLERANCE_MS;
+	return Math.abs(startedAt - heartbeat.registeredAt) < LEGACY_REFERENCE_TOLERANCE_MS;
 }
 /** Read the heartbeat; absent or unparsable files report undefined. */
 async function readHostHeartbeat() {
@@ -7917,30 +10735,41 @@ async function readHostHeartbeat() {
 		const parsed = JSON.parse(await readFile(workbuddyHostHeartbeatPath(), "utf8"));
 		if (typeof parsed !== "object" || parsed === null) return void 0;
 		const document = parsed;
-		if (document["version"] !== HEARTBEAT_FORMAT_VERSION) return void 0;
+		if (!READABLE_HEARTBEAT_VERSIONS.includes(document["version"])) return void 0;
 		if (document["package"] !== "dsh-connect-workbuddy") return void 0;
 		const pid = document["pid"];
 		const registeredAt = document["registeredAt"];
 		if (typeof pid !== "number" || typeof registeredAt !== "number") return void 0;
+		const hostStartedAt = document["hostStartedAt"];
 		return {
-			version: HEARTBEAT_FORMAT_VERSION,
+			version: document["version"],
 			package: "dsh-connect-workbuddy",
 			pluginVersion: typeof document["pluginVersion"] === "string" ? document["pluginVersion"] : WORKBUDDY_CONNECT_VERSION,
 			registeredAt,
-			pid
+			pid,
+			...typeof hostStartedAt === "number" && Number.isFinite(hostStartedAt) ? { hostStartedAt } : {}
 		};
 	} catch {
 		return;
 	}
 }
-/** Write the heartbeat for the current process. */
+/**
+* Write the heartbeat for the current process.
+*
+* `hostStartedAt` is captured HERE, from this process, so the later staleness
+* check compares like with like (issue #174). Sampled on every write rather
+* than cached: the value is cheap, and a module-level cache would be wrong the
+* moment this function is exercised from a child process.
+*/
 async function writeHostHeartbeat() {
+	const hostStartedAt = processStartTimeMs(process.pid);
 	const heartbeat = {
 		version: HEARTBEAT_FORMAT_VERSION,
 		package: "dsh-connect-workbuddy",
 		pluginVersion: WORKBUDDY_CONNECT_VERSION,
 		registeredAt: Date.now(),
-		pid: process.pid
+		pid: process.pid,
+		...hostStartedAt === void 0 ? {} : { hostStartedAt }
 	};
 	await writeFile(workbuddyHostHeartbeatPath(), `${JSON.stringify(heartbeat, null, 2)}\n`, { mode: 384 });
 }
@@ -7949,4 +10778,4 @@ async function clearHostHeartbeat() {
 	await rm(workbuddyHostHeartbeatPath(), { force: true });
 }
 //#endregion
-export { parseCreditMultiplier as $, withFileLock as $t, isEncryptedCredentialError as A, pickMediaModel as At, WorkBuddyCredentialRejectedError as B, deriveAtRestKeyId as Bt, WorkBuddyCredentialStore as C, IMAGE_TAG_TEXT_TO_IMAGE as Ct, defaultDesktopAuthDirs as D, imageMimeForPath as Dt, defaultDesktopAuthCandidates as E, imageDataUrl as Et, workbuddyAccountId as F, imageDefaultFor as Ft, forceNeutralHead as G, isWorkbuddyBundle as Gt, channelGateMemberOf as H, findWorkbuddyAppExecutable as Ht, workbuddyOwnAuthPath as I, nativeModalityOf as It, isCredentialRejectedError as J, openEncryptedField as Jt, isContextTooLongBody as K, macosBundleExecutable as Kt, CONTEXT_OVERFLOW_MARKER as L, WORKBUDDY_APP_EXECUTABLE_ENV as Lt, legacyWorkbuddyOwnAuthPath as M, parseQueueAnswer as Mt, parseWorkBuddyAuth as N, queueNoticeText as Nt, defaultDesktopAuthPath as O, isBareBase64Image as Ot, preferredAccountName as P, NATIVE_MODALITY_BY_MODEL_ID as Pt, openingEvidenceOfBody as Q, resolveDshHome as Qt, CREDENTIAL_REJECTED_CODE as R, clearAtRestKeyCache as Rt, WORKBUDDY_AUTH_FILE_ENV as S, IMAGE_TAG_IMAGE_TO_IMAGE as St, authFileName as T, WorkBuddyImageError as Tt, classifyUpstreamError as U, findWorkbuddyAppExecutableWithSource as Ut, WorkBuddyUpstreamClient as V, fetchAtRestKeyPayload as Vt, declaredTools as W, isEncryptedFieldWrapper as Wt, knownRegionOf as X, workbuddyAppExecutableCandidates as Xt, isFirstMessageGateBody as Y, readAtRestKey as Yt, modelIdOfBody as Z, hostPeersInfo as Zt, deriveCatalog as _, WorkBuddyVideoError as _t, readHostHeartbeat as a, requestEvidenceOf as at, ENCRYPTED_CREDENTIAL_CODE as b, resolveVideoParams as bt, WORKBUDDY_CONNECT_VERSION as c, REFUSES_OFF_MODEL_IDS as ct, rosterSeenPath as d, offDefaultFor as dt, writeFileAtomic as en, parseReasoning as et, piAiRuntimeInfo as f, offRefused as ft, applyContextBudgets as g, VIDEO_TAG_TEXT_TO_VIDEO as gt, WorkBuddyCatalog as h, VIDEO_TAG_IMAGE_TO_VIDEO as ht, processStartTimeMs as i, regionOf as it, isVaultAccountId as j, sniffImageMime as jt, hasEncryptedCredentialFields as k, parseImageDataUrl as kt, createFileRosterSeenStore as l, defaultOffModelIds as lt, FALLBACK_WORKBUDDY_MODELS_GLOBAL as m, withEffectiveOff as mt, clearHostHeartbeat as n, perturbChannelFingerprints as nt, workbuddyHostHeartbeatPath as o, rewriteSessionTitleModel as ot, FALLBACK_WORKBUDDY_MODELS as p, recordRefusal as pt, isConversationIdGateBody as q, macosNestedAppBundles as qt, isHeartbeatProcessAlive as r, prepareChatBody as rt, writeHostHeartbeat as s, attachBusyLevels as st, WORKBUDDY_HOST_HEARTBEAT_FILENAME as t, parseUpstreamModel as tt, describeRosterSeenPayload as u, lastRefusalFor as ut, fallbackModelsFor as v, parseSupportedSecondsRange as vt, WorkBuddyEncryptedCredentialError as w, MAX_INPUT_IMAGE_BYTES as wt, WORKBUDDY_AUTH_FILENAME as x, DEFAULT_IMAGE_SIZE as xt, withoutRouters as y, pickVideoModel as yt, WORKBUDDY_FALLBACK_SYSTEM_PROMPT as z, deriveAtRestKey as zt };
+export { DEFAULT_WIRE_PROFILE as $, imageDefaultFor as $t, withoutRouters as A, offRefused as At, defaultDesktopAuthPath as B, IMAGE_TAG_TEXT_TO_IMAGE as Bt, setDeviceMode as C, hostPeersInfo as Cn, attachBusyLevels as Ct, applyContextBudgets as D, defaultOffModelIds as Dt, WorkBuddyCatalog as E, writeFileAtomic as En, REFUSES_OFF_MODEL_IDS as Et, WorkBuddyCredentialStore as F, WorkBuddyVideoError as Ft, parseWorkBuddyAuth as G, isBareBase64Image as Gt, isEncryptedCredentialError as H, WorkBuddyImageError as Ht, WorkBuddyEncryptedCredentialError as I, parseSupportedSecondsRange as It, workbuddyOwnAuthPath as J, sniffImageMime as Jt, preferredAccountName as K, parseImageDataUrl as Kt, authFileName as L, pickVideoModel as Lt, WORKBUDDY_AUTH_FILENAME as M, withEffectiveOff as Mt, WORKBUDDY_AUTH_FILE_ENV as N, VIDEO_TAG_IMAGE_TO_VIDEO as Nt, deriveCatalog as O, lastRefusalFor as Ot, WORKBUDDY_VAULT_DIRNAME as P, VIDEO_TAG_TEXT_TO_VIDEO as Pt, CREDENTIAL_REJECTED_CODE as Q, NATIVE_MODALITY_BY_MODEL_ID as Qt, defaultDesktopAuthCandidates as R, resolveVideoParams as Rt, saveDeviceSdkSettings as S, workbuddyAppExecutableCandidates as Sn, rewriteSessionTitleModel as St, FALLBACK_WORKBUDDY_MODELS_GLOBAL as T, withFileLock as Tn, selectPromoBadge as Tt, isVaultAccountId as U, imageDataUrl as Ut, hasEncryptedCredentialFields as V, MAX_INPUT_IMAGE_BYTES as Vt, legacyWorkbuddyOwnAuthPath as W, imageMimeForPath as Wt, APP_VERSION as X, queueNoticeText as Xt, workbuddyVaultDir as Y, parseQueueAnswer as Yt, CONTEXT_OVERFLOW_MARKER as Z, pruneTempDir as Zt, createDeviceProfileLookup as _, isWorkbuddyBundle as _n, parseUpstreamModel as _t, readHostHeartbeat as a, deriveDeviceId as an, declaredTools as at, readDeviceSettings as b, openEncryptedField as bn, regionOf as bt, WORKBUDDY_CONNECT_VERSION as c, protectCredentialDirectory as cn, isContextTooLongBody as ct, rosterSeenPath as d, deriveAtRestKey as dn, isFirstMessageGateBody as dt, nativeModalityOf as en, WORKBUDDY_FALLBACK_SYSTEM_PROMPT as et, WORKBUDDY_CN_BASE_ENV as f, deriveAtRestKeyId as fn, knownRegionOf as ft, createTuringSdk as g, isEncryptedFieldWrapper as gn, parseReasoning as gt, createDeviceSdkPort as h, findWorkbuddyAppExecutableWithSource as hn, parseCreditMultiplier as ht, processStartTimeMs as i, readDeviceSalt as in, classifyUpstreamError as it, ENCRYPTED_CREDENTIAL_CODE as j, recordRefusal as jt, fallbackModelsFor as k, offDefaultFor as kt, createFileRosterSeenStore as l, WORKBUDDY_APP_EXECUTABLE_ENV as ln, isConversationIdGateBody as lt, piAiRuntimeInfo as m, findWorkbuddyAppExecutable as mn, openingEvidenceOfBody as mt, clearHostHeartbeat as n, readDeviceTokenFile as nn, WorkBuddyUpstreamClient as nt, workbuddyHostHeartbeatPath as o, isDeviceId as on, describeRequestHeaderNames as ot, resolveCnGateway as p, fetchAtRestKeyPayload as pn, modelIdOfBody as pt, workbuddyAccountId as q, pickMediaModel as qt, isHeartbeatProcessAlive as r, ensureDeviceSalt as rn, channelGateMemberOf as rt, writeHostHeartbeat as s, inspectCredentialDirectory as sn, forceNeutralHead as st, WORKBUDDY_HOST_HEARTBEAT_FILENAME as t, WORKBUDDY_DEVICE_TOKEN_FILE_ENV as tn, WorkBuddyCredentialRejectedError as tt, describeRosterSeenPayload as u, clearAtRestKeyCache as un, isCredentialRejectedError as ut, describeDerivedDevices as v, macosBundleExecutable as vn, perturbChannelFingerprints as vt, FALLBACK_WORKBUDDY_MODELS as w, resolveDshHome as wn, promoBadgeTone as wt, saveDeviceProfile as x, readAtRestKey as xn, requestEvidenceOf as xt, isDeviceMode as y, macosNestedAppBundles as yn, prepareChatBody as yt, defaultDesktopAuthDirs as z, IMAGE_TAG_IMAGE_TO_IMAGE as zt };

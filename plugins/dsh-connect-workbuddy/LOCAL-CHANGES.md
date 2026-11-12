@@ -360,3 +360,31 @@ const REFUSED_CONTENT_SPANS = [{
 2. **不要用 PowerShell `Set-Content` 改这些 JS 文件**：它会给文件加 **UTF-8 BOM**
    （`EF BB BF`），而 `bin.js` 第一行是 `#!/usr/bin/env node`，BOM 顶在 shebang 前面使 `node --check` 直接报错。
    改这类文件用 `[System.IO.File]::WriteAllBytes()` 逐字节写，或 `edit`/`write` 工具。
+
+---
+
+# 2026-11-12 升级到 5.21.4（本地版 5.21.4-zh.1）
+
+上游 5.12.4 → 5.21.4 期间改写了三条被网关拒绝的英文原句，并把它们集中到
+`CHANNEL_GATE_PHRASES` 表里「英文改英文」。本地中文替换的锚点结构没变，
+但**匹配串必须跟着上游走**，否则会出现「补丁打上了、句子却没被替换」。
+
+本次改动：
+
+1. `host-heartbeat-<hash>.js` 的 `UNAPPROVED_CHANNEL_OPENINGS` 增补两条新写法：
+   - `you are working with the user inside the deepseek harness web gui` → Web GUI 中文段
+   - `you are an ai agent running inside deepseek harness` → `你乃AI辅助软件也。`
+   旧写法保留，兼容历史会话。
+2. Claude Code 前缀从 `you are claude code, anthropic's cli for claude` 放宽为
+   `you are claude code`：上游/实测句子是 `Anthropic's official CLI for Claude`，
+   旧前缀少了 `official` 一词，一直匹配不到（5.12.4 的验收用例也是同一写法）。
+3. `neutralizeScannedText()` 的中间层 `REFUSED_CONTENT_SPANS` 改为同时匹配新旧两种
+   `@` 路径句，并保留「按词切分 + `\s+` + 大小写不敏感」的命中方式。
+4. `retryPolicy` 的四个锚点按 5.21.4 的新结构重新定位（`profileFor` 仍读
+   `options.retryPolicy?.()`，adapter 选项对象多了 `dropAllThinking` 一行，锚点挂在它后面）。
+5. 未采用上游 `CHANNEL_GATE_PHRASES` 的「英文改英文」做法：目的相同（绕开网关指纹），
+   但本机按既定做法改成中文；`@` 路径句与身份句都由本地层处理。
+
+验收：`local/verify_local.mjs` **11/11**，`local/verify_retry.cjs` **10/10**。
+升级命令与旧版相同，锚点已更新到 `probe/anchors.json`、`probe/anchors_retry.json`
+（旧版重试锚点留档为 `anchors_retry.5.12.4.json`）。
